@@ -1,0 +1,23 @@
+#!/bin/sh
+# Alpine Recording Station X11 Kiosk Startup Script
+
+# Disable screen saver and power management blanking
+xset s off 2>/dev/null || true
+xset s noblank 2>/dev/null || true
+xset -dpms 2>/dev/null || true
+
+# Start lightweight Openbox window manager in background
+openbox --config-file /root/.config/openbox/rc.xml &
+
+# Ensure /storage has permissive rw/rwx masks for Samba and local access
+mkdir -p /storage
+chmod 0777 /storage 2>/dev/null || true
+
+export PYTHONPATH="/opt/alpine-recorder"
+export QT_AUTO_SCREEN_SCALE_FACTOR=1
+
+# Main kiosk loop: launch fullscreen recorder UI and respawn if exited
+while true; do
+    /usr/bin/python3 -m app.main
+    sleep 1
+done
