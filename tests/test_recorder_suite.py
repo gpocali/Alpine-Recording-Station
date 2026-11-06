@@ -376,6 +376,9 @@ class TestPostBootServiceAndRecoveryConfig(unittest.TestCase):
         # Ensure install.sh cleans up legacy tty1 autologin/autostart rather than installing them
         self.assertNotIn("exec /bin/login -f root", install_text)
         self.assertNotIn("exec startx /root/.xinitrc", install_text)
+        self.assertNotIn("apk add --no-cache", install_text)
+        self.assertIn("APK_CACHE_DIR=", install_text)
+        self.assertIn("apk cache sync", install_text)
         self.assertIn("ALPINE_RECORDER_KIOSK_AUTOSTART", install_text)
         self.assertIn("/etc/init.d/alpine-recorder", install_text)
         self.assertIn("/usr/local/bin/alpine-recorder", install_text)
@@ -387,6 +390,8 @@ class TestPostBootServiceAndRecoveryConfig(unittest.TestCase):
 
         launcher_text = (repo_root / "config" / "alpine-recorder").read_text(encoding="utf-8")
         self.assertIn("run_doctor", launcher_text)
+        self.assertIn("ensure_runtime_packages", launcher_text)
+        self.assertIn("fix-packages", launcher_text)
         self.assertIn("do_recover", launcher_text)
         self.assertIn("max_fast_fails=3", launcher_text)
         self.assertNotIn("-nocursor", launcher_text)

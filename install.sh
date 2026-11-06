@@ -13,6 +13,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 APP_DEST="/opt/alpine-recorder"
 ETC_CONFIG_DIR="/etc/alpine-recorder"
 STORAGE_DIR="/storage"
+APK_CACHE_DIR="${STORAGE_DIR}/.alpine-recorder/apk-cache"
 FORCE_CONFIG=0
 OSK_MODE=""
 ENABLE_SERVICE=1
@@ -126,15 +127,39 @@ case "$ARCH" in
 esac
 
 if command -v apk >/dev/null 2>&1; then
+    # Ensure persistent APK cache exists on /storage so diskless (LBU/RAM) Alpine
+    # systems retain Xorg, Openbox, PyQt6, NumPy, ALSA, and Samba across reboots.
+    mkdir -p "${STORAGE_DIR}" "${STORAGE_DIR}/.alpine-recorder" "${APK_CACHE_DIR}" /etc/apk
+    if [ ! -e /etc/apk/cache ] && [ ! -L /etc/apk/cache ]; then
+        ln -snf "${APK_CACHE_DIR}" /etc/apk/cache
+        log_info "Linked /etc/apk/cache -> ${APK_CACHE_DIR} for persistent package caching across reboots."
+    fi
+
     # shellcheck disable=SC2086
     apk update
+    apk fix 2>/dev/null || true
+    # Never use --no-cache here: diskless Alpine relies on cached .apk archives at boot
     # shellcheck disable=SC2086
-    apk add --no-cache $BASE_PKGS $ARCH_PKGS
+    apk add $BASE_PKGS $ARCH_PKGS
     # Install qt6-qtbase-x11 and X11 cursor packages if available on this Alpine release
+    OPT_PKGS_INSTALLED=""
     for opt_pkg in qt6-qtbase-x11 xsetroot font-cursor-misc libxcursor xcursor-themes adwaita-icon-theme; do
-        apk add --no-cache "$opt_pkg" 2>/dev/null || true
+        if apk add "$opt_pkg" 2>/dev/null; then
+            OPT_PKGS_INSTALLED="${OPT_PKGS_INSTALLED} ${opt_pkg}"
+        fi
     done
-    log_ok "All Alpine packages installed."
+
+    # Sync /etc/apk/cache and mirror required .apk packages into /storage/.alpine-recorder/apk-cache
+    apk cache sync 2>/dev/null || apk cache download 2>/dev/null || true
+    if [ -d /etc/apk/cache ] && [ "$(cd /etc/apk/cache 2>/dev/null && pwd -P)" != "$(cd "${APK_CACHE_DIR}" 2>/dev/null && pwd -P)" ]; then
+        cp -f /etc/apk/cache/*.apk /etc/apk/cache/APKINDEX*.tar.gz "${APK_CACHE_DIR}/" 2>/dev/null || true
+    fi
+    if ! ls "${APK_CACHE_DIR}"/*.apk >/dev/null 2>&1; then
+        log_info "Caching required .apk archives into ${APK_CACHE_DIR} for offline reboot recovery..."
+        # shellcheck disable=SC2086
+        apk fetch --recursive -o "${APK_CACHE_DIR}" $BASE_PKGS $ARCH_PKGS $OPT_PKGS_INSTALLED 2>/dev/null || true
+    fi
+    log_ok "All Alpine packages installed and cached for persistence across reboots."
 else
     log_warn "apk package manager not found (non-Alpine environment). Skipping package installation."
 fi
@@ -170,6 +195,7 @@ modprobe snd-usb-audio 2>/dev/null || true
 log_info "Configuring persistent storage directory at ${STORAGE_DIR}..."
 mkdir -p "${STORAGE_DIR}"
 mkdir -p "${STORAGE_DIR}/.alpine-recorder"
+mkdir -p "${APK_CACHE_DIR}"
 chown root:sambashare "${STORAGE_DIR}" 2>/dev/null || true
 chmod 0777 "${STORAGE_DIR}"
 
@@ -182,7 +208,7 @@ LOCAL_STORAGE_SCRIPT="/etc/local.d/alpine-recorder-storage.start"
 if [ ! -f "${LOCAL_STORAGE_SCRIPT}" ] || [ "${FORCE_CONFIG}" -eq 1 ]; then
     cat << 'EOF' > "${LOCAL_STORAGE_SCRIPT}"
 #!/bin/sh
-mkdir -p /storage /storage/.alpine-recorder
+mkdir -p /storage /storage/.alpine-recorder /storage/.alpine-recorder/apk-cache
 chgrp sambashare /storage 2>/dev/null || true
 chmod 0777 /storage 2>/dev/null || true
 find /storage -maxdepth 1 -type f -name "*.wav" -exec chmod 0666 {} + 2>/dev/null || true

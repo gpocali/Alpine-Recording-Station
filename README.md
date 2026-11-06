@@ -108,15 +108,16 @@ If you previously installed an older revision that used `/etc/inittab` autologin
 Once logged in on `tty1` (`Ctrl+Alt+F1`) or over SSH, use `alpine-recorder` to manage and troubleshoot the kiosk:
 
 ```sh
-alpine-recorder doctor     # Check display nodes (/dev/dri, /dev/fb), Xorg, PyQt6, ALSA & /storage
-alpine-recorder logs       # View recent errors from /var/log/alpine-recorder.log and Xorg logs
-alpine-recorder status     # Check OpenRC service status, running PIDs, and recent logs
-alpine-recorder run        # Launch X11 & recorder in the foreground with console error output
-alpine-recorder stop       # Stop the kiosk service and switch back to tty1
-alpine-recorder restart    # Restart the background VT7 kiosk service
-alpine-recorder disable    # Disable automatic startup at boot for troubleshooting
-alpine-recorder enable     # Re-enable automatic post-boot startup on VT7
-alpine-recorder recover    # Emergency recovery: stop Xorg, clean tty1 config, switch to tty1
+alpine-recorder doctor        # Check display nodes (/dev/dri, /dev/fb), Xorg, PyQt6, ALSA & /storage
+alpine-recorder fix-packages  # Restore and cache missing X11/PyQt6 packages across diskless reboots
+alpine-recorder logs          # View recent errors from /var/log/alpine-recorder.log and Xorg logs
+alpine-recorder status        # Check OpenRC service status, running PIDs, and recent logs
+alpine-recorder run           # Launch X11 & recorder in the foreground with console error output
+alpine-recorder stop          # Stop the kiosk service and switch back to tty1
+alpine-recorder restart       # Restart the background VT7 kiosk service
+alpine-recorder disable       # Disable automatic startup at boot for troubleshooting
+alpine-recorder enable        # Re-enable automatic post-boot startup on VT7
+alpine-recorder recover       # Emergency recovery: stop Xorg, clean tty1 config, switch to tty1
 ```
 
 ---
