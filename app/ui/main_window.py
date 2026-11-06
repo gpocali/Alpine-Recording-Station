@@ -719,6 +719,8 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self._sync_hardware_state()
             self._refresh_recordings_list()
+        elif getattr(dlg, "exit_to_console_requested", False):
+            self.close()
 
     # -------------------------------------------------------------------------
     # Periodic Timers & Keyboard Hotkeys
@@ -810,6 +812,12 @@ class MainWindow(QMainWindow):
                 self.showNormal()
             else:
                 self.showFullScreen()
+            return
+        if key == Qt.Key.Key_Q and bool(
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            if not self.audio_engine.is_recording:
+                self.close()
             return
 
         super().keyPressEvent(event)

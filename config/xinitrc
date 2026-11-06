@@ -1,23 +1,55 @@
 #!/bin/sh
 # Alpine Recording Station X11 Kiosk Startup Script
 
+APP_LOG="/var/log/alpine-recorder.log"
+mkdir -p /var/log /storage
+chmod 0777 /storage 2>/dev/null || true
+
 # Disable screen saver and power management blanking
 xset s off 2>/dev/null || true
 xset s noblank 2>/dev/null || true
 xset -dpms 2>/dev/null || true
 
 # Start lightweight Openbox window manager in background
-openbox --config-file /root/.config/openbox/rc.xml &
-
-# Ensure /storage has permissive rw/rwx masks for Samba and local access
-mkdir -p /storage
-chmod 0777 /storage 2>/dev/null || true
+openbox --config-file /root/.config/openbox/rc.xml >>"${APP_LOG}" 2>&1 &
 
 export PYTHONPATH="/opt/alpine-recorder"
 export QT_AUTO_SCREEN_SCALE_FACTOR=1
 
-# Main kiosk loop: launch fullscreen recorder UI and respawn if exited
+# Foreground single-run mode (used by 'alpine-recorder run')
+if [ "${ALPINE_RECORDER_SINGLE_RUN:-0}" = "1" ]; then
+    # shellcheck disable=SC2086
+    /usr/bin/python3 -m app.main ${ALPINE_RECORDER_ARGS:-} >>"${APP_LOG}" 2>&1
+    exit $?
+fi
+
+# Supervised kiosk loop: respawn on unexpected crash, but exit cleanly on code 0
+# or abort if the UI crashes repeatedly at startup.
+fast_crashes=0
 while true; do
-    /usr/bin/python3 -m app.main
+    start_ts="$(date +%s)"
+    # shellcheck disable=SC2086
+    /usr/bin/python3 -m app.main ${ALPINE_RECORDER_ARGS:-} >>"${APP_LOG}" 2>&1
+    rc=$?
+    end_ts="$(date +%s)"
+    elapsed=$((end_ts - start_ts))
+
+    # Exit code 0 = intentional close / Exit to Console
+    if [ "$rc" -eq 0 ]; then
+        exit 0
+    fi
+
+    if [ "$elapsed" -lt 5 ]; then
+        fast_crashes=$((fast_crashes + 1))
+    else
+        fast_crashes=0
+    fi
+
+    if [ "$fast_crashes" -ge 3 ]; then
+        printf "%s [ERROR] app.main crashed %s times rapidly (last exit=%s). Exiting X11 session.\n" \
+            "$(date -Iseconds 2>/dev/null || date)" "$fast_crashes" "$rc" >>"${APP_LOG}"
+        exit "$rc"
+    fi
+
     sleep 1
 done

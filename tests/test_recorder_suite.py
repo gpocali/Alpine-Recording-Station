@@ -358,5 +358,41 @@ class TestOnScreenKeyboard(unittest.TestCase):
         _ = app
 
 
+class TestPostBootServiceAndRecoveryConfig(unittest.TestCase):
+    def test_scripts_have_lf_line_endings_and_post_boot_vt7_service(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        scripts = [
+            repo_root / "install.sh",
+            repo_root / "config" / "alpine-recorder",
+            repo_root / "config" / "alpine-recorder.initd",
+            repo_root / "config" / "xinitrc",
+        ]
+        for script in scripts:
+            self.assertTrue(script.is_file(), f"Missing script: {script}")
+            raw = script.read_bytes()
+            self.assertNotIn(b"\r\n", raw, f"Script contains CRLF line endings: {script}")
+
+        install_text = (repo_root / "install.sh").read_text(encoding="utf-8")
+        # Ensure install.sh cleans up legacy tty1 autologin/autostart rather than installing them
+        self.assertNotIn("exec /bin/login -f root", install_text)
+        self.assertNotIn("exec startx /root/.xinitrc", install_text)
+        self.assertIn("ALPINE_RECORDER_KIOSK_AUTOSTART", install_text)
+        self.assertIn("/etc/init.d/alpine-recorder", install_text)
+        self.assertIn("/usr/local/bin/alpine-recorder", install_text)
+
+        initd_text = (repo_root / "config" / "alpine-recorder.initd").read_text(encoding="utf-8")
+        self.assertIn("#!/sbin/openrc-run", initd_text)
+        self.assertIn("after bootmisc modules udev eudev alsa samba local networking", initd_text)
+
+        launcher_text = (repo_root / "config" / "alpine-recorder").read_text(encoding="utf-8")
+        self.assertIn("run_doctor", launcher_text)
+        self.assertIn("do_recover", launcher_text)
+        self.assertIn("max_fast_fails=3", launcher_text)
+
+        xinit_text = (repo_root / "config" / "xinitrc").read_text(encoding="utf-8")
+        self.assertIn("ALPINE_RECORDER_SINGLE_RUN", xinit_text)
+        self.assertIn("fast_crashes", xinit_text)
+
+
 if __name__ == "__main__":
     unittest.main()

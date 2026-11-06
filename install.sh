@@ -15,6 +15,7 @@ ETC_CONFIG_DIR="/etc/alpine-recorder"
 STORAGE_DIR="/storage"
 FORCE_CONFIG=0
 OSK_MODE=""
+ENABLE_SERVICE=1
 
 for arg in "$@"; do
     case "$arg" in
@@ -27,11 +28,19 @@ for arg in "$@"; do
         --disable-osk)
             OSK_MODE="false"
             ;;
+        --enable-service)
+            ENABLE_SERVICE=1
+            ;;
+        --disable-service|--no-autostart)
+            ENABLE_SERVICE=0
+            ;;
         --help|-h)
-            echo "Usage: $0 [--force-config] [--enable-osk | --disable-osk]"
-            echo "  --force-config   Overwrite existing smb.conf, xinitrc, and openbox configs."
-            echo "  --enable-osk     Enable the touch On-Screen Keyboard in saved settings."
-            echo "  --disable-osk    Disable the touch On-Screen Keyboard in saved settings."
+            echo "Usage: $0 [--force-config] [--enable-osk | --disable-osk] [--enable-service | --disable-service]"
+            echo "  --force-config      Overwrite existing smb.conf, xinitrc, and openbox configs."
+            echo "  --enable-osk        Enable the touch On-Screen Keyboard in saved settings."
+            echo "  --disable-osk       Disable the touch On-Screen Keyboard in saved settings."
+            echo "  --enable-service    Enable post-boot OpenRC kiosk service on VT7 (default)."
+            echo "  --disable-service   Do not auto-start kiosk at boot; start manually via 'alpine-recorder'."
             exit 0
             ;;
     esac
@@ -84,6 +93,7 @@ BASE_PKGS="
     samba-common-tools
     xorg-server
     xinit
+    xauth
     xset
     openbox
     xf86-input-libinput
@@ -91,6 +101,15 @@ BASE_PKGS="
     xf86-video-fbdev
     mesa-dri-gallium
     ttf-dejavu
+    fontconfig
+    libxkbcommon-x11
+    xcb-util-wm
+    xcb-util-image
+    xcb-util-keysyms
+    xcb-util-renderutil
+    xcb-util-cursor
+    dbus
+    kbd
     eudev
     util-linux
     iproute2
@@ -111,19 +130,30 @@ if command -v apk >/dev/null 2>&1; then
     apk update
     # shellcheck disable=SC2086
     apk add --no-cache $BASE_PKGS $ARCH_PKGS
+    # Install qt6-qtbase-x11 if split into a separate subpackage on this Alpine release
+    apk add --no-cache qt6-qtbase-x11 2>/dev/null || true
     log_ok "All Alpine packages installed."
 else
     log_warn "apk package manager not found (non-Alpine environment). Skipping package installation."
 fi
 
 # -----------------------------------------------------------------------------
-# 3. Configure USB Audio Hardware, Touchscreen Input & ALSA Group Permissions
+# 3. Configure USB Audio Hardware, Touchscreen Input, Video & ALSA Permissions
 # -----------------------------------------------------------------------------
 addgroup -S audio 2>/dev/null || true
 addgroup root audio 2>/dev/null || true
 addgroup -S input 2>/dev/null || true
 addgroup root input 2>/dev/null || true
+addgroup -S video 2>/dev/null || true
+addgroup root video 2>/dev/null || true
 addgroup -S sambashare 2>/dev/null || true
+
+# Allow Xorg to start from a post-boot OpenRC service without a controlling tty
+mkdir -p /etc/X11
+cat << 'EOF' > /etc/X11/Xwrapper.config
+allowed_users=anybody
+needs_root_rights=yes
+EOF
 
 # Ensure kernel module snd-usb-audio loads at boot and ALSA mixer state dir exists
 mkdir -p /etc/modules-load.d /var/lib/alsa
@@ -195,10 +225,6 @@ cm.save()
     fi
 fi
 
-# If the kiosk UI is already running, restart it so updated UI & VU meter take effect immediately
-if command -v pkill >/dev/null 2>&1; then
-    pkill -f "python3 -m app.main" 2>/dev/null || true
-fi
 log_ok "Application code updated in ${APP_DEST}."
 
 # -----------------------------------------------------------------------------
@@ -217,8 +243,24 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 7. Configure Openbox & Fullscreen Kiosk Autostart on tty1
+# 7. Clean Up Any Legacy tty1 Login Hijack & Configure Post-Boot VT7 Service
 # -----------------------------------------------------------------------------
+# Restore tty1 in /etc/inittab if a previous install configured autologin on tty1
+if [ -f /etc/inittab ] && grep -Eq 'alpine-recorder-autologin|getty.*-a root' /etc/inittab; then
+    log_info "Restoring normal console login on tty1 in /etc/inittab..."
+    sed -i 's|^tty1::respawn:.*|tty1::respawn:/sbin/getty 38400 tty1|g' /etc/inittab
+    kill -HUP 1 2>/dev/null || true
+    log_ok "Restored normal getty login on tty1."
+fi
+rm -f /usr/local/bin/alpine-recorder-autologin
+
+# Remove legacy startx block from /root/.profile so root logins never auto-exec startx
+if [ -f /root/.profile ] && grep -q "ALPINE_RECORDER_KIOSK_AUTOSTART" /root/.profile; then
+    log_info "Removing legacy tty1 startx hook from /root/.profile..."
+    sed -i '/# ALPINE_RECORDER_KIOSK_AUTOSTART/,/^fi$/d' /root/.profile
+    log_ok "Cleaned /root/.profile (console login shell is now separate from X11 kiosk)."
+fi
+
 mkdir -p /root/.config/openbox
 if [ ! -f /root/.config/openbox/rc.xml ] || [ "${FORCE_CONFIG}" -eq 1 ]; then
     cp "${SCRIPT_DIR}/config/openbox-rc.xml" /root/.config/openbox/rc.xml
@@ -227,47 +269,24 @@ else
     log_info "Preserving existing /root/.config/openbox/rc.xml."
 fi
 
-if [ ! -f /root/.xinitrc ] || [ "${FORCE_CONFIG}" -eq 1 ]; then
+# Install or upgrade /root/.xinitrc (upgrade automatically if missing crash-loop guard)
+if [ ! -f /root/.xinitrc ] || ! grep -q "ALPINE_RECORDER_SINGLE_RUN" /root/.xinitrc || [ "${FORCE_CONFIG}" -eq 1 ]; then
     cp "${SCRIPT_DIR}/config/xinitrc" /root/.xinitrc
     chmod +x /root/.xinitrc
-    log_ok "Installed /root/.xinitrc."
+    log_ok "Installed /root/.xinitrc with crash-loop protection and logging."
 else
     log_info "Preserving existing /root/.xinitrc."
 fi
 
-# Configure autologin on tty1 in /etc/inittab (idempotent)
-if [ -f /etc/inittab ]; then
-    if ! grep -q "autologin" /etc/inittab; then
-        log_info "Configuring tty1 autologin in /etc/inittab..."
-        cp /etc/inittab /etc/inittab.bak
-        sed -i 's|^tty1::respawn:/sbin/getty 38400 tty1|tty1::respawn:/sbin/getty -n -l /bin/sh 38400 tty1 -a root|g' /etc/inittab
-        # If standard getty doesn't support -a root, create an autologin helper script
-        cat << 'EOF' > /usr/local/bin/alpine-recorder-autologin
-#!/bin/sh
-exec /bin/login -f root
-EOF
-        chmod +x /usr/local/bin/alpine-recorder-autologin
-        sed -i 's|^tty1::respawn:.*|tty1::respawn:/sbin/getty -n -l /usr/local/bin/alpine-recorder-autologin 38400 tty1|g' /etc/inittab
-        log_ok "Configured tty1 autologin."
-    else
-        log_info "tty1 autologin already present in /etc/inittab."
-    fi
-fi
+# Install CLI launcher / diagnostic tool and OpenRC post-boot service
+mkdir -p /usr/local/bin /etc/init.d
+cp "${SCRIPT_DIR}/config/alpine-recorder" /usr/local/bin/alpine-recorder
+chmod +x /usr/local/bin/alpine-recorder
+log_ok "Installed /usr/local/bin/alpine-recorder CLI launcher and diagnostic tool."
 
-# Configure /root/.profile to launch X11 Kiosk on tty1 (idempotent)
-touch /root/.profile
-if ! grep -q "ALPINE_RECORDER_KIOSK_AUTOSTART" /root/.profile; then
-    cat << 'EOF' >> /root/.profile
-
-# ALPINE_RECORDER_KIOSK_AUTOSTART
-if [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
-    exec startx /root/.xinitrc -- -nocursor >/var/log/alpine-recorder-xorg.log 2>&1
-fi
-EOF
-    log_ok "Added fullscreen X11 kiosk autostart to /root/.profile."
-else
-    log_info "Fullscreen X11 kiosk autostart already present in /root/.profile."
-fi
+cp "${SCRIPT_DIR}/config/alpine-recorder.initd" /etc/init.d/alpine-recorder
+chmod +x /etc/init.d/alpine-recorder
+log_ok "Installed /etc/init.d/alpine-recorder post-boot OpenRC service."
 
 # -----------------------------------------------------------------------------
 # 8. Enable OpenRC System Services
@@ -283,7 +302,16 @@ if command -v rc-update >/dev/null 2>&1; then
 
     rc-service samba restart 2>/dev/null || rc-service samba start 2>/dev/null || true
     rc-service alsa start 2>/dev/null || true
-    log_ok "OpenRC services enabled."
+
+    if [ "${ENABLE_SERVICE}" -eq 1 ]; then
+        rc-update add alpine-recorder default 2>/dev/null || true
+        rc-service alpine-recorder restart 2>/dev/null || rc-service alpine-recorder start 2>/dev/null || true
+        log_ok "Enabled and started alpine-recorder OpenRC service on VT7 (tty1 remains a normal login console)."
+    else
+        rc-update del alpine-recorder default 2>/dev/null || true
+        rc-service alpine-recorder stop 2>/dev/null || true
+        log_info "Disabled automatic boot service (--disable-service). Run 'alpine-recorder' manually when ready."
+    fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -294,13 +322,15 @@ if command -v lbu >/dev/null 2>&1; then
     lbu include "${APP_DEST}" 2>/dev/null || true
     lbu include "${ETC_CONFIG_DIR}" 2>/dev/null || true
     lbu include /etc/modules-load.d 2>/dev/null || true
+    lbu include /etc/X11/Xwrapper.config 2>/dev/null || true
     lbu include /var/lib/alsa 2>/dev/null || true
     lbu include /etc/samba 2>/dev/null || true
     lbu include /var/lib/samba/private 2>/dev/null || true
     lbu include /root/.xinitrc 2>/dev/null || true
     lbu include /root/.profile 2>/dev/null || true
     lbu include /root/.config/openbox 2>/dev/null || true
-    lbu include /usr/local/bin/alpine-recorder-autologin 2>/dev/null || true
+    lbu include /usr/local/bin/alpine-recorder 2>/dev/null || true
+    lbu include /etc/init.d/alpine-recorder 2>/dev/null || true
     lbu include "${LOCAL_STORAGE_SCRIPT}" 2>/dev/null || true
     lbu include /etc/inittab 2>/dev/null || true
 
@@ -322,3 +352,5 @@ else
 fi
 
 log_ok "Alpine Recording Station installation/update complete!"
+log_info "Console login on tty1 (Ctrl+Alt+F1) is independent of the kiosk UI on VT7 (Ctrl+Alt+F7)."
+log_info "Use 'alpine-recorder status', 'alpine-recorder logs', or 'alpine-recorder doctor' to troubleshoot."

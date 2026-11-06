@@ -57,6 +57,7 @@ class SettingsDialog(QDialog):
         self._playback_devices: List[AudioDeviceCapabilities] = []
         self._device_map: Dict[str, AudioDeviceCapabilities] = {}
         self._initializing = True
+        self.exit_to_console_requested = False
 
         self.osk_controller = OnScreenKeyboardController(
             is_enabled=self._is_osk_enabled,
@@ -93,6 +94,16 @@ class SettingsDialog(QDialog):
         self.ip_info_label.setStyleSheet("color: #8B949E;")
         bottom_bar.addWidget(self.ip_info_label)
         bottom_bar.addStretch(1)
+
+        self.exit_kiosk_btn = QPushButton("Exit to Console")
+        self.exit_kiosk_btn.setToolTip(
+            "Close the recorder UI and return to the Linux console (tty1) for troubleshooting [Hotkey: Ctrl+Q]"
+        )
+        self.exit_kiosk_btn.setStyleSheet(
+            "background-color: #21262D; color: #F85149; border: 1px solid #8E1523;"
+        )
+        self.exit_kiosk_btn.clicked.connect(self._on_exit_to_console)
+        bottom_bar.addWidget(self.exit_kiosk_btn)
 
         self.rescan_btn = QPushButton("Rescan Audio Hardware")
         self.rescan_btn.setToolTip(
@@ -407,6 +418,17 @@ class SettingsDialog(QDialog):
 
     def _on_rescan_devices(self) -> None:
         self._populate_devices_and_settings(force_probe=True)
+
+    def _on_exit_to_console(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Exit to Linux Console",
+            "Close Alpine Recording Station and return to the Linux console (tty1) for troubleshooting?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.exit_to_console_requested = True
+            self.reject()
 
     def _on_input_device_changed(self, _index: int) -> None:
         if self._initializing:
