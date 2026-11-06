@@ -295,7 +295,7 @@ class OnScreenKeyboardDialog(QDialog):
         self.input_edit.textChanged.connect(self._on_display_text_changed)
         input_row.addWidget(self.input_edit, stretch=1)
 
-        self.show_pw_btn = QPushButton("👁 Show")
+        self.show_pw_btn = QPushButton("◉ Show")
         self.show_pw_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.show_pw_btn.setToolTip("Toggle password visibility while typing")
         self.show_pw_btn.clicked.connect(self.toggle_password_visibility)
@@ -470,7 +470,7 @@ class OnScreenKeyboardDialog(QDialog):
 
         is_pw = target.echoMode() == QLineEdit.EchoMode.Password
         self.show_pw_btn.setVisible(is_pw)
-        self.show_pw_btn.setText("👁 Show")
+        self.show_pw_btn.setText("◉ Show")
 
         has_siblings = len(self._sibling_fields) > 1
         self.next_field_btn.setVisible(has_siblings)
@@ -619,10 +619,10 @@ class OnScreenKeyboardDialog(QDialog):
         self._password_revealed = not self._password_revealed
         if self._password_revealed:
             self.input_edit.setEchoMode(QLineEdit.EchoMode.Normal)
-            self.show_pw_btn.setText("🙈 Hide")
+            self.show_pw_btn.setText("○ Hide")
         else:
             self.input_edit.setEchoMode(QLineEdit.EchoMode.Password)
-            self.show_pw_btn.setText("👁 Show")
+            self.show_pw_btn.setText("◉ Show")
 
     def switch_to_next_field(self) -> None:
         """Commit current field text and advance to the next sibling QLineEdit."""

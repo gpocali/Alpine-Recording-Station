@@ -386,7 +386,7 @@ class VuMeterWidget(QFrame):
             )
         elif is_recording and is_paused:
             self.title_label.setText(
-                "⏸ INPUT VU METER (RECORDING PAUSED — FILE SAVED & CLOSED)"
+                "❚❚ INPUT VU METER (RECORDING PAUSED — FILE SAVED & CLOSED)"
             )
             self.title_label.setStyleSheet(
                 f"border: none; color: #FFDF5D; font-weight: bold; font-size: {small_px}px;"

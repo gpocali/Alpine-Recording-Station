@@ -25,6 +25,10 @@ from app.audio_engine import (
 )
 from app.config_manager import (
     ConfigManager,
+    compute_wav_byte_rate,
+    format_remaining_hms,
+    format_remaining_time,
+    format_storage_bytes,
     generate_recording_filename,
     sanitize_project_name,
 )
@@ -644,6 +648,206 @@ class TestComboBoxDropdownStyles(unittest.TestCase):
                         "#F0F6FC",
                     )
         _ = (app, configure_combo_box_popup)
+
+
+class TestStorageMonitoringAndRemainingTime(unittest.TestCase):
+    def test_byte_rate_and_remaining_time_calculations(self) -> None:
+        # 24-bit (3 bytes) * 48,000 Hz * 1 ch (Mono) = 144,000 bytes/sec
+        self.assertEqual(
+            compute_wav_byte_rate(48000, 24, channels=1, studio_mode=False),
+            144000,
+        )
+        # Studio mode forces 2 channels -> 288,000 bytes/sec
+        self.assertEqual(
+            compute_wav_byte_rate(48000, 24, channels=1, studio_mode=True),
+            288000,
+        )
+        # 32-bit (4 bytes) * 96,000 Hz * 2 ch (Stereo) = 768,000 bytes/sec
+        self.assertEqual(
+            compute_wav_byte_rate(96000, 32, channels=2, studio_mode=False),
+            768000,
+        )
+
+        self.assertEqual(format_storage_bytes(512), "512 B")
+        self.assertEqual(format_storage_bytes(2048), "2.0 KB")
+        self.assertEqual(format_storage_bytes(10 * 1024 * 1024), "10.0 MB")
+        self.assertEqual(format_storage_bytes(25 * (1024 ** 3)), "25.0 GB")
+        self.assertEqual(format_remaining_time(3661.9), "01h 01m 01s")
+        self.assertEqual(format_remaining_hms(3661.9), "01:01:01")
+        self.assertEqual(format_remaining_time(125 * 3600 + 1800), "125h 30m")
+
+    def test_storage_status_utilization_thresholds_and_settings_scaling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(
+                storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc")
+            )
+            cm.settings.sample_rate = 48000
+            cm.settings.bit_depth = 24
+            cm.settings.channels = 1
+            cm.settings.studio_mode = False
+
+            # 1. Healthy drive: 50% used, 10 hours remaining at 48k/24b Mono (144,000 B/s)
+            free_10h = 10 * 3600 * 144000
+            total_cap = free_10h * 2
+            st_ok = cm.get_storage_status(
+                disk_usage_fn=lambda _p: (total_cap, free_10h, free_10h)
+            )
+            self.assertEqual(st_ok.level, "ok")
+            self.assertFalse(st_ok.is_warning)
+            self.assertFalse(st_ok.is_critical)
+            self.assertAlmostEqual(st_ok.used_percent, 50.0, places=2)
+            self.assertAlmostEqual(st_ok.remaining_seconds, 36000.0, places=2)
+            self.assertEqual(st_ok.formatted_remaining, "10h 00m 00s")
+
+            # Switching to Studio Mode (2 channels) halves remaining recording time to 5 hours
+            st_studio = cm.get_storage_status(
+                studio_mode=True,
+                disk_usage_fn=lambda _p: (total_cap, free_10h, free_10h),
+            )
+            self.assertEqual(st_studio.effective_channels, 2)
+            self.assertAlmostEqual(st_studio.remaining_seconds, 18000.0, places=2)
+            self.assertEqual(st_studio.formatted_remaining, "05h 00m 00s")
+
+            # 2. Warning threshold by drive utilization (85% used, even with plenty of time)
+            st_warn_pct = cm.get_storage_status(
+                disk_usage_fn=lambda _p: (100 * (1024 ** 3), 85 * (1024 ** 3), 15 * (1024 ** 3))
+            )
+            self.assertEqual(st_warn_pct.level, "warning")
+            self.assertTrue(st_warn_pct.is_warning)
+            self.assertFalse(st_warn_pct.is_critical)
+            self.assertAlmostEqual(st_warn_pct.used_percent, 85.0, places=2)
+
+            # 3. Warning threshold by low remaining recording time (20 minutes left, even at 40% used)
+            free_20m = 20 * 60 * 144000
+            st_warn_time = cm.get_storage_status(
+                disk_usage_fn=lambda _p: (free_20m * 2, free_20m, free_20m)
+            )
+            self.assertEqual(st_warn_time.level, "warning")
+            self.assertEqual(st_warn_time.formatted_remaining, "00h 20m 00s")
+
+            # 4. Critical threshold by drive utilization (94% used)
+            st_crit_pct = cm.get_storage_status(
+                disk_usage_fn=lambda _p: (100 * (1024 ** 3), 94 * (1024 ** 3), 6 * (1024 ** 3))
+            )
+            self.assertEqual(st_crit_pct.level, "critical")
+            self.assertTrue(st_crit_pct.is_critical)
+            self.assertAlmostEqual(st_crit_pct.used_percent, 94.0, places=2)
+
+            # 5. Critical threshold by low remaining time (5 minutes left)
+            free_5m = 5 * 60 * 144000
+            st_crit_time = cm.get_storage_status(
+                disk_usage_fn=lambda _p: (free_5m * 4, free_5m * 3, free_5m)
+            )
+            self.assertEqual(st_crit_time.level, "critical")
+            self.assertEqual(st_crit_time.formatted_remaining, "00h 05m 00s")
+
+            # 6. Full drive (0 free bytes)
+            st_full = cm.get_storage_status(
+                disk_usage_fn=lambda _p: (100 * (1024 ** 3), 100 * (1024 ** 3), 0)
+            )
+            self.assertEqual(st_full.level, "full")
+            self.assertTrue(st_full.is_critical)
+            self.assertEqual(st_full.remaining_seconds, 0.0)
+            self.assertEqual(st_full.formatted_remaining, "00h 00m 00s")
+
+    def test_storage_monitor_widget_and_settings_preview(self) -> None:
+        try:
+            import os
+
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PyQt6.QtWidgets import QApplication
+            from app.ui.storage_monitor import StorageMonitorWidget
+            from app.ui.settings_dialog import SettingsDialog
+        except Exception:
+            return
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(
+                storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc")
+            )
+            widget = StorageMonitorWidget()
+
+            st_ok = cm.get_storage_status(
+                sample_rate=48000,
+                bit_depth=24,
+                channels=1,
+                studio_mode=False,
+                disk_usage_fn=lambda _p: (100_000_000_000, 35_000_000_000, 65_000_000_000),
+            )
+            widget.set_status(st_ok)
+            self.assertEqual(widget.value(), 35)
+            self.assertIn("SPACE OK", widget.status_badge.text())
+            self.assertIn("TIME REMAINING:", widget.remaining_label.text())
+
+            st_warn = cm.get_storage_status(
+                sample_rate=48000,
+                bit_depth=24,
+                channels=2,
+                studio_mode=True,
+                disk_usage_fn=lambda _p: (100_000_000_000, 84_000_000_000, 16_000_000_000),
+            )
+            widget.set_status(st_warn)
+            self.assertEqual(widget.value(), 84)
+            self.assertIn("LOW SPACE", widget.status_badge.text())
+            self.assertIn("GETTING FULL", widget.title_label.text())
+
+            st_crit = cm.get_storage_status(
+                sample_rate=96000,
+                bit_depth=32,
+                channels=2,
+                studio_mode=True,
+                disk_usage_fn=lambda _p: (100_000_000_000, 95_000_000_000, 5_000_000_000),
+            )
+            widget.set_status(st_crit, is_recording=True)
+            self.assertEqual(widget.value(), 95)
+            self.assertIn("CRITICAL", widget.status_badge.text())
+            self.assertIn("CRITICALLY FULL", widget.title_label.text())
+
+            # Verify SettingsDialog live storage preview updates when format settings change
+            engine = AudioEngine(simulate_if_empty=True)
+            sm = SambaManager(cm)
+            sm.pdbedit_bin = None
+            sm.smbpasswd_bin = None
+            dlg = SettingsDialog(
+                config_manager=cm,
+                audio_engine=engine,
+                samba_manager=sm,
+            )
+            self.assertIn("Time Remaining:", dlg.storage_info_label.text())
+            self.assertIn("/storage Utilization:", dlg.storage_info_label.text())
+        _ = app
+
+
+class TestUiGlyphsAndButtonMnemonics(unittest.TestCase):
+    def test_dejavu_compatible_icons_and_escaped_button_ampersands(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        ui_dir = repo_root / "app" / "ui"
+        for py_file in sorted(ui_dir.glob("*.py")):
+            content = py_file.read_text(encoding="utf-8")
+            # Ensure no Unicode 7.0 U+23F8 or SMP emojis (U+10000+, e.g. U+1F399)
+            # that render as missing-glyph boxes in Alpine's ttf-dejavu fonts
+            self.assertNotIn("\u23f8", content, f"Unsupported U+23F8 pause char in {py_file.name}")
+            self.assertNotIn("\U0001f399", content, f"Unsupported U+1F399 mic emoji in {py_file.name}")
+            non_bmp = [ch for ch in content if ord(ch) > 0xFFFF]
+            self.assertEqual(
+                non_bmp,
+                [],
+                f"Non-BMP character(s) found in {py_file.name}: {[hex(ord(c)) for c in non_bmp]}",
+            )
+
+        main_win_text = (ui_dir / "main_window.py").read_text(encoding="utf-8")
+        self.assertIn("❚❚", main_win_text)
+        self.assertIn("◉  TALKBACK", main_win_text)
+        self.assertIn("STOP && SAVE", main_win_text)
+        self.assertNotIn('"■   STOP & SAVE"', main_win_text)
+
+        settings_text = (ui_dir / "settings_dialog.py").read_text(encoding="utf-8")
+        self.assertIn('"Save && Apply Settings"', settings_text)
+        self.assertNotIn('"Save & Apply Settings"', settings_text)
+        self.assertIn('"Audio && Recording Settings"', settings_text)
 
 
 if __name__ == "__main__":

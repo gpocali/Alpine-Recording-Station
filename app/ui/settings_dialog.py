@@ -100,7 +100,7 @@ class SettingsDialog(QDialog):
         # Tab 1: Audio & Recording Settings
         self.audio_tab = QWidget()
         self._build_audio_tab(self.audio_tab)
-        self.tabs.addTab(self.audio_tab, "Audio & Recording Settings")
+        self.tabs.addTab(self.audio_tab, "Audio && Recording Settings")
 
         # Tab 2: Samba Share Access
         self.samba_tab = QWidget()
@@ -137,7 +137,7 @@ class SettingsDialog(QDialog):
         self.cancel_btn.clicked.connect(self.reject)
         bottom_bar.addWidget(self.cancel_btn)
 
-        self.save_btn = QPushButton("Save & Apply Settings")
+        self.save_btn = QPushButton("Save && Apply Settings")
         self.save_btn.setToolTip(
             "Save settings persistently to /storage and LBU [Hotkey: Ctrl+S or Enter]"
         )
@@ -179,12 +179,14 @@ class SettingsDialog(QDialog):
         self.bit_depth_combo.setToolTip(
             "Hardware-supported bit depth (defaults to maximum supported by interface)"
         )
+        self.bit_depth_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Bit Depth:", self.bit_depth_combo)
 
         self.sample_rate_combo = QComboBox()
         self.sample_rate_combo.setToolTip(
             "Hardware-supported sample rate (defaults to maximum supported by interface)"
         )
+        self.sample_rate_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Sample Rate:", self.sample_rate_combo)
 
         self.mode_combo = QComboBox()
@@ -206,6 +208,7 @@ class SettingsDialog(QDialog):
         self.channels_combo.setToolTip(
             "Select Mono or Stereo output file (Studio Mode automatically uses Stereo)"
         )
+        self.channels_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Recording Channels:", self.channels_combo)
 
         self.input_channel_combo = QComboBox()
@@ -282,6 +285,10 @@ class SettingsDialog(QDialog):
             "background-color: #0D1014; color: #8B949E; padding: 10px; border-radius: 6px; border: 1px solid #21262D;"
         )
         layout.addWidget(self.mode_hint_label)
+
+        self.storage_info_label = QLabel()
+        self.storage_info_label.setWordWrap(True)
+        layout.addWidget(self.storage_info_label)
         layout.addStretch(1)
 
     def _build_samba_tab(self, container: QWidget) -> None:
@@ -547,61 +554,69 @@ class SettingsDialog(QDialog):
         dev_id = str(self.input_device_combo.currentData() or "")
         dev = self._device_map.get(dev_id)
 
-        self.bit_depth_combo.clear()
-        self.sample_rate_combo.clear()
-        self.input_channel_combo.clear()
+        self.bit_depth_combo.blockSignals(True)
+        self.sample_rate_combo.blockSignals(True)
+        try:
+            self.bit_depth_combo.clear()
+            self.sample_rate_combo.clear()
+            self.input_channel_combo.clear()
 
-        if dev is None:
-            # Disconnected or no hardware available
-            for bd in (16, 24, 32):
+            if dev is None:
+                # Disconnected or no hardware available
+                for bd in (16, 24, 32):
+                    self.bit_depth_combo.addItem(f"{bd}-bit PCM", bd)
+                for sr in (44100, 48000, 96000):
+                    self.sample_rate_combo.addItem(f"{sr:,} Hz", sr)
+                self.input_channel_combo.addItem("Channel 1 (Default)", 0)
+                return
+
+            # Populate supported bit depths (ascending order, defaulting to maximum)
+            for bd in sorted(dev.supported_bit_depths):
                 self.bit_depth_combo.addItem(f"{bd}-bit PCM", bd)
-            for sr in (44100, 48000, 96000):
+
+            # Populate supported sample rates (ascending order, defaulting to maximum)
+            for sr in sorted(dev.supported_sample_rates):
                 self.sample_rate_combo.addItem(f"{sr:,} Hz", sr)
-            self.input_channel_combo.addItem("Channel 1 (Default)", 0)
-            return
 
-        # Populate supported bit depths (ascending order, defaulting to maximum)
-        for bd in sorted(dev.supported_bit_depths):
-            self.bit_depth_combo.addItem(f"{bd}-bit PCM", bd)
+            # Populate input channels
+            max_in_ch = max(1, dev.max_channels)
+            for ch_i in range(max_in_ch):
+                label = f"Input Channel {ch_i + 1}" + (" (Default)" if ch_i == 0 else "")
+                self.input_channel_combo.addItem(label, ch_i)
 
-        # Populate supported sample rates (ascending order, defaulting to maximum)
-        for sr in sorted(dev.supported_sample_rates):
-            self.sample_rate_combo.addItem(f"{sr:,} Hz", sr)
+            # Determine target bit depth & sample rate (default to hardware MAX)
+            target_bd = dev.max_bit_depth
+            target_sr = dev.max_sample_rate
+            target_in_ch = settings.input_channel
 
-        # Populate input channels
-        max_in_ch = max(1, dev.max_channels)
-        for ch_i in range(max_in_ch):
-            label = f"Input Channel {ch_i + 1}" + (" (Default)" if ch_i == 0 else "")
-            self.input_channel_combo.addItem(label, ch_i)
+            saved_per_dev = settings.known_device_defaults.get(dev_id, {})
+            if use_saved_values and settings.bit_depth in dev.supported_bit_depths:
+                target_bd = settings.bit_depth
+            elif saved_per_dev.get("bit_depth") in dev.supported_bit_depths:
+                target_bd = int(saved_per_dev["bit_depth"])
 
-        # Determine target bit depth & sample rate (default to hardware MAX)
-        target_bd = dev.max_bit_depth
-        target_sr = dev.max_sample_rate
-        target_in_ch = settings.input_channel
+            if use_saved_values and settings.sample_rate in dev.supported_sample_rates:
+                target_sr = settings.sample_rate
+            elif saved_per_dev.get("sample_rate") in dev.supported_sample_rates:
+                target_sr = int(saved_per_dev["sample_rate"])
 
-        saved_per_dev = settings.known_device_defaults.get(dev_id, {})
-        if use_saved_values and settings.bit_depth in dev.supported_bit_depths:
-            target_bd = settings.bit_depth
-        elif saved_per_dev.get("bit_depth") in dev.supported_bit_depths:
-            target_bd = int(saved_per_dev["bit_depth"])
+            bd_idx = self.bit_depth_combo.findData(target_bd)
+            self.bit_depth_combo.setCurrentIndex(
+                bd_idx if bd_idx >= 0 else self.bit_depth_combo.count() - 1
+            )
 
-        if use_saved_values and settings.sample_rate in dev.supported_sample_rates:
-            target_sr = settings.sample_rate
-        elif saved_per_dev.get("sample_rate") in dev.supported_sample_rates:
-            target_sr = int(saved_per_dev["sample_rate"])
+            sr_idx = self.sample_rate_combo.findData(target_sr)
+            self.sample_rate_combo.setCurrentIndex(
+                sr_idx if sr_idx >= 0 else self.sample_rate_combo.count() - 1
+            )
 
-        bd_idx = self.bit_depth_combo.findData(target_bd)
-        self.bit_depth_combo.setCurrentIndex(
-            bd_idx if bd_idx >= 0 else self.bit_depth_combo.count() - 1
-        )
+            in_ch_idx = self.input_channel_combo.findData(target_in_ch)
+            self.input_channel_combo.setCurrentIndex(in_ch_idx if in_ch_idx >= 0 else 0)
+        finally:
+            self.bit_depth_combo.blockSignals(False)
+            self.sample_rate_combo.blockSignals(False)
 
-        sr_idx = self.sample_rate_combo.findData(target_sr)
-        self.sample_rate_combo.setCurrentIndex(
-            sr_idx if sr_idx >= 0 else self.sample_rate_combo.count() - 1
-        )
-
-        in_ch_idx = self.input_channel_combo.findData(target_in_ch)
-        self.input_channel_combo.setCurrentIndex(in_ch_idx if in_ch_idx >= 0 else 0)
+        self._update_storage_preview()
 
     def _on_mode_changed(self, _index: int) -> None:
         self._update_mode_ui_state()
@@ -645,6 +660,57 @@ class SettingsDialog(QDialog):
                 "Normal Mode Active: Records microphone directly in either Mono (1-channel) "
                 "or Stereo (2-channel) at the selected bit depth and sample rate."
             )
+
+        self._update_storage_preview()
+
+    def _update_storage_preview(self) -> None:
+        if not hasattr(self, "storage_info_label"):
+            return
+        bd = int(self.bit_depth_combo.currentData() or 24)
+        sr = int(self.sample_rate_combo.currentData() or 48000)
+        studio = bool(self.mode_combo.currentData())
+        ch = 2 if studio else int(self.channels_combo.currentData() or 1)
+
+        st = self.config_manager.get_storage_status(
+            sample_rate=sr,
+            bit_depth=bd,
+            channels=ch,
+            studio_mode=studio,
+        )
+        ch_str = "Studio Stereo (2ch)" if studio else ("Stereo (2ch)" if ch >= 2 else "Mono (1ch)")
+        if not st.available:
+            self.storage_info_label.setText(
+                f"Storage ({st.storage_path}): Unavailable"
+            )
+            self.storage_info_label.setStyleSheet(
+                "background-color: #0D1014; color: #6E7681; padding: 8px 10px; "
+                "border-radius: 6px; border: 1px solid #21262D; font-family: monospace;"
+            )
+            return
+
+        prefix_badge = ""
+        if st.level == "full":
+            fg, bg, border = "#FF6B7A", "#240D11", "#F85149"
+            prefix_badge = "⛔ DRIVE FULL — "
+        elif st.level == "critical":
+            fg, bg, border = "#FF6B7A", "#200E12", "#F85149"
+            prefix_badge = "⚠ CRITICAL LOW SPACE — "
+        elif st.level == "warning":
+            fg, bg, border = "#FFDF5D", "#19150B", "#D29922"
+            prefix_badge = "⚠ LOW DISK SPACE — "
+        else:
+            fg, bg, border = "#58A6FF", "#0D1014", "#1F6FEB"
+
+        self.storage_info_label.setText(
+            f"{prefix_badge}/storage Utilization: {st.used_percent:.1f}% used "
+            f"({st.formatted_free} free of {st.formatted_total})  •  "
+            f"Rate: {st.mb_per_minute:.1f} MB/min ({bd}-bit / {sr:,} Hz / {ch_str})  •  "
+            f"Time Remaining: {st.formatted_remaining}"
+        )
+        self.storage_info_label.setStyleSheet(
+            f"background-color: {bg}; color: {fg}; padding: 8px 10px; "
+            f"border-radius: 6px; border: 1px solid {border}; font-family: monospace; font-weight: bold;"
+        )
 
     def _on_save_settings(self) -> None:
         s = self.config_manager.settings

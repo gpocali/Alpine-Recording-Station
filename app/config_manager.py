@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -12,12 +13,17 @@ import subprocess
 import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_STORAGE_DIR = "/storage"
 DEFAULT_ETC_CONFIG_DIR = "/etc/alpine-recorder"
+
+STORAGE_WARN_USED_PERCENT: float = 80.0
+STORAGE_CRITICAL_USED_PERCENT: float = 90.0
+STORAGE_WARN_REMAINING_SEC: float = 1800.0      # 30 minutes
+STORAGE_CRITICAL_REMAINING_SEC: float = 600.0   # 10 minutes
 
 TALKBACK_TONE_FREQ_OPTIONS: tuple[tuple[float, str], ...] = (
     (330.0, "330 Hz (E4 — Warm Low, Very Easy on Ear)"),
@@ -128,6 +134,126 @@ class RecordingEntry:
             return f"{mb:.1f} MB"
         kb = self.size_bytes / 1024
         return f"{kb:.1f} KB"
+
+
+def compute_wav_byte_rate(
+    sample_rate: int,
+    bit_depth: int,
+    channels: int = 1,
+    studio_mode: bool = False,
+) -> int:
+    """Compute uncompressed PCM WAV byte rate (bytes per second) for given settings."""
+    sr = int(sample_rate) if int(sample_rate) > 0 else 48000
+    bd = int(bit_depth) if int(bit_depth) in (16, 24, 32) else 24
+    eff_channels = 2 if (studio_mode or int(channels) >= 2) else 1
+    bytes_per_sample = bd // 8
+    return sr * eff_channels * bytes_per_sample
+
+
+def format_storage_bytes(num_bytes: int) -> str:
+    """Format a byte count into a human-readable capacity string (TB, GB, MB, KB, B)."""
+    val = max(0, int(num_bytes))
+    tb = 1024 ** 4
+    gb = 1024 ** 3
+    mb = 1024 ** 2
+    kb = 1024
+    if val >= tb:
+        return f"{val / tb:.2f} TB"
+    if val >= gb:
+        gb_val = val / gb
+        return f"{gb_val:.1f} GB" if gb_val >= 10.0 else f"{gb_val:.2f} GB"
+    if val >= mb:
+        return f"{val / mb:.1f} MB"
+    if val >= kb:
+        return f"{val / kb:.1f} KB"
+    return f"{val} B"
+
+
+def format_remaining_time(seconds: float) -> str:
+    """Format remaining recording duration in seconds as 'HHh MMm SSs' (or 'HHH+h MMm')."""
+    total_sec = max(0, int(math.floor(max(0.0, float(seconds)))))
+    mins, secs = divmod(total_sec, 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs >= 100:
+        return f"{hrs:,}h {mins:02d}m"
+    return f"{hrs:02d}h {mins:02d}m {secs:02d}s"
+
+
+def format_remaining_hms(seconds: float) -> str:
+    """Format remaining recording duration in seconds as 'HH:MM:SS'."""
+    total_sec = max(0, int(math.floor(max(0.0, float(seconds)))))
+    mins, secs = divmod(total_sec, 60)
+    hrs, mins = divmod(mins, 60)
+    return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+
+
+@dataclass
+class StorageStatus:
+    """Telemetry snapshot for /storage drive utilization and recording time remaining."""
+
+    storage_path: Path
+    total_bytes: int = 0
+    used_bytes: int = 0
+    free_bytes: int = 0
+    used_percent: float = 0.0
+    sample_rate: int = 48000
+    bit_depth: int = 24
+    channels: int = 1
+    studio_mode: bool = False
+    byte_rate: int = 0
+    remaining_seconds: float = 0.0
+    level: str = "ok"  # "ok", "warning", "critical", "full", or "offline"
+    available: bool = True
+
+    @property
+    def effective_channels(self) -> int:
+        return 2 if (self.studio_mode or self.channels >= 2) else 1
+
+    @property
+    def formatted_remaining(self) -> str:
+        return format_remaining_time(self.remaining_seconds)
+
+    @property
+    def formatted_remaining_hms(self) -> str:
+        return format_remaining_hms(self.remaining_seconds)
+
+    @property
+    def formatted_free(self) -> str:
+        return format_storage_bytes(self.free_bytes)
+
+    @property
+    def formatted_used(self) -> str:
+        return format_storage_bytes(self.used_bytes)
+
+    @property
+    def formatted_total(self) -> str:
+        return format_storage_bytes(self.total_bytes)
+
+    @property
+    def mb_per_minute(self) -> float:
+        if self.byte_rate <= 0:
+            return 0.0
+        return (self.byte_rate * 60.0) / (1024.0 * 1024.0)
+
+    @property
+    def is_warning(self) -> bool:
+        return self.level == "warning"
+
+    @property
+    def is_critical(self) -> bool:
+        return self.level in ("critical", "full")
+
+    @property
+    def status_badge_text(self) -> str:
+        if not self.available or self.level == "offline":
+            return "OFFLINE"
+        if self.level == "full":
+            return "DRIVE FULL"
+        if self.level == "critical":
+            return "CRITICAL LOW SPACE"
+        if self.level == "warning":
+            return "LOW SPACE"
+        return "OK"
 
 
 class ConfigManager:
@@ -398,6 +524,101 @@ class ConfigManager:
         # Newest recordings first
         entries.sort(key=lambda e: e.modified_time, reverse=True)
         return entries
+
+    def get_storage_status(
+        self,
+        sample_rate: Optional[int] = None,
+        bit_depth: Optional[int] = None,
+        channels: Optional[int] = None,
+        studio_mode: Optional[bool] = None,
+        disk_usage_fn: Optional[Callable[[Path], Tuple[int, int, int]]] = None,
+    ) -> StorageStatus:
+        """Query /storage disk utilization and calculate recording time remaining for current or given settings."""
+        sr_raw = sample_rate if sample_rate is not None else self.settings.sample_rate
+        bd_raw = bit_depth if bit_depth is not None else self.settings.bit_depth
+        st_mode = bool(
+            studio_mode if studio_mode is not None else self.settings.studio_mode
+        )
+        ch_raw = channels if channels is not None else self.settings.channels
+
+        sr = int(sr_raw) if int(sr_raw) > 0 else 48000
+        bd = int(bd_raw) if int(bd_raw) in (16, 24, 32) else 24
+        eff_ch = 2 if (st_mode or int(ch_raw) >= 2) else 1
+        byte_rate = compute_wav_byte_rate(sr, bd, eff_ch, st_mode)
+
+        probe_path = self.storage_dir
+        try:
+            while not probe_path.exists() and probe_path.parent != probe_path:
+                probe_path = probe_path.parent
+            usage_fn = disk_usage_fn if disk_usage_fn is not None else shutil.disk_usage
+            usage = usage_fn(probe_path)
+            total_bytes = max(0, int(usage[0]))
+            raw_used = max(0, int(usage[1]))
+            free_bytes = max(0, int(usage[2]))
+        except Exception as exc:
+            logger.debug("Could not query disk usage for %s: %s", self.storage_dir, exc)
+            return StorageStatus(
+                storage_path=self.storage_dir,
+                sample_rate=sr,
+                bit_depth=bd,
+                channels=eff_ch,
+                studio_mode=st_mode,
+                byte_rate=byte_rate,
+                level="offline",
+                available=False,
+            )
+
+        if total_bytes <= 0:
+            return StorageStatus(
+                storage_path=self.storage_dir,
+                sample_rate=sr,
+                bit_depth=bd,
+                channels=eff_ch,
+                studio_mode=st_mode,
+                byte_rate=byte_rate,
+                level="offline",
+                available=False,
+            )
+
+        # Ensure used_bytes accounts for unavailable space so 0 free bytes == 100.0% used
+        used_bytes = min(total_bytes, max(raw_used, total_bytes - free_bytes))
+        used_percent = min(100.0, max(0.0, (used_bytes / total_bytes) * 100.0))
+
+        if byte_rate > 0 and free_bytes > 44:
+            remaining_seconds = float(free_bytes) / float(byte_rate)
+        else:
+            remaining_seconds = 0.0
+
+        if free_bytes <= 44 or remaining_seconds < 1.0 or used_percent >= 99.95:
+            level = "full"
+        elif (
+            used_percent >= STORAGE_CRITICAL_USED_PERCENT
+            or remaining_seconds <= STORAGE_CRITICAL_REMAINING_SEC
+        ):
+            level = "critical"
+        elif (
+            used_percent >= STORAGE_WARN_USED_PERCENT
+            or remaining_seconds <= STORAGE_WARN_REMAINING_SEC
+        ):
+            level = "warning"
+        else:
+            level = "ok"
+
+        return StorageStatus(
+            storage_path=self.storage_dir,
+            total_bytes=total_bytes,
+            used_bytes=used_bytes,
+            free_bytes=free_bytes,
+            used_percent=used_percent,
+            sample_rate=sr,
+            bit_depth=bd,
+            channels=eff_ch,
+            studio_mode=st_mode,
+            byte_rate=byte_rate,
+            remaining_seconds=remaining_seconds,
+            level=level,
+            available=True,
+        )
 
     @staticmethod
     def _probe_wav_header(filepath: Path, file_size: int) -> tuple[float, int, int, int]:

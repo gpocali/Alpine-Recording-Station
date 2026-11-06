@@ -43,6 +43,7 @@ from app.ui.styles import (
     build_talkback_button_style,
     compute_scale_factor,
 )
+from app.ui.storage_monitor import StorageMonitorWidget
 from app.ui.vu_meter import VuMeterWidget
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ class MainWindow(QMainWindow):
         self._project_recordings: List[RecordingEntry] = []
         self._talkback_key_held = False
         self._pause_blink_phase = True
+        self._last_storage_refresh_monotonic: float = 0.0
 
         self.osk_controller = OnScreenKeyboardController(
             is_enabled=lambda: bool(self.config_manager.settings.on_screen_keyboard),
@@ -217,6 +219,10 @@ class MainWindow(QMainWindow):
         self.level_bar = self.vu_meter
         deck_layout.addWidget(self.vu_meter)
 
+        # Graphical Storage Utilization & Recording Time Remaining Monitor
+        self.storage_monitor = StorageMonitorWidget(parent=self.deck_frame)
+        deck_layout.addWidget(self.storage_monitor)
+
         # Primary Transport Controls Row (Record/Stop + Pause/Resume + Studio Talkback)
         controls_row = QHBoxLayout()
         controls_row.setSpacing(16)
@@ -231,7 +237,7 @@ class MainWindow(QMainWindow):
         self.record_btn.clicked.connect(self._on_record_button_clicked)
         controls_row.addWidget(self.record_btn, stretch=3)
 
-        self.pause_record_btn = QPushButton("⏸  PAUSE\nRECORDING")
+        self.pause_record_btn = QPushButton("❚❚  PAUSE\nRECORDING")
         self.pause_record_btn.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -242,7 +248,7 @@ class MainWindow(QMainWindow):
         self.pause_record_btn.clicked.connect(self._on_pause_record_button_clicked)
         controls_row.addWidget(self.pause_record_btn, stretch=2)
 
-        self.talkback_btn = QPushButton("🎙  TALKBACK\n(HOLD FOR NOTES)")
+        self.talkback_btn = QPushButton("◉  TALKBACK\n(HOLD FOR NOTES)")
         self.talkback_btn.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -349,11 +355,12 @@ class MainWindow(QMainWindow):
         timer_font.setStyleHint(QFont.StyleHint.Monospace)
         self.timer_label.setFont(timer_font)
 
-        btn_min_h = max(72, int(round(130 * self._scale)))
+        btn_min_h = max(68, int(round(120 * self._scale)))
         self.record_btn.setMinimumHeight(btn_min_h)
         self.pause_record_btn.setMinimumHeight(btn_min_h)
         self.talkback_btn.setMinimumHeight(btn_min_h)
         self.vu_meter.apply_scale(self._scale)
+        self.storage_monitor.apply_scale(self._scale)
 
         self._refresh_transport_styles()
 
@@ -473,7 +480,7 @@ class MainWindow(QMainWindow):
             )
             if is_rec_paused:
                 self.hw_status_label.setText(
-                    f"⏸ RECORDING PAUSED (FILE SAVED & CLOSED: {rec_name}) — WAITING TO RESUME"
+                    f"❚❚ RECORDING PAUSED (FILE SAVED & CLOSED: {rec_name}) — WAITING TO RESUME"
                 )
                 status_col = "#FFDF5D" if blink_on else "#F0B72F"
                 self.hw_status_label.setStyleSheet(f"color: {status_col}; font-weight: bold;")
@@ -494,7 +501,7 @@ class MainWindow(QMainWindow):
             )
             self.pause_record_btn.setEnabled(True)
             if is_rec_paused:
-                self.record_btn.setText("■   STOP & SAVE")
+                self.record_btn.setText("■   STOP && SAVE")
                 self.pause_record_btn.setText("▶   RESUME\nRECORDING")
                 self.pause_record_btn.setStyleSheet(
                     build_pause_record_button_style(
@@ -505,7 +512,7 @@ class MainWindow(QMainWindow):
                 self.timer_label.setStyleSheet(f"color: {timer_col}; font-weight: bold;")
             else:
                 self.record_btn.setText("■   STOP RECORDING")
-                self.pause_record_btn.setText("⏸   PAUSE\nRECORDING")
+                self.pause_record_btn.setText("❚❚   PAUSE\nRECORDING")
                 self.pause_record_btn.setStyleSheet(
                     build_pause_record_button_style("active", self._scale)
                 )
@@ -517,7 +524,7 @@ class MainWindow(QMainWindow):
                 build_record_button_style("ready", self._scale)
             )
             self.pause_record_btn.setEnabled(False)
-            self.pause_record_btn.setText("⏸   PAUSE\nRECORDING")
+            self.pause_record_btn.setText("❚❚   PAUSE\nRECORDING")
             self.pause_record_btn.setStyleSheet(
                 build_pause_record_button_style("disabled", self._scale)
             )
@@ -529,7 +536,7 @@ class MainWindow(QMainWindow):
                 build_record_button_style("disabled", self._scale)
             )
             self.pause_record_btn.setEnabled(False)
-            self.pause_record_btn.setText("⏸   PAUSE\nRECORDING")
+            self.pause_record_btn.setText("❚❚   PAUSE\nRECORDING")
             self.pause_record_btn.setStyleSheet(
                 build_pause_record_button_style("disabled", self._scale)
             )
@@ -549,7 +556,7 @@ class MainWindow(QMainWindow):
         if is_rec_paused:
             self.talkback_banner.setVisible(True)
             if settings.studio_mode:
-                self.talkback_btn.setText("🎙  TALKBACK\n(PAUSED)")
+                self.talkback_btn.setText("◉  TALKBACK\n(PAUSED)")
             file_info = f" ({rec_name})" if rec_name else ""
             self.talkback_banner.setText(
                 f"⚠  RECORDING PAUSED{file_info} — WAV FILE SAVED & CLOSED ON DISK  •  "
@@ -571,7 +578,7 @@ class MainWindow(QMainWindow):
             freq_hz = f"{settings.talkback_tone_hz:g} Hz"
             self.talkback_banner.setVisible(True)
             if tb_active:
-                self.talkback_btn.setText("🎙  TALKBACK ACTIVE\n(RECORDING RIGHT CH)")
+                self.talkback_btn.setText("◉  TALKBACK ACTIVE\n(RECORDING RIGHT CH)")
                 self.talkback_banner.setText(
                     f"⚡ TALKBACK ACTIVE — LEFT CH MUTED • {press_dur} TONE ({freq_hz}) + MIC ON RIGHT CH (RELEASE: {rel_dur}) ⚡"
                 )
@@ -580,7 +587,7 @@ class MainWindow(QMainWindow):
                     "padding: 6px; border-radius: 6px; border: 2px solid #FFDF5D;"
                 )
             else:
-                self.talkback_btn.setText("🎙  TALKBACK\n(HOLD FOR NOTES)")
+                self.talkback_btn.setText("◉  TALKBACK\n(HOLD FOR NOTES)")
                 self.talkback_banner.setText(
                     f"STUDIO MODE: MIC ON LEFT CH  •  HOLD TALKBACK [T] FOR RIGHT CH NOTES ({freq_hz}: {press_dur} PRESS / {rel_dur} RELEASE)"
                 )
@@ -591,7 +598,18 @@ class MainWindow(QMainWindow):
         else:
             self.talkback_banner.setVisible(False)
 
+        self._refresh_storage_status()
         self._update_playback_buttons_state()
+
+    def _refresh_storage_status(self) -> None:
+        """Query /storage drive utilization and update the StorageMonitorWidget."""
+        status = self.config_manager.get_storage_status()
+        self.storage_monitor.set_status(
+            status,
+            is_recording=self.audio_engine.is_recording,
+            blink_on=self._pause_blink_phase,
+        )
+        self._last_storage_refresh_monotonic = time.monotonic()
 
     # -------------------------------------------------------------------------
     # Recording, Pause/Resume & Talkback Actions
@@ -615,7 +633,7 @@ class MainWindow(QMainWindow):
             hrs = int(elapsed // 3600)
             mins = int((elapsed % 3600) // 60)
             secs = elapsed % 60.0
-            self.timer_label.setText(f"⏸ {hrs:02d}:{mins:02d}:{secs:04.1f}  [PAUSED]")
+            self.timer_label.setText(f"❚❚ {hrs:02d}:{mins:02d}:{secs:04.1f}  [PAUSED]")
 
     def _start_recording(self) -> None:
         self._sync_hardware_state()
@@ -713,7 +731,7 @@ class MainWindow(QMainWindow):
     def _update_filename_preview(self) -> None:
         rec_path = self.audio_engine.current_recording_path
         if self.audio_engine.is_record_paused and rec_path is not None:
-            self.filename_preview_label.setText(f"⏸ Paused File: {rec_path.name}")
+            self.filename_preview_label.setText(f"❚❚ Paused File: {rec_path.name}")
             self.filename_preview_label.setStyleSheet(
                 "border: none; color: #FFDF5D; font-family: monospace; font-weight: bold;"
             )
@@ -767,6 +785,7 @@ class MainWindow(QMainWindow):
         if self._project_recordings:
             self.recordings_list.setCurrentRow(selected_row)
         self.recordings_list.blockSignals(False)
+        self._refresh_storage_status()
         self._update_playback_buttons_state()
 
     def _get_selected_recording_path(self) -> Optional[Path]:
@@ -825,7 +844,7 @@ class MainWindow(QMainWindow):
             if is_paused:
                 self.play_btn.setText("▶ Resume")
             else:
-                self.play_btn.setText("⏸ Pause")
+                self.play_btn.setText("❚❚ Pause")
         else:
             self.play_btn.setText("▶ Play / Pause")
             if not is_rec:
@@ -868,21 +887,24 @@ class MainWindow(QMainWindow):
             is_paused=is_rec_paused,
         )
 
+        now_mono = time.monotonic()
         if is_rec:
             elapsed = self.audio_engine.elapsed_seconds
             hrs = int(elapsed // 3600)
             mins = int((elapsed % 3600) // 60)
             secs = elapsed % 60.0
             if is_rec_paused:
-                blink_on = (int(time.monotonic() * 2.5) % 2) == 0
+                blink_on = (int(now_mono * 2.5) % 2) == 0
                 if blink_on != self._pause_blink_phase:
                     self._pause_blink_phase = blink_on
                     self._refresh_transport_styles()
                 self.timer_label.setText(
-                    f"⏸ {hrs:02d}:{mins:02d}:{secs:04.1f}  [PAUSED]"
+                    f"❚❚ {hrs:02d}:{mins:02d}:{secs:04.1f}  [PAUSED]"
                 )
             else:
                 self.timer_label.setText(f"{hrs:02d}:{mins:02d}:{secs:04.1f}")
+            if now_mono - self._last_storage_refresh_monotonic >= 0.5:
+                self._refresh_storage_status()
         elif self.audio_engine.is_playing:
             pos = self.audio_engine.play_position_sec
             dur = self.audio_engine.play_duration_sec
@@ -902,6 +924,7 @@ class MainWindow(QMainWindow):
         self.ip_bar_label.setText(get_primary_ip_display())
         self._update_filename_preview()
         self.config_manager.enforce_storage_permissions()
+        self._refresh_storage_status()
         if not self.audio_engine.is_recording and not self.audio_engine.is_playing:
             self._sync_hardware_state()
 

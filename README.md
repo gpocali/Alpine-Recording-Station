@@ -14,6 +14,9 @@ An optimized **Alpine Linux** kiosk configuration and fullscreen studio applicat
   - Continuously monitors the selected USB audio input while the application is active (both in standby/ready mode and during recording) so preamp gain can be level-set before or during a session.
   - Displays a 60-segment studio LED bar graph across a calibrated `-60 dBFS` to `0 dBFS` scale (`Green` safe range `-60..-18 dB`, `Amber` nominal peak target `-18..-6 dB`, `Red` headroom warning `-6..0 dB`) with both RMS body and instantaneous Peak levels.
   - **Maintained Peak Hold**: Locks and displays the maximum peak level both graphically (via a high-contrast marker on the meter scale) and numerically (`PEAK HOLD: dBFS` readout + latching `CLIP` indicator at `-0.1 dBFS`) until reset via the **Reset Peak** button, clicking the meter, or pressing `[C]`.
+- **`/storage` Drive Utilization & Recording Time Remaining Monitor**:
+  - Displays a real-time 50-segment studio drive utilization bar (`0%` to `100%` with marked `80%` Warning and `90%` Critical threshold zones), exact percentage used, used/free/total capacity, data rate (`MB/min`), and **Recording Time Remaining** (`HHh MMm SSs`) calculated dynamically for the active Bit Depth, Sample Rate, and Channel/Studio Mode settings (and live in **Settings** as you adjust format options).
+  - Automatically escalates to high-visibility **Amber Warning** (`⚠ LOW SPACE` / `STORAGE GETTING FULL` at `>= 80%` used or `<= 30 minutes` remaining) and **Red Critical** (`⚠ CRITICAL` / `STORAGE CRITICALLY FULL` at `>= 90%` used or `<= 10 minutes` remaining) banners and borders so it is immediately clear when the drive is getting close to full.
 - **Normal Mode & Studio Mode (with Momentary Talkback)**:
   - **Normal Mode**: Records Mono (`1ch`) or Stereo (`2ch`) `.wav` files at the selected bit depth and sample rate.
   - **Studio Mode**: Defaults to Stereo (`2ch`) output where:
@@ -140,6 +143,7 @@ alpine-recorder recover       # Emergency recovery: stop Xorg, clean tty1 config
 - [`app/network_info.py`](app/network_info.py) — LAN IPv4 address discovery for the subtle status bar display.
 - [`app/ui/main_window.py`](app/ui/main_window.py) — Responsive fullscreen PyQt6 studio interface.
 - [`app/ui/vu_meter.py`](app/ui/vu_meter.py) — Graphical studio LED VU & Peak Hold meter widget (`-60` to `0 dBFS`) for live input level setting.
+- [`app/ui/storage_monitor.py`](app/ui/storage_monitor.py) — Graphical `/storage` drive utilization bar (`0%` to `100%`), low-space/critical warning panel, and real-time recording time remaining monitor.
 - [`app/ui/settings_dialog.py`](app/ui/settings_dialog.py) — Audio hardware settings, On-Screen Keyboard toggle, Exit to Console action, and Samba user administration dialog.
 - [`app/ui/on_screen_keyboard.py`](app/ui/on_screen_keyboard.py) — Touch On-Screen Keyboard dialog and automatic `QLineEdit` event controller.
 - [`app/ui/styles.py`](app/ui/styles.py) — Resolution-adaptive dark studio theme and button state styles.

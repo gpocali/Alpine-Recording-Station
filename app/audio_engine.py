@@ -1329,6 +1329,13 @@ class AudioEngine:
             return self._active_writer is not None and self._active_writer.is_open
 
     @property
+    def recording_bytes_written(self) -> int:
+        with self._writer_lock:
+            if self._active_writer is None:
+                return 0
+            return 44 + int(self._active_writer.data_bytes_written)
+
+    @property
     def elapsed_seconds(self) -> float:
         with self._record_lock:
             if not self._is_recording:
@@ -1562,7 +1569,7 @@ class AudioEngine:
                         out_block = processor.process_block(in_block)
                         writer.write_float_frames(out_block)
 
-                        if t0 - last_header_flush >= 2.0:
+                        if t0 - last_header_flush >= 1.0:
                             writer.flush_header()
                             last_header_flush = t0
             else:
@@ -1669,7 +1676,7 @@ class AudioEngine:
                             writer.write_float_frames(out_float)
 
                             now = time.monotonic()
-                            if now - last_header_flush >= 2.0:
+                            if now - last_header_flush >= 1.0:
                                 writer.flush_header()
                                 last_header_flush = now
                 else:
