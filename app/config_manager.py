@@ -223,6 +223,13 @@ class ConfigManager:
         def _worker() -> None:
             try:
                 subprocess.run(
+                    [lbu_bin, "exclude", "/var/lib/samba/private/msg.sock"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
+                subprocess.run(
                     [lbu_bin, "commit", "-d"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

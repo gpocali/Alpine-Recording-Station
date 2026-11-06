@@ -379,6 +379,7 @@ class TestPostBootServiceAndRecoveryConfig(unittest.TestCase):
         self.assertIn("ALPINE_RECORDER_KIOSK_AUTOSTART", install_text)
         self.assertIn("/etc/init.d/alpine-recorder", install_text)
         self.assertIn("/usr/local/bin/alpine-recorder", install_text)
+        self.assertIn("lbu exclude /var/lib/samba/private/msg.sock", install_text)
 
         initd_text = (repo_root / "config" / "alpine-recorder.initd").read_text(encoding="utf-8")
         self.assertIn("#!/sbin/openrc-run", initd_text)
@@ -394,6 +395,70 @@ class TestPostBootServiceAndRecoveryConfig(unittest.TestCase):
         self.assertIn("ALPINE_RECORDER_SINGLE_RUN", xinit_text)
         self.assertIn("fast_crashes", xinit_text)
         self.assertIn("xsetroot -cursor_name left_ptr", xinit_text)
+
+
+class TestComboBoxDropdownStyles(unittest.TestCase):
+    def test_combo_box_popup_stylesheet_and_settings_dropdowns(self) -> None:
+        from app.ui.styles import (
+            build_combo_popup_stylesheet,
+            build_main_stylesheet,
+            configure_combo_box_popup,
+        )
+
+        main_qss = build_main_stylesheet(1.0)
+        self.assertIn("QComboBox QAbstractItemView", main_qss)
+        self.assertIn("QComboBox QAbstractItemView::item", main_qss)
+        self.assertIn("QComboBox QAbstractItemView::item:selected", main_qss)
+
+        popup_qss = build_combo_popup_stylesheet(1.0)
+        self.assertIn("QAbstractItemView", popup_qss)
+        self.assertIn("background-color: #161B22;", popup_qss)
+        self.assertIn("color: #F0F6FC;", popup_qss)
+        self.assertIn("selection-background-color: #1F6FEB;", popup_qss)
+        self.assertIn("selection-color: #FFFFFF;", popup_qss)
+
+        try:
+            import os
+
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PyQt6.QtGui import QPalette
+            from PyQt6.QtWidgets import QApplication, QComboBox, QStyledItemDelegate
+            from app.ui.settings_dialog import SettingsDialog
+        except Exception:
+            return
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(
+                storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc")
+            )
+            engine = AudioEngine(simulate_if_empty=True)
+            sm = SambaManager(cm)
+            sm.pdbedit_bin = None
+            sm.smbpasswd_bin = None
+
+            dlg = SettingsDialog(
+                config_manager=cm,
+                audio_engine=engine,
+                samba_manager=sm,
+            )
+            combos = dlg.findChildren(QComboBox)
+            self.assertGreaterEqual(len(combos), 8)
+            for combo in combos:
+                self.assertIsInstance(combo.itemDelegate(), QStyledItemDelegate)
+                view = combo.view()
+                self.assertIsNotNone(view)
+                if view is not None:
+                    self.assertEqual(
+                        view.palette().color(QPalette.ColorRole.Base).name().upper(),
+                        "#161B22",
+                    )
+                    self.assertEqual(
+                        view.palette().color(QPalette.ColorRole.Text).name().upper(),
+                        "#F0F6FC",
+                    )
+        _ = (app, configure_combo_box_popup)
 
 
 if __name__ == "__main__":

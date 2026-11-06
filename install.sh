@@ -338,6 +338,8 @@ if command -v lbu >/dev/null 2>&1; then
 
     # Exclude /storage so recorded WAV files are never packed into RAM overlay
     lbu exclude "${STORAGE_DIR}" 2>/dev/null || true
+    # Exclude Samba runtime sockets in /var/lib/samba/private/msg.sock to prevent lbu commit errors
+    lbu exclude /var/lib/samba/private/msg.sock 2>/dev/null || true
 
     if grep -Eq '^[^#]*LBU_MEDIA=' /etc/lbu/lbu.conf 2>/dev/null || [ -n "${LBU_MEDIA:-}" ]; then
         log_info "Committing changes to LBU persistent overlay..."

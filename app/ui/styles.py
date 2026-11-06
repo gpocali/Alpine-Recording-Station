@@ -2,12 +2,100 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PyQt6.QtWidgets import QComboBox
+
 
 def compute_scale_factor(width: int, height: int) -> float:
     """Compute a responsive UI scale factor relative to a 1280x720 baseline."""
     w_scale = max(0.55, width / 1280.0)
     h_scale = max(0.55, height / 720.0)
     return min(w_scale, h_scale)
+
+
+def build_combo_popup_stylesheet(scale: float = 1.0) -> str:
+    """Return explicit dark stylesheet for a QComboBox dropdown popup view."""
+    base_font = max(11, int(round(14 * scale)))
+    input_pad_v = max(6, int(round(8 * scale)))
+    input_pad_h = max(8, int(round(12 * scale)))
+    item_min_h = max(22, int(round(28 * scale)))
+
+    return f"""
+    QAbstractItemView {{
+        background-color: #161B22;
+        color: #F0F6FC;
+        border: 1px solid #30363D;
+        font-size: {base_font}px;
+        selection-background-color: #1F6FEB;
+        selection-color: #FFFFFF;
+        outline: 0px;
+        padding: 4px;
+    }}
+
+    QAbstractItemView::item {{
+        background-color: #161B22;
+        color: #F0F6FC;
+        padding: {input_pad_v}px {input_pad_h}px;
+        min-height: {item_min_h}px;
+    }}
+
+    QAbstractItemView::item:hover,
+    QAbstractItemView::item:selected {{
+        background-color: #1F6FEB;
+        color: #FFFFFF;
+    }}
+    """
+
+
+def configure_combo_box_popup(combo: QComboBox, scale: float = 1.0) -> None:
+    """Configure QComboBox delegate, popup palette, and stylesheet so unselected options are readable."""
+    from PyQt6.QtGui import QColor, QPalette
+    from PyQt6.QtWidgets import QStyledItemDelegate
+
+    combo.setItemDelegate(QStyledItemDelegate(combo))
+
+    bg_color = QColor("#161B22")
+    fg_color = QColor("#F0F6FC")
+    sel_bg_color = QColor("#1F6FEB")
+    sel_fg_color = QColor("#FFFFFF")
+    disabled_bg = QColor("#1A1E24")
+    disabled_fg = QColor("#6E7681")
+
+    palette = combo.palette()
+    for group in (
+        QPalette.ColorGroup.Active,
+        QPalette.ColorGroup.Inactive,
+    ):
+        palette.setColor(group, QPalette.ColorRole.Window, bg_color)
+        palette.setColor(group, QPalette.ColorRole.Base, bg_color)
+        palette.setColor(group, QPalette.ColorRole.AlternateBase, bg_color)
+        palette.setColor(group, QPalette.ColorRole.Button, bg_color)
+        palette.setColor(group, QPalette.ColorRole.Text, fg_color)
+        palette.setColor(group, QPalette.ColorRole.WindowText, fg_color)
+        palette.setColor(group, QPalette.ColorRole.ButtonText, fg_color)
+        palette.setColor(group, QPalette.ColorRole.Highlight, sel_bg_color)
+        palette.setColor(group, QPalette.ColorRole.HighlightedText, sel_fg_color)
+
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Window, disabled_bg)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Base, disabled_bg)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Button, disabled_bg)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled_fg)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled_fg)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled_fg)
+
+    combo.setPalette(palette)
+
+    view = combo.view()
+    if view is not None:
+        view.setPalette(palette)
+        view.setAutoFillBackground(True)
+        view.setStyleSheet(build_combo_popup_stylesheet(scale))
+        viewport = view.viewport()
+        if viewport is not None:
+            viewport.setPalette(palette)
+            viewport.setAutoFillBackground(True)
 
 
 def build_main_stylesheet(scale: float = 1.0) -> str:
@@ -63,9 +151,44 @@ def build_main_stylesheet(scale: float = 1.0) -> str:
         border: 2px solid #388BFD;
     }}
 
+    QComboBox:disabled {{
+        background-color: #1A1E24;
+        color: #6E7681;
+        border-color: #21262D;
+    }}
+
     QComboBox::drop-down {{
         border: none;
         width: {max(24, int(round(32 * scale)))}px;
+    }}
+
+    QComboBoxPrivateContainer {{
+        background-color: #161B22;
+        color: #F0F6FC;
+        border: 1px solid #30363D;
+    }}
+
+    QComboBox QAbstractItemView {{
+        background-color: #161B22;
+        color: #F0F6FC;
+        border: 1px solid #30363D;
+        selection-background-color: #1F6FEB;
+        selection-color: #FFFFFF;
+        outline: 0px;
+        padding: 4px;
+    }}
+
+    QComboBox QAbstractItemView::item {{
+        background-color: #161B22;
+        color: #F0F6FC;
+        padding: {input_pad_v}px {input_pad_h}px;
+        min-height: {max(22, int(round(28 * scale)))}px;
+    }}
+
+    QComboBox QAbstractItemView::item:hover,
+    QComboBox QAbstractItemView::item:selected {{
+        background-color: #1F6FEB;
+        color: #FFFFFF;
     }}
 
     QListWidget::item {{

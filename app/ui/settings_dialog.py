@@ -26,6 +26,11 @@ from app.config_manager import ConfigManager
 from app.network_info import get_primary_ip_display
 from app.samba_manager import SambaManager
 from app.ui.on_screen_keyboard import OnScreenKeyboardController
+from app.ui.styles import (
+    build_main_stylesheet,
+    compute_scale_factor,
+    configure_combo_box_popup,
+)
 
 
 class SettingsDialog(QDialog):
@@ -46,12 +51,15 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings & Samba Share Administration")
         self.setModal(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        if parent is not None:
+        if parent is not None and parent.width() >= 480:
+            pw, ph = parent.width(), parent.height()
+            self._scale = compute_scale_factor(pw, ph)
             self.resize(
-                max(640, int(parent.width() * 0.78)),
-                max(440, int(parent.height() * 0.82)),
+                max(640, int(pw * 0.78)),
+                max(440, int(ph * 0.82)),
             )
         else:
+            self._scale = 1.0
             self.resize(780, 540)
 
         self._capture_devices: List[AudioDeviceCapabilities] = []
@@ -66,10 +74,16 @@ class SettingsDialog(QDialog):
         )
 
         self._build_ui()
+        self._apply_styles()
         self._register_osk_fields()
         self._populate_devices_and_settings()
         self._refresh_samba_users()
         self._initializing = False
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(build_main_stylesheet(self._scale))
+        for combo in self.findChildren(QComboBox):
+            configure_combo_box_popup(combo, self._scale)
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
