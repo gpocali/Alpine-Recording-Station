@@ -73,6 +73,10 @@ ensure_runtime_packages() {
     log_info "$msg"
     printf "%s [INFO] %s\n" "$(date -Iseconds 2>/dev/null || date)" "$msg" >>"${APP_LOG}"
 
+    mkdir -p /storage 2>/dev/null || true
+    if ! mountpoint -q /storage 2>/dev/null; then
+        mount /storage 2>/dev/null || mount -a 2>/dev/null || true
+    fi
     mkdir -p "${APK_CACHE_DIR}" /etc/apk 2>/dev/null || true
     if [ ! -e /etc/apk/cache ] && [ ! -L /etc/apk/cache ] && [ -d "${APK_CACHE_DIR}" ]; then
         ln -snf "${APK_CACHE_DIR}" /etc/apk/cache 2>/dev/null || true
@@ -244,9 +248,17 @@ run_doctor() {
         log_warn "/proc/asound/cards not present (is snd-usb-audio loaded?)."
     fi
 
-    # 6. Check /storage directory and persistent APK cache
+    # 6. Check /storage directory, mount status, and persistent APK cache
+    mkdir -p /storage 2>/dev/null || true
+    if ! mountpoint -q /storage 2>/dev/null; then
+        mount /storage 2>/dev/null || mount -a 2>/dev/null || true
+    fi
     if [ -d /storage ] && [ -w /storage ]; then
-        log_ok "/storage directory exists and is writable."
+        if mountpoint -q /storage 2>/dev/null; then
+            log_ok "/storage is mounted on a persistent drive and is writable."
+        else
+            log_warn "/storage exists and is writable, but is not a separate mountpoint (check /etc/fstab)."
+        fi
     else
         log_err "/storage directory is missing or not writable."
         issues=$((issues + 1))

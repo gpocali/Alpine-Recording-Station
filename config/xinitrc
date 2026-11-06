@@ -4,6 +4,9 @@
 APP_LOG="/var/log/alpine-recorder.log"
 umask 0000 2>/dev/null || true
 mkdir -p /var/log /storage
+if ! mountpoint -q /storage 2>/dev/null; then
+    mount /storage 2>/dev/null || mount -a 2>/dev/null || true
+fi
 chown root:sambashare /storage 2>/dev/null || true
 chmod 2777 /storage 2>/dev/null || chmod 0777 /storage 2>/dev/null || true
 

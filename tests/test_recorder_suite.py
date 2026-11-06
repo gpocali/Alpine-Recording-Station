@@ -30,6 +30,8 @@ from app.config_manager import (
     format_remaining_time,
     format_storage_bytes,
     generate_recording_filename,
+    parse_proc_mounts,
+    resolve_mount_for_path,
     sanitize_project_name,
 )
 from app.samba_manager import SambaManager
@@ -750,6 +752,35 @@ class TestStorageMonitoringAndRemainingTime(unittest.TestCase):
             self.assertTrue(st_full.is_critical)
             self.assertEqual(st_full.remaining_seconds, 0.0)
             self.assertEqual(st_full.formatted_remaining, "00h 00m 00s")
+
+    def test_proc_mounts_persistent_drive_resolution(self) -> None:
+        sample_mounts = """
+rootfs / rootfs rw 0 0
+tmpfs / tmpfs rw,relatime,size=1982464k,mode=755 0 0
+devtmpfs /dev devtmpfs rw,relatime,size=10240k,nr_inodes=493021,mode=755 0 0
+/dev/sda1 /media/sda1 vfat rw,relatime,fmask=0022,dmask=0022 0 0
+/dev/sda2 /storage ext4 rw,noatime 0 0
+"""
+        mounts = parse_proc_mounts(sample_mounts)
+        _p, dev, mnt, fstype, is_temp = resolve_mount_for_path(Path("/storage"), mounts)
+        self.assertEqual(dev, "/dev/sda2")
+        self.assertEqual(mnt, "/storage")
+        self.assertEqual(fstype, "ext4")
+        self.assertFalse(is_temp)
+
+        # When /storage is not mounted yet and falls on root tmpfs
+        unmounted_text = """
+rootfs / rootfs rw 0 0
+tmpfs / tmpfs rw,relatime,size=1982464k,mode=755 0 0
+"""
+        mounts_unmounted = parse_proc_mounts(unmounted_text)
+        _p2, dev2, mnt2, fstype2, is_temp2 = resolve_mount_for_path(
+            Path("/storage"), mounts_unmounted
+        )
+        self.assertEqual(dev2, "tmpfs")
+        self.assertEqual(mnt2, "/")
+        self.assertEqual(fstype2, "tmpfs")
+        self.assertTrue(is_temp2)
 
     def test_storage_monitor_widget_and_settings_preview(self) -> None:
         try:

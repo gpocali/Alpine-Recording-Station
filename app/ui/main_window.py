@@ -219,10 +219,6 @@ class MainWindow(QMainWindow):
         self.level_bar = self.vu_meter
         deck_layout.addWidget(self.vu_meter)
 
-        # Graphical Storage Utilization & Recording Time Remaining Monitor
-        self.storage_monitor = StorageMonitorWidget(parent=self.deck_frame)
-        deck_layout.addWidget(self.storage_monitor)
-
         # Primary Transport Controls Row (Record/Stop + Pause/Resume + Studio Talkback)
         controls_row = QHBoxLayout()
         controls_row.setSpacing(16)
@@ -264,7 +260,11 @@ class MainWindow(QMainWindow):
         deck_layout.addLayout(controls_row, stretch=1)
         self.main_layout.addWidget(self.deck_frame, stretch=3)
 
-        # 4. Bottom Pane: Scrollable Project Recordings List & Reference Playback
+        # 4. Storage Capacity & Recording Time Remaining Strip (outside Studio Deck, above Recordings Pane)
+        self.storage_monitor = StorageMonitorWidget(parent=central)
+        self.main_layout.addWidget(self.storage_monitor)
+
+        # 5. Bottom Pane: Scrollable Project Recordings List & Reference Playback
         takes_frame = QFrame()
         takes_frame.setStyleSheet(
             "QFrame#TakesPane { background-color: #161B22; border: 1px solid #30363D; border-radius: 10px; }"
@@ -853,6 +853,7 @@ class MainWindow(QMainWindow):
                 )
 
     def _on_manual_refresh(self) -> None:
+        self.config_manager._ensure_storage_mounted(force=True)
         self._sync_hardware_state(force_probe=True)
         self._refresh_recordings_list()
         self.ip_bar_label.setText(get_primary_ip_display())

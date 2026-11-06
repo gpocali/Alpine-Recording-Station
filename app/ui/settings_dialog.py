@@ -691,7 +691,7 @@ class SettingsDialog(QDialog):
         prefix_badge = ""
         if st.level == "full":
             fg, bg, border = "#FF6B7A", "#240D11", "#F85149"
-            prefix_badge = "⛔ DRIVE FULL — "
+            prefix_badge = "⚠ DRIVE FULL — "
         elif st.level == "critical":
             fg, bg, border = "#FF6B7A", "#200E12", "#F85149"
             prefix_badge = "⚠ CRITICAL LOW SPACE — "

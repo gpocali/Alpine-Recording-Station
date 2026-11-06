@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -204,10 +205,24 @@ class StorageStatus:
     remaining_seconds: float = 0.0
     level: str = "ok"  # "ok", "warning", "critical", "full", or "offline"
     available: bool = True
+    filesystem_device: str = ""
+    mount_point: str = ""
+    filesystem_type: str = ""
+    is_temporary_fs: bool = False
 
     @property
     def effective_channels(self) -> int:
         return 2 if (self.studio_mode or self.channels >= 2) else 1
+
+    @property
+    def drive_summary(self) -> str:
+        """Return human-readable mount/filesystem descriptor for /storage."""
+        if self.filesystem_device and self.filesystem_type:
+            dev_short = self.filesystem_device
+            if self.is_temporary_fs:
+                return f"{self.storage_path} [RAM {self.filesystem_type}]"
+            return f"{self.storage_path} ({dev_short} • {self.filesystem_type})"
+        return str(self.storage_path)
 
     @property
     def formatted_remaining(self) -> str:
@@ -256,6 +271,92 @@ class StorageStatus:
         return "OK"
 
 
+TEMP_FILESYSTEM_TYPES: tuple[str, ...] = (
+    "tmpfs",
+    "ramfs",
+    "rootfs",
+    "devtmpfs",
+)
+
+
+def parse_proc_mounts(mounts_text: str) -> List[Tuple[str, str, str]]:
+    """Parse /proc/mounts content into a list of (device, mount_point, fs_type)."""
+    entries: List[Tuple[str, str, str]] = []
+    for raw_line in mounts_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        dev = parts[0].replace("\\040", " ")
+        mnt = parts[1].replace("\\040", " ")
+        fstype = parts[2]
+        entries.append((dev, mnt, fstype))
+    return entries
+
+
+def resolve_mount_for_path(
+    target_path: Path | str, mounts: List[Tuple[str, str, str]]
+) -> Tuple[Path, str, str, str, bool]:
+    """Identify the active mounted filesystem backing target_path from /proc/mounts."""
+    raw_str = str(target_path)
+    if os.name != "nt":
+        try:
+            real_str = os.path.realpath(raw_str)
+        except OSError:
+            real_str = raw_str
+    else:
+        # On Windows (used for cross-platform unit tests), preserve POSIX root paths
+        p_obj = Path(target_path)
+        if not p_obj.drive:
+            real_str = posixpath.normpath(raw_str.replace("\\", "/"))
+        else:
+            real_str = raw_str.replace("\\", "/")
+    real_path = Path(real_str)
+
+    if not mounts:
+        return (real_path, "", "", "", False)
+
+    norm_target = real_str.rstrip("/") or "/"
+
+    # Find longest matching ancestor mountpoint; iterate in order so later mounts win on ties
+    best_dev = ""
+    best_mnt = ""
+    best_fs = ""
+    best_len = -1
+
+    for dev, mnt, fstype in mounts:
+        if fstype == "autofs":
+            continue
+        norm_mnt = mnt.rstrip("/") or "/"
+        if norm_target == norm_mnt or (
+            norm_mnt == "/" and norm_target.startswith("/")
+        ) or norm_target.startswith(norm_mnt + "/"):
+            mnt_len = 0 if norm_mnt == "/" else len(norm_mnt)
+            if mnt_len >= best_len:
+                best_len = mnt_len
+                best_dev = dev
+                best_mnt = norm_mnt
+                best_fs = fstype
+
+    is_temp = best_fs.lower() in TEMP_FILESYSTEM_TYPES
+
+    # If /storage itself is on root tmpfs, check if a persistent drive is mounted directly inside /storage
+    if is_temp and norm_target != "/":
+        prefix = norm_target + "/"
+        for dev, mnt, fstype in mounts:
+            norm_mnt = mnt.rstrip("/")
+            if (
+                norm_mnt.startswith(prefix)
+                and fstype.lower() not in TEMP_FILESYSTEM_TYPES
+                and fstype != "autofs"
+            ):
+                return (Path(norm_mnt), dev, norm_mnt, fstype, False)
+
+    return (real_path, best_dev, best_mnt, best_fs, is_temp)
+
+
 class ConfigManager:
     """Manages loading and saving settings across persistent storage and LBU."""
 
@@ -271,6 +372,10 @@ class ConfigManager:
         self.etc_config_dir = Path(
             etc_config_dir or env_config or DEFAULT_ETC_CONFIG_DIR
         )
+        self._mount_attempted: bool = False
+
+        # Ensure /storage persistent partition is mounted if configured in /etc/fstab
+        self._ensure_storage_mounted()
 
         # Fallback for non-root or non-Alpine test runs
         if not self._can_use_directory(self.storage_dir):
@@ -289,10 +394,81 @@ class ConfigManager:
         self.settings: RecorderSettings = self.load()
 
     @staticmethod
+    def _read_proc_mounts() -> List[Tuple[str, str, str]]:
+        """Read mounted filesystems from /proc/mounts on Linux."""
+        proc_mounts = Path("/proc/mounts")
+        if not proc_mounts.is_file():
+            return []
+        try:
+            return parse_proc_mounts(
+                proc_mounts.read_text(encoding="utf-8", errors="ignore")
+            )
+        except OSError:
+            return []
+
+    def _ensure_storage_mounted(self, force: bool = False) -> None:
+        """If /storage is unmounted on a diskless RAM root (tmpfs), mount it from /etc/fstab."""
+        if os.name != "posix":
+            return
+        if self._mount_attempted and not force:
+            return
+
+        target = self.storage_dir
+        try:
+            if not target.exists():
+                target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+
+        mounts = self._read_proc_mounts()
+        if not mounts:
+            return
+
+        _probe, _dev, mnt_pt, _fs, is_temp = resolve_mount_for_path(target, mounts)
+        norm_target = os.path.realpath(str(target)).rstrip("/") or "/"
+        if mnt_pt == norm_target and not is_temp:
+            self._mount_attempted = True
+            return
+
+        self._mount_attempted = True
+        mount_bin = shutil.which("mount")
+        if not mount_bin:
+            return
+
+        try:
+            subprocess.run(
+                [mount_bin, str(target)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            mounts_after = self._read_proc_mounts()
+            _p2, _d2, mnt_pt2, _f2, is_temp2 = resolve_mount_for_path(
+                target, mounts_after
+            )
+            if mnt_pt2 != norm_target or is_temp2:
+                subprocess.run(
+                    [mount_bin, "-a"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+        except Exception as exc:
+            logger.debug("Mount check for %s skipped: %s", target, exc)
+
+    @staticmethod
     def _can_use_directory(path: Path) -> bool:
         try:
-            path.mkdir(parents=True, exist_ok=True)
-            test_file = path / ".write_test"
+            if not path.is_dir():
+                path.mkdir(parents=True, exist_ok=True)
+            real_dir = Path(os.path.realpath(str(path)))
+            if not real_dir.is_dir():
+                real_dir.mkdir(parents=True, exist_ok=True)
+            if os.access(real_dir, os.W_OK):
+                return True
+            test_file = real_dir / ".write_test"
             test_file.touch(exist_ok=True)
             test_file.unlink(missing_ok=True)
             return True
@@ -547,9 +723,34 @@ class ConfigManager:
         byte_rate = compute_wav_byte_rate(sr, bd, eff_ch, st_mode)
 
         probe_path = self.storage_dir
+        fs_device = ""
+        mount_point = ""
+        fs_type = ""
+        is_temp_fs = False
+
         try:
             while not probe_path.exists() and probe_path.parent != probe_path:
                 probe_path = probe_path.parent
+
+            if disk_usage_fn is None and os.name == "posix":
+                mounts = self._read_proc_mounts()
+                if mounts:
+                    resolved_probe, fs_device, mount_point, fs_type, is_temp_fs = (
+                        resolve_mount_for_path(probe_path, mounts)
+                    )
+                    if is_temp_fs and not self._mount_attempted:
+                        self._ensure_storage_mounted(force=True)
+                        mounts = self._read_proc_mounts()
+                        resolved_probe, fs_device, mount_point, fs_type, is_temp_fs = (
+                            resolve_mount_for_path(probe_path, mounts)
+                        )
+                    if resolved_probe.exists():
+                        probe_path = resolved_probe
+                else:
+                    probe_path = Path(os.path.realpath(str(probe_path)))
+            elif disk_usage_fn is None:
+                probe_path = Path(os.path.realpath(str(probe_path)))
+
             usage_fn = disk_usage_fn if disk_usage_fn is not None else shutil.disk_usage
             usage = usage_fn(probe_path)
             total_bytes = max(0, int(usage[0]))
@@ -618,6 +819,10 @@ class ConfigManager:
             remaining_seconds=remaining_seconds,
             level=level,
             available=True,
+            filesystem_device=fs_device,
+            mount_point=mount_point,
+            filesystem_type=fs_type,
+            is_temporary_fs=is_temp_fs,
         )
 
     @staticmethod

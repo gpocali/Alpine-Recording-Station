@@ -20,7 +20,11 @@ depend() {
 }
 
 start_pre() {
-    mkdir -p /var/log /storage /storage/.alpine-recorder
+    mkdir -p /var/log /storage
+    if ! mountpoint -q /storage 2>/dev/null; then
+        mount /storage 2>/dev/null || mount -a 2>/dev/null || true
+    fi
+    mkdir -p /storage/.alpine-recorder
     chown root:sambashare /storage 2>/dev/null || true
     chmod 2777 /storage 2>/dev/null || chmod 0777 /storage 2>/dev/null || true
     find /storage \( -path /storage/.alpine-recorder -o -path /storage/lost+found \) -prune -o -type d -exec chown root:sambashare {} + -exec chmod 2777 {} + 2>/dev/null || true

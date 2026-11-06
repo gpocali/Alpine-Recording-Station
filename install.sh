@@ -129,7 +129,11 @@ esac
 if command -v apk >/dev/null 2>&1; then
     # Ensure persistent APK cache exists on /storage so diskless (LBU/RAM) Alpine
     # systems retain Xorg, Openbox, PyQt6, NumPy, ALSA, and Samba across reboots.
-    mkdir -p "${STORAGE_DIR}" "${STORAGE_DIR}/.alpine-recorder" "${APK_CACHE_DIR}" /etc/apk
+    mkdir -p "${STORAGE_DIR}"
+    if ! mountpoint -q "${STORAGE_DIR}" 2>/dev/null; then
+        mount "${STORAGE_DIR}" 2>/dev/null || mount -a 2>/dev/null || true
+    fi
+    mkdir -p "${STORAGE_DIR}/.alpine-recorder" "${APK_CACHE_DIR}" /etc/apk
     if [ ! -e /etc/apk/cache ] && [ ! -L /etc/apk/cache ]; then
         ln -snf "${APK_CACHE_DIR}" /etc/apk/cache
         log_info "Linked /etc/apk/cache -> ${APK_CACHE_DIR} for persistent package caching across reboots."
@@ -194,6 +198,9 @@ modprobe snd-usb-audio 2>/dev/null || true
 # -----------------------------------------------------------------------------
 log_info "Configuring persistent storage directory at ${STORAGE_DIR}..."
 mkdir -p "${STORAGE_DIR}"
+if ! mountpoint -q "${STORAGE_DIR}" 2>/dev/null; then
+    mount "${STORAGE_DIR}" 2>/dev/null || mount -a 2>/dev/null || true
+fi
 mkdir -p "${STORAGE_DIR}/.alpine-recorder"
 mkdir -p "${APK_CACHE_DIR}"
 chown root:sambashare "${STORAGE_DIR}" 2>/dev/null || true
@@ -203,14 +210,18 @@ find "${STORAGE_DIR}" \( -path "${STORAGE_DIR}/.alpine-recorder" -o -path "${STO
 
 mkdir -p "${ETC_CONFIG_DIR}"
 
-# Create OpenRC local.d script so /storage permissions are masked on every boot
-# (even when an external partition is mounted at /storage via /etc/fstab)
+# Create OpenRC local.d script so /storage is mounted and permissions are masked on every boot
+# (even when /storage directory was excluded from the LBU overlay when localmount ran)
 mkdir -p /etc/local.d
 LOCAL_STORAGE_SCRIPT="/etc/local.d/alpine-recorder-storage.start"
-if [ ! -f "${LOCAL_STORAGE_SCRIPT}" ] || ! grep -q "chmod 2777" "${LOCAL_STORAGE_SCRIPT}" || [ "${FORCE_CONFIG}" -eq 1 ]; then
+if [ ! -f "${LOCAL_STORAGE_SCRIPT}" ] || ! grep -q "mountpoint -q /storage" "${LOCAL_STORAGE_SCRIPT}" || [ "${FORCE_CONFIG}" -eq 1 ]; then
     cat << 'EOF' > "${LOCAL_STORAGE_SCRIPT}"
 #!/bin/sh
-mkdir -p /storage /storage/.alpine-recorder /storage/.alpine-recorder/apk-cache
+mkdir -p /storage
+if ! mountpoint -q /storage 2>/dev/null; then
+    mount /storage 2>/dev/null || mount -a 2>/dev/null || true
+fi
+mkdir -p /storage/.alpine-recorder /storage/.alpine-recorder/apk-cache
 chown root:sambashare /storage 2>/dev/null || chgrp sambashare /storage 2>/dev/null || true
 chmod 2777 /storage 2>/dev/null || chmod 0777 /storage 2>/dev/null || true
 find /storage \( -path /storage/.alpine-recorder -o -path /storage/lost+found \) -prune -o -type d -exec chown root:sambashare {} + -exec chmod 2777 {} + 2>/dev/null || true
@@ -241,6 +252,7 @@ if command -v python3 >/dev/null 2>&1; then
         "${APP_DEST}/app/network_info.py" \
         "${APP_DEST}/app/ui/main_window.py" \
         "${APP_DEST}/app/ui/vu_meter.py" \
+        "${APP_DEST}/app/ui/storage_monitor.py" \
         "${APP_DEST}/app/ui/settings_dialog.py" \
         "${APP_DEST}/app/ui/on_screen_keyboard.py" \
         "${APP_DEST}/app/ui/styles.py" 2>/dev/null || true
