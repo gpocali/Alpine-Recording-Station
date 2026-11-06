@@ -63,6 +63,7 @@ class RecorderSettings:
     input_channel: int = 0  # 0-indexed input channel on multi-channel interface
     studio_mode: bool = False  # True = Studio Mode (Stereo output, L=Mic, R=Talkback+Tone)
     project_name: str = "Session"
+    on_screen_keyboard: bool = True  # True = Show touch on-screen keyboard for text inputs
     talkback_tone_hz: float = 1000.0
     talkback_tone_duration_sec: float = 0.5
     storage_dir: str = DEFAULT_STORAGE_DIR

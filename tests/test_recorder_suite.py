@@ -11,11 +11,15 @@ from pathlib import Path
 import numpy as np
 
 from app.audio_engine import (
+    METER_FLOOR_DB,
     SND_PCM_FORMAT_S16_LE,
     SND_PCM_FORMAT_S24_3LE,
     SND_PCM_FORMAT_S32_LE,
+    AudioEngine,
     StudioTalkbackProcessor,
     WavFileWriter,
+    dbfs_to_ratio,
+    linear_to_dbfs,
     parse_proc_usb_stream0,
     read_wav_as_float64,
 )
@@ -175,6 +179,7 @@ class TestConfigAndProjectFiltering(unittest.TestCase):
             cm.settings.sample_rate = 96000
             cm.settings.bit_depth = 24
             cm.settings.studio_mode = True
+            cm.settings.on_screen_keyboard = False
             cm.save()
 
             # Write 2 WAV files for PodcastA and 1 for OtherProject
@@ -201,6 +206,7 @@ class TestConfigAndProjectFiltering(unittest.TestCase):
             self.assertEqual(cm2.settings.sample_rate, 96000)
             self.assertEqual(cm2.settings.bit_depth, 24)
             self.assertTrue(cm2.settings.studio_mode)
+            self.assertFalse(cm2.settings.on_screen_keyboard)
 
 
 class TestSambaManager(unittest.TestCase):
@@ -234,6 +240,122 @@ class TestSambaManager(unittest.TestCase):
             ok, _ = sm.remove_user("engineer1")
             self.assertTrue(ok)
             self.assertEqual(sm.list_users(), [])
+
+
+class TestVuMeterAndPeakHold(unittest.TestCase):
+    def test_dbfs_conversions_and_peak_hold_maintenance(self) -> None:
+        self.assertAlmostEqual(linear_to_dbfs(1.0), 0.0, places=3)
+        self.assertAlmostEqual(linear_to_dbfs(0.5), -6.0206, places=2)
+        self.assertAlmostEqual(linear_to_dbfs(0.0), METER_FLOOR_DB, places=3)
+        self.assertAlmostEqual(dbfs_to_ratio(-60.0), 0.0, places=3)
+        self.assertAlmostEqual(dbfs_to_ratio(-30.0), 0.5, places=3)
+        self.assertAlmostEqual(dbfs_to_ratio(0.0), 1.0, places=3)
+
+        engine = AudioEngine(simulate_if_empty=True)
+
+        # Feed a moderate stereo block (-12 dBFS ~ 0.2512)
+        block_mod = np.column_stack(
+            (np.full(512, 0.25, dtype=np.float64), np.full(512, 0.125, dtype=np.float64))
+        )
+        engine._update_meter_from_block(block_mod)
+        r1 = engine.get_vu_readings()
+        self.assertEqual(r1.channels, 2)
+        self.assertAlmostEqual(r1.peak_hold_level, 0.25, places=4)
+        self.assertAlmostEqual(r1.channel_peak_holds[0], 0.25, places=4)
+        self.assertAlmostEqual(r1.channel_peak_holds[1], 0.125, places=4)
+        self.assertFalse(r1.clipped)
+
+        # Feed a transient peak block (0.8 ~ -1.94 dBFS) on Left channel
+        block_peak = np.column_stack(
+            (np.full(512, 0.80, dtype=np.float64), np.full(512, 0.20, dtype=np.float64))
+        )
+        engine._update_meter_from_block(block_peak)
+
+        # Feed several silent blocks; Peak Hold must maintain at 0.80
+        block_silent = np.zeros((512, 2), dtype=np.float64)
+        for _ in range(10):
+            engine._update_meter_from_block(block_silent)
+
+        r2 = engine.get_vu_readings()
+        self.assertAlmostEqual(r2.peak_hold_level, 0.80, places=4)
+        self.assertAlmostEqual(r2.channel_peak_holds[0], 0.80, places=4)
+        self.assertAlmostEqual(r2.channel_peak_holds[1], 0.20, places=4)
+        self.assertLess(r2.peak_level, 0.80)
+
+        # Trigger clip (>= 0.99) and verify clip latch + reset_peak_hold()
+        block_clip = np.full((512, 2), 0.995, dtype=np.float64)
+        engine._update_meter_from_block(block_clip)
+        r3 = engine.get_vu_readings()
+        self.assertTrue(r3.clipped)
+        self.assertAlmostEqual(r3.peak_hold_level, 0.995, places=4)
+
+        engine.reset_peak_hold()
+        r4 = engine.get_vu_readings()
+        self.assertFalse(r4.clipped)
+        self.assertEqual(r4.peak_hold_level, 0.0)
+        self.assertEqual(r4.channel_peak_holds, (0.0, 0.0))
+
+
+class TestOnScreenKeyboard(unittest.TestCase):
+    def test_on_screen_keyboard_editing_and_field_switching(self) -> None:
+        try:
+            import os
+
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PyQt6.QtWidgets import QApplication, QLineEdit
+            from app.ui.on_screen_keyboard import OnScreenKeyboardDialog, OskFieldSpec
+        except Exception:
+            self.skipTest("PyQt6 not available in test environment")
+            return
+
+        app = QApplication.instance() or QApplication([])
+
+        proj_edit = QLineEdit("Session")
+        dlg = OnScreenKeyboardDialog(target=proj_edit, title="Project Prefix")
+        dlg.press_clear()
+        dlg.toggle_shift()
+        dlg.press_key("V")
+        dlg.press_key("o")
+        dlg.press_key("c")
+        dlg.press_key("a")
+        dlg.press_key("l")
+        dlg.press_key("_")
+        dlg.press_key("1")
+        dlg.press_backspace()
+        dlg.press_key("2")
+        dlg.accept()
+        self.assertEqual(proj_edit.text(), "Vocal_2")
+
+        # Verify Cancel restores initial text
+        dlg_cancel = OnScreenKeyboardDialog(target=proj_edit, title="Project Prefix")
+        dlg_cancel.press_clear()
+        dlg_cancel.press_key("X")
+        dlg_cancel.reject()
+        self.assertEqual(proj_edit.text(), "Vocal_2")
+
+        # Verify multi-field switching (e.g. Samba Username -> Password -> Confirm)
+        user_edit = QLineEdit("")
+        pw_edit = QLineEdit("")
+        pw_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        siblings = [
+            OskFieldSpec(user_edit, "Samba Username"),
+            OskFieldSpec(pw_edit, "Samba Password"),
+        ]
+        dlg_multi = OnScreenKeyboardDialog(
+            target=user_edit,
+            title="Samba Username",
+            sibling_fields=siblings,
+        )
+        for ch in "eng1":
+            dlg_multi.press_key(ch)
+        dlg_multi.switch_to_next_field()
+        self.assertEqual(user_edit.text(), "eng1")
+        self.assertIs(dlg_multi.target_line_edit, pw_edit)
+        for ch in "pass99":
+            dlg_multi.press_key(ch)
+        dlg_multi.accept()
+        self.assertEqual(pw_edit.text(), "pass99")
+        _ = app
 
 
 if __name__ == "__main__":

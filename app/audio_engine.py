@@ -43,6 +43,45 @@ SND_PCM_FORMAT_S32_LE = 10     # 32-bit signed little endian
 SND_PCM_FORMAT_FLOAT_LE = 14   # 32-bit float
 SND_PCM_FORMAT_S24_3LE = 32    # 24-bit packed in 3 bytes
 
+METER_FLOOR_DB: float = -60.0
+CLIP_THRESHOLD_LINEAR: float = 0.988553  # Approx -0.1 dBFS
+
+
+def linear_to_dbfs(level: float, floor_db: float = METER_FLOOR_DB) -> float:
+    """Convert a linear amplitude [0.0, 1.0+] to dBFS clamped to [floor_db, 0.0]."""
+    clamped = max(0.0, float(level))
+    if clamped <= 1e-6:
+        return float(floor_db)
+    db = 20.0 * math.log10(min(1.0, clamped))
+    return max(float(floor_db), min(0.0, db))
+
+
+def dbfs_to_ratio(db: float, floor_db: float = METER_FLOOR_DB) -> float:
+    """Map a dBFS value in [floor_db, 0.0] to a normalized meter ratio [0.0, 1.0]."""
+    span = abs(float(floor_db))
+    if span <= 0.0:
+        return 0.0
+    clamped_db = max(float(floor_db), min(0.0, float(db)))
+    return (clamped_db - float(floor_db)) / span
+
+
+@dataclass
+class VuMeterReadings:
+    """Real-time input signal VU meter and Peak Hold telemetry."""
+
+    rms_level: float = 0.0              # Smoothed RMS linear [0.0, 1.0]
+    peak_level: float = 0.0             # Smoothed instantaneous peak linear [0.0, 1.0]
+    peak_hold_level: float = 0.0        # Maintained maximum peak linear [0.0, 1.0]
+    rms_db: float = METER_FLOOR_DB      # Smoothed RMS in dBFS [-60.0, 0.0]
+    peak_db: float = METER_FLOOR_DB     # Smoothed instantaneous peak in dBFS [-60.0, 0.0]
+    peak_hold_db: float = METER_FLOOR_DB  # Maintained maximum peak in dBFS [-60.0, 0.0]
+    channel_peaks: Tuple[float, ...] = (0.0,)       # Per-channel smoothed peak linear
+    channel_rms: Tuple[float, ...] = (0.0,)         # Per-channel smoothed RMS linear
+    channel_peak_holds: Tuple[float, ...] = (0.0,)  # Per-channel maintained peak hold linear
+    channels: int = 1                   # Active metered channels (1 or 2)
+    clipped: bool = False               # True if peak reached >= -0.1 dBFS since last reset
+    active: bool = False                # True when input monitoring or recording is active
+
 
 @dataclass
 class AudioDeviceCapabilities:
@@ -553,13 +592,37 @@ def parse_proc_usb_stream0(stream_text: str) -> Tuple[List[int], Dict[int, int],
 
 
 class AudioEngine:
-    """Manages audio hardware discovery, WAV recording, Talkback routing, and reference playback."""
+    """Manages audio hardware discovery, input monitoring, VU/Peak Hold metering, WAV recording, Talkback routing, and reference playback."""
 
     def __init__(self, simulate_if_empty: bool = False) -> None:
         self.alsa = AlsaLibWrapper()
         self.simulate_if_empty = simulate_if_empty or (
             os.environ.get("ALPINE_RECORDER_SIMULATE_AUDIO", "0") == "1"
         )
+
+        # Cache probed hardware capabilities so background enumeration does not fail
+        # with EBUSY while the capture device is held open for live input monitoring.
+        self._hw_probe_cache: Dict[Tuple[str, int], Tuple[List[int], Dict[int, int], int, int]] = {}
+
+        # Real-time VU Meter and Peak Hold state
+        self._meter_lock = threading.Lock()
+        self._peak_level: float = 0.0
+        self._rms_level: float = 0.0
+        self._peak_hold_level: float = 0.0
+        self._channel_peaks: List[float] = [0.0]
+        self._channel_rms: List[float] = [0.0]
+        self._channel_peak_holds: List[float] = [0.0]
+        self._meter_channels: int = 1
+        self._clipped: bool = False
+        self._last_meter_update_monotonic: float = 0.0
+
+        # Continuous Input Monitoring state (for level setting while app is active)
+        self._monitor_lock = threading.Lock()
+        self._is_monitoring = False
+        self._stop_monitor_event = threading.Event()
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._active_monitor_signature: Optional[Tuple[str, int, int, bool, int, int]] = None
+        self._desired_monitor_params: Optional[Tuple[AudioDeviceCapabilities, int, int, bool, int, int]] = None
 
         self._record_lock = threading.Lock()
         self._is_recording = False
@@ -568,7 +631,6 @@ class AudioEngine:
         self._record_start_monotonic: float = 0.0
         self._current_processor: Optional[StudioTalkbackProcessor] = None
         self._current_recording_path: Optional[Path] = None
-        self._peak_level: float = 0.0
 
         self._play_lock = threading.Lock()
         self._is_playing = False
@@ -582,8 +644,15 @@ class AudioEngine:
     # -------------------------------------------------------------------------
     # Hardware Enumeration
     # -------------------------------------------------------------------------
-    def enumerate_devices(self) -> List[AudioDeviceCapabilities]:
+    def enumerate_devices(self, force_probe: bool = False) -> List[AudioDeviceCapabilities]:
         """Discover available audio devices and query their supported sample rates & bit depths."""
+        was_monitoring = False
+        if force_probe:
+            self._hw_probe_cache.clear()
+            if self.is_monitoring and not self.is_recording:
+                was_monitoring = True
+                self._stop_monitoring_thread()
+
         devices: List[AudioDeviceCapabilities] = []
 
         proc_asound = Path("/proc/asound")
@@ -615,13 +684,17 @@ class AudioEngine:
 
         # Sort USB audio interfaces first
         devices.sort(key=lambda d: (not d.is_usb, d.card_index, d.device_index))
+
+        if was_monitoring:
+            self._resume_monitoring_if_configured()
+
         return devices
 
-    def get_capture_devices(self) -> List[AudioDeviceCapabilities]:
-        return [d for d in self.enumerate_devices() if d.is_capture]
+    def get_capture_devices(self, force_probe: bool = False) -> List[AudioDeviceCapabilities]:
+        return [d for d in self.enumerate_devices(force_probe=force_probe) if d.is_capture]
 
-    def get_playback_devices(self) -> List[AudioDeviceCapabilities]:
-        return [d for d in self.enumerate_devices() if d.is_playback]
+    def get_playback_devices(self, force_probe: bool = False) -> List[AudioDeviceCapabilities]:
+        return [d for d in self.enumerate_devices(force_probe=force_probe) if d.is_playback]
 
     def _enumerate_alsa_proc(self, proc_asound: Path) -> List[AudioDeviceCapabilities]:
         cards_file = proc_asound / "cards"
@@ -682,13 +755,24 @@ class AudioEngine:
                 fmt_map: Dict[int, int] = {}
                 min_ch, max_ch = 1, 2
 
-                # 1. Try ALSA libasound hardware probe
+                # 1. Try ALSA libasound hardware probe (falling back to cached probe if busy monitoring)
                 stream_dir = (
                     SND_PCM_STREAM_CAPTURE if is_capture else SND_PCM_STREAM_PLAYBACK
                 )
+                cache_key = (dev_id, stream_dir)
                 probed = self.alsa.probe_hw_params(dev_id, stream_dir)
                 if probed:
-                    rates, fmt_map, min_ch, max_ch = probed
+                    self._hw_probe_cache[cache_key] = probed
+                else:
+                    probed = self._hw_probe_cache.get(cache_key)
+
+                if probed:
+                    rates, fmt_map, min_ch, max_ch = (
+                        list(probed[0]),
+                        dict(probed[1]),
+                        probed[2],
+                        probed[3],
+                    )
 
                 # 2. Supplement or fallback with /proc/asound/cardX/stream0 for USB devices
                 stream0_path = proc_asound / f"card{c_idx}" / f"stream{d_idx}"
@@ -741,6 +825,387 @@ class AudioEngine:
         return devices
 
     # -------------------------------------------------------------------------
+    # VU Meter, Peak Hold & Continuous Input Monitoring
+    # -------------------------------------------------------------------------
+    @property
+    def is_monitoring(self) -> bool:
+        with self._monitor_lock:
+            return self._is_monitoring
+
+    @property
+    def peak_level(self) -> float:
+        with self._meter_lock:
+            return self._peak_level
+
+    @property
+    def rms_level(self) -> float:
+        with self._meter_lock:
+            return self._rms_level
+
+    @property
+    def peak_hold_level(self) -> float:
+        with self._meter_lock:
+            return self._peak_hold_level
+
+    @property
+    def peak_clipped(self) -> bool:
+        with self._meter_lock:
+            return self._clipped
+
+    def reset_peak_hold(self) -> None:
+        """Reset maintained Peak Hold level and clip indicator while keeping live metering active."""
+        with self._meter_lock:
+            self._peak_hold_level = 0.0
+            self._channel_peak_holds = [0.0] * max(1, self._meter_channels)
+            self._clipped = False
+
+    def get_vu_readings(self) -> VuMeterReadings:
+        """Return a snapshot of current VU meter levels (linear & dBFS) and maintained Peak Hold."""
+        active = self.is_recording or self.is_monitoring
+        now = time.monotonic()
+
+        with self._meter_lock:
+            if not active and (self._peak_level > 0.0 or self._rms_level > 0.0):
+                dt = max(0.0, now - self._last_meter_update_monotonic)
+                if dt > 0.08:
+                    decay = 0.65 ** min(20.0, dt / 0.05)
+                    self._peak_level = self._peak_level * decay if self._peak_level > 1e-4 else 0.0
+                    self._rms_level = self._rms_level * decay if self._rms_level > 1e-4 else 0.0
+                    self._channel_peaks = [
+                        (p * decay if p > 1e-4 else 0.0) for p in self._channel_peaks
+                    ]
+                    self._channel_rms = [
+                        (r * decay if r > 1e-4 else 0.0) for r in self._channel_rms
+                    ]
+                    self._last_meter_update_monotonic = now
+
+            rms_lin = self._rms_level
+            peak_lin = self._peak_level
+            hold_lin = self._peak_hold_level
+            ch_peaks = tuple(self._channel_peaks)
+            ch_rms = tuple(self._channel_rms)
+            ch_holds = tuple(self._channel_peak_holds)
+            num_ch = self._meter_channels
+            clipped = self._clipped
+
+        return VuMeterReadings(
+            rms_level=rms_lin,
+            peak_level=peak_lin,
+            peak_hold_level=hold_lin,
+            rms_db=linear_to_dbfs(rms_lin),
+            peak_db=linear_to_dbfs(peak_lin),
+            peak_hold_db=linear_to_dbfs(hold_lin),
+            channel_peaks=ch_peaks,
+            channel_rms=ch_rms,
+            channel_peak_holds=ch_holds,
+            channels=num_ch,
+            clipped=clipped,
+            active=active,
+        )
+
+    @staticmethod
+    def _extract_metered_input(
+        input_frames: np.ndarray,
+        studio_mode: bool,
+        channels: int,
+        input_channel: int,
+    ) -> np.ndarray:
+        """Extract the active input channel(s) to feed the VU & Peak Hold meter."""
+        if input_frames.ndim == 1:
+            input_frames = input_frames[:, np.newaxis]
+        num_frames, hw_channels = input_frames.shape
+        if num_frames == 0 or hw_channels == 0:
+            target_ch = 1 if (studio_mode or channels <= 1) else 2
+            return np.zeros((0, target_ch), dtype=np.float64)
+
+        mic_ch_idx = min(max(0, int(input_channel)), hw_channels - 1)
+        if studio_mode or channels <= 1:
+            return input_frames[:, mic_ch_idx : mic_ch_idx + 1]
+
+        # Normal Stereo mode (2 channels)
+        if hw_channels >= 2:
+            return input_frames[:, :2]
+        mic_col = input_frames[:, mic_ch_idx]
+        return np.column_stack((mic_col, mic_col))
+
+    def _update_meter_from_block(self, metered_block: np.ndarray) -> None:
+        """Update smoothed VU levels and Peak Hold from an input audio block."""
+        if metered_block.size == 0:
+            return
+        if metered_block.ndim == 1:
+            metered_block = metered_block[:, np.newaxis]
+
+        num_frames, num_ch = metered_block.shape
+        if num_frames == 0 or num_ch == 0:
+            return
+
+        abs_block = np.abs(metered_block)
+        ch_block_peaks = np.max(abs_block, axis=0)
+        ch_block_rms = np.sqrt(np.mean(np.square(metered_block), axis=0))
+
+        overall_peak = float(np.max(ch_block_peaks))
+        overall_rms = float(np.max(ch_block_rms))
+        now = time.monotonic()
+
+        with self._meter_lock:
+            dt = max(0.005, min(0.5, now - self._last_meter_update_monotonic)) if self._last_meter_update_monotonic > 0 else 0.04
+            self._last_meter_update_monotonic = now
+
+            # Smooth release ballistics (~20 dB/sec release) with instant attack
+            release_coef = 0.80 ** (dt / 0.04)
+
+            if self._meter_channels != num_ch or len(self._channel_peaks) != num_ch:
+                self._meter_channels = num_ch
+                self._channel_peaks = [0.0] * num_ch
+                self._channel_rms = [0.0] * num_ch
+                self._channel_peak_holds = [0.0] * num_ch
+                self._peak_hold_level = 0.0
+                self._clipped = False
+
+            self._peak_level = max(overall_peak, self._peak_level * release_coef)
+            self._rms_level = max(overall_rms, self._rms_level * release_coef)
+
+            if overall_peak > self._peak_hold_level:
+                self._peak_hold_level = min(1.0, overall_peak)
+            if overall_peak >= CLIP_THRESHOLD_LINEAR:
+                self._clipped = True
+
+            for idx in range(num_ch):
+                cp = float(ch_block_peaks[idx])
+                cr = float(ch_block_rms[idx])
+                self._channel_peaks[idx] = max(cp, self._channel_peaks[idx] * release_coef)
+                self._channel_rms[idx] = max(cr, self._channel_rms[idx] * release_coef)
+                if cp > self._channel_peak_holds[idx]:
+                    self._channel_peak_holds[idx] = min(1.0, cp)
+
+    def start_monitoring(
+        self,
+        device: Optional[AudioDeviceCapabilities],
+        sample_rate: int,
+        bit_depth: int,
+        studio_mode: bool = False,
+        channels: int = 1,
+        input_channel: int = 0,
+    ) -> None:
+        """Start or update live input signal monitoring so the VU meter & Peak Hold work while idle."""
+        if device is None or not device.is_capture:
+            self.stop_monitoring()
+            return
+
+        sr = max(8000, int(sample_rate or device.max_sample_rate))
+        bd = int(bit_depth or device.max_bit_depth)
+        st_mode = bool(studio_mode)
+        ch = 2 if st_mode else max(1, min(2, int(channels)))
+        in_ch = max(0, int(input_channel))
+
+        sig = (device.device_id, sr, bd, st_mode, ch, in_ch)
+        with self._monitor_lock:
+            prev_sig = self._active_monitor_signature
+            self._desired_monitor_params = (device, sr, bd, st_mode, ch, in_ch)
+            if (
+                self._is_monitoring
+                and prev_sig == sig
+                and self._monitor_thread is not None
+                and self._monitor_thread.is_alive()
+            ):
+                return
+
+        if prev_sig is not None and prev_sig[0] != device.device_id:
+            self.reset_peak_hold()
+
+        if self.is_recording or self.is_playing:
+            return
+
+        self._stop_monitoring_thread()
+
+        with self._monitor_lock:
+            self._stop_monitor_event.clear()
+            self._is_monitoring = True
+            self._active_monitor_signature = sig
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_worker,
+                args=(device, sr, bd, st_mode, ch, in_ch),
+                daemon=True,
+            )
+            self._monitor_thread.start()
+
+    def stop_monitoring(self) -> None:
+        """Stop live input monitoring and clear desired monitoring state."""
+        with self._monitor_lock:
+            self._desired_monitor_params = None
+        self._stop_monitoring_thread()
+
+    def _stop_monitoring_thread(self) -> None:
+        with self._monitor_lock:
+            if not self._is_monitoring and self._monitor_thread is None:
+                return
+            self._stop_monitor_event.set()
+            thread = self._monitor_thread
+
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+
+        with self._monitor_lock:
+            self._is_monitoring = False
+            self._monitor_thread = None
+            self._active_monitor_signature = None
+
+    def _resume_monitoring_if_configured(self) -> None:
+        with self._monitor_lock:
+            params = self._desired_monitor_params
+        if params is not None and not self.is_recording and not self.is_playing:
+            self.start_monitoring(*params)
+
+    def _monitor_worker(
+        self,
+        device: AudioDeviceCapabilities,
+        sample_rate: int,
+        bit_depth: int,
+        studio_mode: bool,
+        channels: int,
+        input_channel: int,
+    ) -> None:
+        try:
+            if device.device_id.startswith("sim:") or not self.alsa.available:
+                self._monitor_simulated_loop(
+                    sample_rate, studio_mode, channels, input_channel
+                )
+            else:
+                self._monitor_alsa_loop(
+                    device, sample_rate, bit_depth, studio_mode, channels, input_channel
+                )
+        except Exception as exc:
+            logger.debug("Input monitor stopped on %s: %s", device.device_id, exc)
+        finally:
+            with self._monitor_lock:
+                if self._monitor_thread is threading.current_thread():
+                    self._is_monitoring = False
+
+    @staticmethod
+    def _generate_simulated_input_block(
+        chunk_frames: int, sample_rate: int, phase: float
+    ) -> np.ndarray:
+        """Generate a realistic dynamic simulated microphone input block for level-setting."""
+        t_vec = (np.arange(chunk_frames, dtype=np.float64) + phase) / sample_rate
+        # Modulated envelope between ~-24 dBFS and -10 dBFS with periodic transient peaks at ~-6.5 dBFS
+        slow_env = 0.14 + 0.10 * np.sin(2.0 * math.pi * 0.65 * t_vec)
+        transient = 0.22 * np.power(np.maximum(0.0, np.sin(2.0 * math.pi * 0.25 * t_vec)), 12)
+        amp_l = slow_env + transient
+        amp_r = slow_env * (0.88 + 0.10 * np.cos(2.0 * math.pi * 0.45 * t_vec)) + 0.85 * transient
+        carrier = np.sin(2.0 * math.pi * 440.0 * t_vec)
+        sig_l = amp_l * carrier
+        sig_r = amp_r * carrier
+        return np.column_stack((sig_l, sig_r))
+
+    def _monitor_simulated_loop(
+        self,
+        sample_rate: int,
+        studio_mode: bool,
+        channels: int,
+        input_channel: int,
+    ) -> None:
+        chunk_frames = max(256, sample_rate // 25)
+        chunk_duration = chunk_frames / sample_rate
+        phase = 0.0
+
+        while not self._stop_monitor_event.is_set():
+            t0 = time.monotonic()
+            in_block = self._generate_simulated_input_block(chunk_frames, sample_rate, phase)
+            phase += chunk_frames
+
+            metered = self._extract_metered_input(
+                in_block, studio_mode, channels, input_channel
+            )
+            self._update_meter_from_block(metered)
+
+            elapsed = time.monotonic() - t0
+            sleep_for = max(0.005, chunk_duration - elapsed)
+            self._stop_monitor_event.wait(sleep_for)
+
+    def _monitor_alsa_loop(
+        self,
+        device: AudioDeviceCapabilities,
+        sample_rate: int,
+        bit_depth: int,
+        studio_mode: bool,
+        channels: int,
+        input_channel: int,
+    ) -> None:
+        assert self.alsa.lib is not None
+        lib = self.alsa.lib
+
+        pcm = ctypes.c_void_p()
+        err = lib.snd_pcm_open(
+            ctypes.byref(pcm),
+            device.device_id.encode("ascii"),
+            SND_PCM_STREAM_CAPTURE,
+            0,
+        )
+        if err < 0 or not pcm:
+            return
+
+        hw_params = ctypes.c_void_p()
+        lib.snd_pcm_hw_params_malloc(ctypes.byref(hw_params))
+        try:
+            alsa_fmt = device.alsa_format_map.get(bit_depth, SND_PCM_FORMAT_S16_LE)
+            hw_channels = max(
+                device.min_channels,
+                min(device.max_channels, max(2, input_channel + 1)),
+            )
+
+            if lib.snd_pcm_hw_params_any(pcm, hw_params) < 0:
+                return
+            if lib.snd_pcm_hw_params_set_access(pcm, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED) < 0:
+                return
+            if lib.snd_pcm_hw_params_set_format(pcm, hw_params, alsa_fmt) < 0:
+                return
+            if lib.snd_pcm_hw_params_set_channels(pcm, hw_params, hw_channels) < 0:
+                hw_channels = device.min_channels
+                if lib.snd_pcm_hw_params_set_channels(pcm, hw_params, hw_channels) < 0:
+                    return
+            if lib.snd_pcm_hw_params_set_rate(pcm, hw_params, sample_rate, 0) < 0:
+                return
+            if lib.snd_pcm_hw_params(pcm, hw_params) < 0:
+                return
+        finally:
+            lib.snd_pcm_hw_params_free(hw_params)
+
+        lib.snd_pcm_prepare(pcm)
+
+        bytes_per_sample = 2
+        if alsa_fmt == SND_PCM_FORMAT_S24_3LE:
+            bytes_per_sample = 3
+        elif alsa_fmt in (SND_PCM_FORMAT_S24_LE, SND_PCM_FORMAT_S32_LE, SND_PCM_FORMAT_FLOAT_LE):
+            bytes_per_sample = 4
+
+        period_frames = max(256, min(4096, sample_rate // 25))
+        frame_bytes = hw_channels * bytes_per_sample
+        buf = ctypes.create_string_buffer(period_frames * frame_bytes)
+
+        try:
+            while not self._stop_monitor_event.is_set():
+                frames_read = lib.snd_pcm_readi(pcm, buf, period_frames)
+                if frames_read < 0:
+                    recovered = lib.snd_pcm_recover(pcm, int(frames_read), 1)
+                    if recovered < 0:
+                        break
+                    continue
+                if frames_read == 0:
+                    continue
+
+                raw_slice = buf.raw[: frames_read * frame_bytes]
+                in_float = self._decode_alsa_bytes(
+                    raw_slice, int(frames_read), hw_channels, alsa_fmt
+                )
+                metered = self._extract_metered_input(
+                    in_float, studio_mode, channels, input_channel
+                )
+                self._update_meter_from_block(metered)
+        finally:
+            lib.snd_pcm_drop(pcm)
+            lib.snd_pcm_close(pcm)
+
+    # -------------------------------------------------------------------------
     # Recording State & Control
     # -------------------------------------------------------------------------
     @property
@@ -754,10 +1219,6 @@ class AudioEngine:
             if not self._is_recording:
                 return 0.0
             return max(0.0, time.monotonic() - self._record_start_monotonic)
-
-    @property
-    def peak_level(self) -> float:
-        return self._peak_level
 
     @property
     def talkback_active(self) -> bool:
@@ -785,6 +1246,8 @@ class AudioEngine:
     ) -> None:
         """Start recording from the selected hardware device to a WAV file."""
         self.stop_playback()
+        # Release idle monitor handle so recording thread has exclusive ALSA capture access
+        self._stop_monitoring_thread()
 
         with self._record_lock:
             if self._is_recording:
@@ -804,7 +1267,6 @@ class AudioEngine:
             self._stop_record_event.clear()
             self._is_recording = True
             self._record_start_monotonic = time.monotonic()
-            self._peak_level = 0.0
 
             self._record_thread = threading.Thread(
                 target=self._record_worker,
@@ -835,7 +1297,9 @@ class AudioEngine:
         with self._record_lock:
             self._is_recording = False
             self._current_processor = None
-            self._peak_level = 0.0
+
+        # Resume live input monitoring so VU meter & Peak Hold remain active
+        self._resume_monitoring_if_configured()
 
         return recorded_path
 
@@ -871,7 +1335,6 @@ class AudioEngine:
                 writer.close()
             with self._record_lock:
                 self._is_recording = False
-                self._peak_level = 0.0
 
     def _record_simulated_loop(
         self,
@@ -887,14 +1350,18 @@ class AudioEngine:
 
         while not self._stop_record_event.is_set():
             t0 = time.monotonic()
-            t_vec = (np.arange(chunk_frames, dtype=np.float64) + phase) / sample_rate
+            in_block = self._generate_simulated_input_block(chunk_frames, sample_rate, phase)
             phase += chunk_frames
-            # Gentle 440 Hz simulated mic signal at -18 dBFS
-            sim_mic = 0.125 * np.sin(2.0 * math.pi * 440.0 * t_vec)
-            in_block = np.column_stack((sim_mic, sim_mic))
+
+            metered = self._extract_metered_input(
+                in_block,
+                processor.studio_mode,
+                processor.output_channels,
+                processor.input_channel,
+            )
+            self._update_meter_from_block(metered)
 
             out_block = processor.process_block(in_block)
-            self._peak_level = float(np.max(np.abs(out_block))) if out_block.size else 0.0
             writer.write_float_frames(out_block)
 
             if t0 - last_header_flush >= 2.0:
@@ -983,10 +1450,15 @@ class AudioEngine:
                 in_float = self._decode_alsa_bytes(
                     raw_slice, int(frames_read), hw_channels, alsa_fmt
                 )
-                out_float = processor.process_block(in_float)
-                self._peak_level = (
-                    float(np.max(np.abs(out_float))) if out_float.size else 0.0
+                metered = self._extract_metered_input(
+                    in_float,
+                    processor.studio_mode,
+                    processor.output_channels,
+                    processor.input_channel,
                 )
+                self._update_meter_from_block(metered)
+
+                out_float = processor.process_block(in_float)
                 writer.write_float_frames(out_float)
 
                 now = time.monotonic()
@@ -1058,6 +1530,7 @@ class AudioEngine:
             return
 
         self.stop_playback()
+        self._stop_monitoring_thread()
 
         with self._play_lock:
             self._stop_play_event.clear()
@@ -1099,6 +1572,8 @@ class AudioEngine:
             self._play_position_sec = 0.0
             self._playing_filepath = None
 
+        self._resume_monitoring_if_configured()
+
     def _playback_worker(
         self,
         filepath: Path,
@@ -1127,6 +1602,7 @@ class AudioEngine:
             with self._play_lock:
                 self._is_playing = False
                 self._is_paused = False
+            self._resume_monitoring_if_configured()
             if on_finished:
                 on_finished()
 

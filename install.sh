@@ -14,15 +14,24 @@ APP_DEST="/opt/alpine-recorder"
 ETC_CONFIG_DIR="/etc/alpine-recorder"
 STORAGE_DIR="/storage"
 FORCE_CONFIG=0
+OSK_MODE=""
 
 for arg in "$@"; do
     case "$arg" in
         --force-config)
             FORCE_CONFIG=1
             ;;
+        --enable-osk)
+            OSK_MODE="true"
+            ;;
+        --disable-osk)
+            OSK_MODE="false"
+            ;;
         --help|-h)
-            echo "Usage: $0 [--force-config]"
+            echo "Usage: $0 [--force-config] [--enable-osk | --disable-osk]"
             echo "  --force-config   Overwrite existing smb.conf, xinitrc, and openbox configs."
+            echo "  --enable-osk     Enable the touch On-Screen Keyboard in saved settings."
+            echo "  --disable-osk    Disable the touch On-Screen Keyboard in saved settings."
             exit 0
             ;;
     esac
@@ -108,14 +117,16 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 3. Configure USB Audio Hardware & ALSA Group Permissions
+# 3. Configure USB Audio Hardware, Touchscreen Input & ALSA Group Permissions
 # -----------------------------------------------------------------------------
 addgroup -S audio 2>/dev/null || true
 addgroup root audio 2>/dev/null || true
+addgroup -S input 2>/dev/null || true
+addgroup root input 2>/dev/null || true
 addgroup -S sambashare 2>/dev/null || true
 
-# Ensure kernel module snd-usb-audio loads at boot
-mkdir -p /etc/modules-load.d
+# Ensure kernel module snd-usb-audio loads at boot and ALSA mixer state dir exists
+mkdir -p /etc/modules-load.d /var/lib/alsa
 if [ ! -f /etc/modules-load.d/usb-audio.conf ]; then
     echo "snd-usb-audio" > /etc/modules-load.d/usb-audio.conf
 fi
@@ -154,7 +165,40 @@ log_info "Deploying application code to ${APP_DEST}..."
 mkdir -p "${APP_DEST}"
 rm -rf "${APP_DEST}/app"
 cp -r "${SCRIPT_DIR}/app" "${APP_DEST}/app"
+if [ -d "${SCRIPT_DIR}/tests" ]; then
+    rm -rf "${APP_DEST}/tests"
+    cp -r "${SCRIPT_DIR}/tests" "${APP_DEST}/tests"
+fi
 chmod -R a+rX "${APP_DEST}"
+
+if command -v python3 >/dev/null 2>&1; then
+    PYTHONPATH="${APP_DEST}" python3 -m py_compile \
+        "${APP_DEST}/app/main.py" \
+        "${APP_DEST}/app/audio_engine.py" \
+        "${APP_DEST}/app/config_manager.py" \
+        "${APP_DEST}/app/samba_manager.py" \
+        "${APP_DEST}/app/network_info.py" \
+        "${APP_DEST}/app/ui/main_window.py" \
+        "${APP_DEST}/app/ui/vu_meter.py" \
+        "${APP_DEST}/app/ui/settings_dialog.py" \
+        "${APP_DEST}/app/ui/on_screen_keyboard.py" \
+        "${APP_DEST}/app/ui/styles.py" 2>/dev/null || true
+
+    if [ -n "${OSK_MODE}" ]; then
+        PYTHONPATH="${APP_DEST}" python3 -c "
+from app.config_manager import ConfigManager
+cm = ConfigManager(storage_dir='${STORAGE_DIR}', etc_config_dir='${ETC_CONFIG_DIR}')
+cm.settings.on_screen_keyboard = ('${OSK_MODE}' == 'true')
+cm.save()
+" 2>/dev/null || true
+        log_ok "On-Screen Keyboard setting updated to: ${OSK_MODE}"
+    fi
+fi
+
+# If the kiosk UI is already running, restart it so updated UI & VU meter take effect immediately
+if command -v pkill >/dev/null 2>&1; then
+    pkill -f "python3 -m app.main" 2>/dev/null || true
+fi
 log_ok "Application code updated in ${APP_DEST}."
 
 # -----------------------------------------------------------------------------
@@ -249,6 +293,8 @@ if command -v lbu >/dev/null 2>&1; then
     log_info "Registering application and configuration files with Alpine LBU..."
     lbu include "${APP_DEST}" 2>/dev/null || true
     lbu include "${ETC_CONFIG_DIR}" 2>/dev/null || true
+    lbu include /etc/modules-load.d 2>/dev/null || true
+    lbu include /var/lib/alsa 2>/dev/null || true
     lbu include /etc/samba 2>/dev/null || true
     lbu include /var/lib/samba/private 2>/dev/null || true
     lbu include /root/.xinitrc 2>/dev/null || true

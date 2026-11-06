@@ -38,6 +38,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Provide a simulated USB audio interface when no hardware is attached.",
     )
+    parser.add_argument(
+        "--osk",
+        dest="on_screen_keyboard",
+        action="store_true",
+        default=None,
+        help="Enable the touch On-Screen Keyboard (persisted in settings).",
+    )
+    parser.add_argument(
+        "--no-osk",
+        dest="on_screen_keyboard",
+        action="store_false",
+        default=None,
+        help="Disable the touch On-Screen Keyboard when using a hardware keyboard (persisted in settings).",
+    )
     return parser.parse_args(argv)
 
 
@@ -52,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
         storage_dir=args.storage_dir,
         etc_config_dir=args.config_dir,
     )
+    if args.on_screen_keyboard is not None:
+        config_manager.settings.on_screen_keyboard = bool(args.on_screen_keyboard)
+        config_manager.save()
     audio_engine = AudioEngine(simulate_if_empty=args.simulate_audio)
     samba_manager = SambaManager(config_manager=config_manager)
 

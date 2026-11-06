@@ -25,6 +25,7 @@ from app.audio_engine import AudioDeviceCapabilities, AudioEngine
 from app.config_manager import ConfigManager
 from app.network_info import get_primary_ip_display
 from app.samba_manager import SambaManager
+from app.ui.on_screen_keyboard import OnScreenKeyboardController
 
 
 class SettingsDialog(QDialog):
@@ -57,7 +58,13 @@ class SettingsDialog(QDialog):
         self._device_map: Dict[str, AudioDeviceCapabilities] = {}
         self._initializing = True
 
+        self.osk_controller = OnScreenKeyboardController(
+            is_enabled=self._is_osk_enabled,
+            parent=self,
+        )
+
         self._build_ui()
+        self._register_osk_fields()
         self._populate_devices_and_settings()
         self._refresh_samba_users()
         self._initializing = False
@@ -177,6 +184,22 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Mic Input Channel:", self.input_channel_combo)
 
+        self.osk_combo = QComboBox()
+        self.osk_combo.addItem(
+            "Enabled (Touchscreen Mode — Show on-screen keyboard for text fields)",
+            True,
+        )
+        self.osk_combo.addItem(
+            "Disabled (Hardware Keyboard Mode)",
+            False,
+        )
+        self.osk_combo.setToolTip(
+            "Enable or disable the On-Screen Touch Keyboard when editing the Project Prefix, "
+            "Samba user credentials, or any other text input field"
+        )
+        self.osk_combo.currentIndexChanged.connect(self._on_osk_setting_changed)
+        form.addRow("On-Screen Keyboard:", self.osk_combo)
+
         layout.addLayout(form)
 
         self.mode_hint_label = QLabel()
@@ -245,6 +268,13 @@ class SettingsDialog(QDialog):
 
         right_layout.addLayout(form)
 
+        self.samba_osk_btn = QPushButton("⌨ Open Touch Keyboard")
+        self.samba_osk_btn.setToolTip(
+            "Open the On-Screen Touch Keyboard to enter Samba Username and Password"
+        )
+        self.samba_osk_btn.clicked.connect(self._on_open_samba_osk)
+        right_layout.addWidget(self.samba_osk_btn)
+
         btn_row = QHBoxLayout()
         self.add_user_btn = QPushButton("Add New User")
         self.add_user_btn.setToolTip(
@@ -279,10 +309,10 @@ class SettingsDialog(QDialog):
     # -------------------------------------------------------------------------
     # Audio Hardware & Settings Logic
     # -------------------------------------------------------------------------
-    def _populate_devices_and_settings(self) -> None:
+    def _populate_devices_and_settings(self, force_probe: bool = False) -> None:
         settings = self.config_manager.settings
-        self._capture_devices = self.audio_engine.get_capture_devices()
-        self._playback_devices = self.audio_engine.get_playback_devices()
+        self._capture_devices = self.audio_engine.get_capture_devices(force_probe=force_probe)
+        self._playback_devices = self.audio_engine.get_playback_devices(force_probe=False)
         self._device_map = {d.device_id: d for d in self._capture_devices}
 
         self.input_device_combo.blockSignals(True)
@@ -328,12 +358,55 @@ class SettingsDialog(QDialog):
         ch_idx = self.channels_combo.findData(settings.channels)
         self.channels_combo.setCurrentIndex(ch_idx if ch_idx >= 0 else 0)
 
+        osk_idx = self.osk_combo.findData(bool(settings.on_screen_keyboard))
+        self.osk_combo.setCurrentIndex(osk_idx if osk_idx >= 0 else 0)
+        self.samba_osk_btn.setVisible(self._is_osk_enabled())
+
         # Populate bit depth & sample rate for active input device
         self._update_capabilities_for_current_device(use_saved_values=True)
         self._update_mode_ui_state()
 
+    def _register_osk_fields(self) -> None:
+        self.osk_controller.register_line_edit(
+            self.samba_username_edit,
+            title="Samba Username",
+            hint="Letters, numbers, underscores, or hyphens (max 31 chars)",
+            group="samba_credentials",
+        )
+        self.osk_controller.register_line_edit(
+            self.samba_password_edit,
+            title="Samba Password",
+            hint="Minimum 4 characters",
+            group="samba_credentials",
+        )
+        self.osk_controller.register_line_edit(
+            self.samba_password_confirm_edit,
+            title="Confirm Samba Password",
+            hint="Re-enter password to confirm",
+            group="samba_credentials",
+        )
+        self.osk_controller.attach_to_container(self)
+
+    def _is_osk_enabled(self) -> bool:
+        if hasattr(self, "osk_combo") and self.osk_combo.count() > 0:
+            return bool(self.osk_combo.currentData())
+        return bool(self.config_manager.settings.on_screen_keyboard)
+
+    def _on_osk_setting_changed(self, _index: int) -> None:
+        if hasattr(self, "samba_osk_btn"):
+            self.samba_osk_btn.setVisible(self._is_osk_enabled())
+
+    def _on_open_samba_osk(self) -> None:
+        if not self.samba_username_edit.text().strip():
+            target = self.samba_username_edit
+        elif not self.samba_password_edit.text():
+            target = self.samba_password_edit
+        else:
+            target = self.samba_password_confirm_edit
+        self.osk_controller.open_for_line_edit(target)
+
     def _on_rescan_devices(self) -> None:
-        self._populate_devices_and_settings()
+        self._populate_devices_and_settings(force_probe=True)
 
     def _on_input_device_changed(self, _index: int) -> None:
         if self._initializing:
@@ -437,6 +510,7 @@ class SettingsDialog(QDialog):
         s.studio_mode = bool(self.mode_combo.currentData())
         s.channels = 2 if s.studio_mode else int(self.channels_combo.currentData() or 1)
         s.input_channel = int(self.input_channel_combo.currentData() or 0)
+        s.on_screen_keyboard = self._is_osk_enabled()
 
         if dev_id:
             s.known_device_defaults[dev_id] = {

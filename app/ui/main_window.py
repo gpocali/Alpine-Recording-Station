@@ -33,6 +33,7 @@ from app.config_manager import (
 )
 from app.network_info import get_primary_ip_display
 from app.samba_manager import SambaManager
+from app.ui.on_screen_keyboard import OnScreenKeyboardController
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.styles import (
     build_main_stylesheet,
@@ -40,6 +41,7 @@ from app.ui.styles import (
     build_talkback_button_style,
     compute_scale_factor,
 )
+from app.ui.vu_meter import VuMeterWidget
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +72,19 @@ class MainWindow(QMainWindow):
         self._project_recordings: List[RecordingEntry] = []
         self._talkback_key_held = False
 
+        self.osk_controller = OnScreenKeyboardController(
+            is_enabled=lambda: bool(self.config_manager.settings.on_screen_keyboard),
+            on_committed=self._on_osk_field_committed,
+            parent=self,
+        )
+
         self._build_ui()
+        self.osk_controller.register_line_edit(
+            self.project_edit,
+            title="Project Prefix",
+            hint="Output WAV format: <ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav",
+        )
+        self.osk_controller.attach_to_container(self)
         self._sync_hardware_state()
         self._refresh_recordings_list()
         self._apply_responsive_scaling()
@@ -120,6 +134,15 @@ class MainWindow(QMainWindow):
         self.project_edit.textChanged.connect(self._on_project_name_changed)
         self.project_edit.returnPressed.connect(self.setFocus)
         top_layout.addWidget(self.project_edit, stretch=2)
+
+        self.project_osk_btn = QPushButton("⌨")
+        self.project_osk_btn.setToolTip(
+            "Open On-Screen Touch Keyboard to edit Project Prefix"
+        )
+        self.project_osk_btn.clicked.connect(
+            lambda: self.osk_controller.open_for_line_edit(self.project_edit)
+        )
+        top_layout.addWidget(self.project_osk_btn)
 
         self.filename_preview_label = QLabel()
         self.filename_preview_label.setStyleSheet(
@@ -182,26 +205,13 @@ class MainWindow(QMainWindow):
         self.timer_label.setStyleSheet("color: #F0F6FC; font-weight: bold;")
         deck_layout.addWidget(self.timer_label)
 
-        # Peak Level Meter bar
-        self.level_bar = QProgressBar()
-        self.level_bar.setRange(0, 100)
-        self.level_bar.setValue(0)
-        self.level_bar.setTextVisible(False)
-        self.level_bar.setFixedHeight(8)
-        self.level_bar.setStyleSheet(
-            """
-            QProgressBar {
-                background-color: #161B22;
-                border: 1px solid #30363D;
-                border-radius: 4px;
-            }
-            QProgressBar::chunk {
-                background-color: #3FB950;
-                border-radius: 3px;
-            }
-            """
+        # Graphical Studio VU & Peak Hold Meter (active during standby monitoring & recording)
+        self.vu_meter = VuMeterWidget(
+            on_reset_peak=self._on_reset_peak_hold,
+            parent=deck_frame,
         )
-        deck_layout.addWidget(self.level_bar)
+        self.level_bar = self.vu_meter
+        deck_layout.addWidget(self.vu_meter)
 
         # Primary Transport Controls Row (Record/Stop + Studio Talkback)
         controls_row = QHBoxLayout()
@@ -327,20 +337,21 @@ class MainWindow(QMainWindow):
         btn_min_h = max(72, int(round(130 * self._scale)))
         self.record_btn.setMinimumHeight(btn_min_h)
         self.talkback_btn.setMinimumHeight(btn_min_h)
+        self.vu_meter.apply_scale(self._scale)
 
         self._refresh_transport_styles()
 
     # -------------------------------------------------------------------------
     # Hardware State & Defaults
     # -------------------------------------------------------------------------
-    def _sync_hardware_state(self) -> None:
-        """Validate selected input/output devices and apply max rate/bit-depth defaults."""
+    def _sync_hardware_state(self, force_probe: bool = False) -> None:
+        """Validate selected input/output devices, apply max rate/bit-depth defaults, and start live input monitoring."""
         if self.audio_engine.is_recording:
             return
 
         settings = self.config_manager.settings
-        capture_devs = self.audio_engine.get_capture_devices()
-        playback_devs = self.audio_engine.get_playback_devices()
+        capture_devs = self.audio_engine.get_capture_devices(force_probe=force_probe)
+        playback_devs = self.audio_engine.get_playback_devices(force_probe=False)
 
         dev_map = {d.device_id: d for d in capture_devs}
         play_map = {d.device_id: d for d in playback_devs}
@@ -364,6 +375,18 @@ class MainWindow(QMainWindow):
             if settings.input_channel >= selected_dev.max_channels:
                 settings.input_channel = 0
             self.config_manager.save()
+
+            # Ensure continuous input monitoring is running so the VU & Peak Hold meter works while active
+            self.audio_engine.start_monitoring(
+                device=selected_dev,
+                sample_rate=settings.sample_rate,
+                bit_depth=settings.bit_depth,
+                studio_mode=settings.studio_mode,
+                channels=settings.effective_channels,
+                input_channel=settings.input_channel,
+            )
+        else:
+            self.audio_engine.stop_monitoring()
 
         # Resolve output playback device
         if settings.output_device == "same" or not settings.output_device:
@@ -396,6 +419,8 @@ class MainWindow(QMainWindow):
         self.mode_toggle_btn.setEnabled(not is_rec)
         self.settings_btn.setEnabled(not is_rec)
         self.project_edit.setEnabled(not is_rec)
+        self.project_osk_btn.setVisible(bool(settings.on_screen_keyboard))
+        self.project_osk_btn.setEnabled(not is_rec)
 
         # Hardware & Format labels
         if dev is None:
@@ -510,9 +535,18 @@ class MainWindow(QMainWindow):
         self._talkback_key_held = False
         self.audio_engine.set_talkback(False)
         finished_path = self.audio_engine.stop_recording()
-        self.level_bar.setValue(0)
         self._refresh_transport_styles()
         self._refresh_recordings_list(select_path=finished_path)
+
+    def _on_reset_peak_hold(self) -> None:
+        self.audio_engine.reset_peak_hold()
+        readings = self.audio_engine.get_vu_readings()
+        self.vu_meter.set_readings(
+            readings,
+            is_recording=self.audio_engine.is_recording,
+            has_device=(self._active_input_device is not None),
+        )
+        self.setFocus()
 
     def _on_recording_error_threadsafe(self, err_msg: str) -> None:
         QTimer.singleShot(0, lambda: self._handle_recording_error_ui(err_msg))
@@ -544,6 +578,7 @@ class MainWindow(QMainWindow):
         if s.studio_mode:
             s.channels = 2
         self.config_manager.save(commit_lbu=True)
+        self._sync_hardware_state()
         self._refresh_transport_styles()
 
     # -------------------------------------------------------------------------
@@ -554,6 +589,10 @@ class MainWindow(QMainWindow):
         self.config_manager.save()
         self._update_filename_preview()
         self._refresh_recordings_list()
+
+    def _on_osk_field_committed(self, _line_edit: QLineEdit, _text: str) -> None:
+        self.config_manager.save(commit_lbu=True)
+        self.setFocus()
 
     def _update_filename_preview(self) -> None:
         sample_name = generate_recording_filename(
@@ -663,7 +702,7 @@ class MainWindow(QMainWindow):
                 )
 
     def _on_manual_refresh(self) -> None:
-        self._sync_hardware_state()
+        self._sync_hardware_state(force_probe=True)
         self._refresh_recordings_list()
         self.ip_bar_label.setText(get_primary_ip_display())
 
@@ -685,14 +724,20 @@ class MainWindow(QMainWindow):
     # Periodic Timers & Keyboard Hotkeys
     # -------------------------------------------------------------------------
     def _on_ui_tick(self) -> None:
-        if self.audio_engine.is_recording:
+        is_rec = self.audio_engine.is_recording
+        readings = self.audio_engine.get_vu_readings()
+        self.vu_meter.set_readings(
+            readings,
+            is_recording=is_rec,
+            has_device=(self._active_input_device is not None),
+        )
+
+        if is_rec:
             elapsed = self.audio_engine.elapsed_seconds
             hrs = int(elapsed // 3600)
             mins = int((elapsed % 3600) // 60)
             secs = elapsed % 60.0
             self.timer_label.setText(f"{hrs:02d}:{mins:02d}:{secs:04.1f}")
-            peak_pct = min(100, int(round(self.audio_engine.peak_level * 100)))
-            self.level_bar.setValue(peak_pct)
         elif self.audio_engine.is_playing:
             pos = self.audio_engine.play_position_sec
             dur = self.audio_engine.play_duration_sec
@@ -739,6 +784,9 @@ class MainWindow(QMainWindow):
             if self.record_btn.isEnabled():
                 self._on_record_button_clicked()
             return
+        if key == Qt.Key.Key_C:
+            self._on_reset_peak_hold()
+            return
         if key == Qt.Key.Key_M:
             self._on_toggle_studio_mode()
             return
@@ -775,6 +823,7 @@ class MainWindow(QMainWindow):
         super().keyReleaseEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.audio_engine.stop_monitoring()
         self.audio_engine.stop_recording()
         self.audio_engine.stop_playback()
         super().closeEvent(event)
