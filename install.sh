@@ -197,7 +197,9 @@ mkdir -p "${STORAGE_DIR}"
 mkdir -p "${STORAGE_DIR}/.alpine-recorder"
 mkdir -p "${APK_CACHE_DIR}"
 chown root:sambashare "${STORAGE_DIR}" 2>/dev/null || true
-chmod 0777 "${STORAGE_DIR}"
+chmod 2777 "${STORAGE_DIR}" 2>/dev/null || chmod 0777 "${STORAGE_DIR}"
+find "${STORAGE_DIR}" \( -path "${STORAGE_DIR}/.alpine-recorder" -o -path "${STORAGE_DIR}/lost+found" \) -prune -o -type d -exec chown root:sambashare {} + -exec chmod 2777 {} + 2>/dev/null || true
+find "${STORAGE_DIR}" \( -path "${STORAGE_DIR}/.alpine-recorder" -o -path "${STORAGE_DIR}/lost+found" \) -prune -o -type f -exec chown root:sambashare {} + -exec chmod 0666 {} + 2>/dev/null || true
 
 mkdir -p "${ETC_CONFIG_DIR}"
 
@@ -205,13 +207,14 @@ mkdir -p "${ETC_CONFIG_DIR}"
 # (even when an external partition is mounted at /storage via /etc/fstab)
 mkdir -p /etc/local.d
 LOCAL_STORAGE_SCRIPT="/etc/local.d/alpine-recorder-storage.start"
-if [ ! -f "${LOCAL_STORAGE_SCRIPT}" ] || [ "${FORCE_CONFIG}" -eq 1 ]; then
+if [ ! -f "${LOCAL_STORAGE_SCRIPT}" ] || ! grep -q "chmod 2777" "${LOCAL_STORAGE_SCRIPT}" || [ "${FORCE_CONFIG}" -eq 1 ]; then
     cat << 'EOF' > "${LOCAL_STORAGE_SCRIPT}"
 #!/bin/sh
 mkdir -p /storage /storage/.alpine-recorder /storage/.alpine-recorder/apk-cache
-chgrp sambashare /storage 2>/dev/null || true
-chmod 0777 /storage 2>/dev/null || true
-find /storage -maxdepth 1 -type f -name "*.wav" -exec chmod 0666 {} + 2>/dev/null || true
+chown root:sambashare /storage 2>/dev/null || chgrp sambashare /storage 2>/dev/null || true
+chmod 2777 /storage 2>/dev/null || chmod 0777 /storage 2>/dev/null || true
+find /storage \( -path /storage/.alpine-recorder -o -path /storage/lost+found \) -prune -o -type d -exec chown root:sambashare {} + -exec chmod 2777 {} + 2>/dev/null || true
+find /storage \( -path /storage/.alpine-recorder -o -path /storage/lost+found \) -prune -o -type f -exec chown root:sambashare {} + -exec chmod 0666 {} + 2>/dev/null || true
 EOF
     chmod +x "${LOCAL_STORAGE_SCRIPT}"
 fi
@@ -260,7 +263,7 @@ log_ok "Application code updated in ${APP_DEST}."
 # -----------------------------------------------------------------------------
 mkdir -p /etc/samba /var/log/samba /var/lib/samba/private
 
-if [ ! -f /etc/samba/smb.conf ] || ! grep -q "\[storage\]" /etc/samba/smb.conf || [ "${FORCE_CONFIG}" -eq 1 ]; then
+if [ ! -f /etc/samba/smb.conf ] || ! grep -q "\[storage\]" /etc/samba/smb.conf || ! grep -q "force directory mode = 2777" /etc/samba/smb.conf || [ "${FORCE_CONFIG}" -eq 1 ]; then
     if [ -f /etc/samba/smb.conf ] && [ ! -f /etc/samba/smb.conf.orig ]; then
         cp /etc/samba/smb.conf /etc/samba/smb.conf.orig
     fi

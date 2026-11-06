@@ -26,7 +26,7 @@ An optimized **Alpine Linux** kiosk configuration and fullscreen studio applicat
 - **Samba Share & User Administration**:
   - Shares `/storage` over SMB (`\\<IP>\storage`).
   - Built-in **Samba Share Administration** tab in Settings to **Add Users**, **Change Passwords**, and **Remove Users** (persisted via `lbu commit`).
-  - All files and directories in `/storage` are permission-masked (`0666` / `0777` with `force group = sambashare`) so authenticated users have full read, write, and delete capability for remote cleanup.
+  - All files and subdirectories anywhere within the `/storage` shared folder structure are permission- and ownership-masked (`create mask = 0777`, `force create mode = 0666`, `directory mask = 2777`, `force directory mode = 2777`, `force user = root`, `force group = sambashare`, `admin users = @sambashare`, `inherit owner = windows and unix`, `nt acl support = no`, `map readonly = no`, plus recursive filesystem permission/ownership normalization) so authenticated users always have full read, write, and delete access even if new files appear with mismatched permissions or ownership.
 - **Touchscreen On-Screen Keyboard (with Hardware Keyboard Toggle)**:
   - Built-in responsive touch keyboard for strictly touchscreen kiosk deployments—pops up automatically when tapping the **Project Prefix** field, **Samba Share Administration** username/password fields, or any other text input (plus dedicated `⌨` launch buttons).
   - Includes full QWERTY, numeric, and symbol layers (`?123`), `Shift`, `Caps Lock`, cursor movement, `Clear`, password visibility toggle (`👁 Show` / `🙈 Hide`), and `Next Field ⇥` navigation across multi-field forms.

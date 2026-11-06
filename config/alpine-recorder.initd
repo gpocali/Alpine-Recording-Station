@@ -21,7 +21,10 @@ depend() {
 
 start_pre() {
     mkdir -p /var/log /storage /storage/.alpine-recorder
-    chmod 0777 /storage 2>/dev/null || true
+    chown root:sambashare /storage 2>/dev/null || true
+    chmod 2777 /storage 2>/dev/null || chmod 0777 /storage 2>/dev/null || true
+    find /storage \( -path /storage/.alpine-recorder -o -path /storage/lost+found \) -prune -o -type d -exec chown root:sambashare {} + -exec chmod 2777 {} + 2>/dev/null || true
+    find /storage \( -path /storage/.alpine-recorder -o -path /storage/lost+found \) -prune -o -type f -exec chown root:sambashare {} + -exec chmod 0666 {} + 2>/dev/null || true
 }
 
 stop_post() {

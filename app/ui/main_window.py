@@ -759,6 +759,7 @@ class MainWindow(QMainWindow):
     def _on_background_tick(self) -> None:
         self.ip_bar_label.setText(get_primary_ip_display())
         self._update_filename_preview()
+        self.config_manager.enforce_storage_permissions()
         if not self.audio_engine.is_recording and not self.audio_engine.is_playing:
             self._sync_hardware_state()
 

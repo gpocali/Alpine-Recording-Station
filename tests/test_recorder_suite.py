@@ -208,6 +208,37 @@ class TestConfigAndProjectFiltering(unittest.TestCase):
             self.assertTrue(cm2.settings.studio_mode)
             self.assertFalse(cm2.settings.on_screen_keyboard)
 
+    def test_recursive_storage_permission_masking(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            storage = base / "storage"
+            etc = base / "etc"
+            cm = ConfigManager(storage_dir=str(storage), etc_config_dir=str(etc))
+
+            nested_dir = storage / "imported" / "session_sub"
+            nested_dir.mkdir(parents=True, exist_ok=True)
+            nested_file = nested_dir / "external_take.wav"
+            nested_file.write_bytes(b"RIFF....WAVE")
+
+            # Simulate restrictive permissions on newly appeared directory & file
+            os.chmod(nested_file, 0o400)
+            os.chmod(nested_dir, 0o700)
+
+            cm.enforce_storage_permissions()
+
+            file_mode = nested_file.stat().st_mode & 0o666
+            dir_mode = nested_dir.stat().st_mode & 0o777
+            self.assertEqual(file_mode & 0o600, 0o600)
+            self.assertEqual(dir_mode & 0o700, 0o700)
+            if os.name != "nt":
+                self.assertEqual(file_mode, 0o666)
+                self.assertEqual(dir_mode, 0o777)
+            # Clean up read-only bits on Windows if any before temp dir cleanup
+            os.chmod(nested_file, 0o666)
+            os.chmod(nested_dir, 0o777)
+
 
 class TestSambaManager(unittest.TestCase):
     def test_samba_user_validation_and_crud(self) -> None:
@@ -400,6 +431,18 @@ class TestPostBootServiceAndRecoveryConfig(unittest.TestCase):
         self.assertIn("ALPINE_RECORDER_SINGLE_RUN", xinit_text)
         self.assertIn("fast_crashes", xinit_text)
         self.assertIn("xsetroot -cursor_name left_ptr", xinit_text)
+
+        smb_text = (repo_root / "config" / "smb.conf.template").read_text(encoding="utf-8")
+        self.assertIn("admin users = @sambashare", smb_text)
+        self.assertIn("force user = root", smb_text)
+        self.assertIn("force group = sambashare", smb_text)
+        self.assertIn("inherit owner = windows and unix", smb_text)
+        self.assertIn("create mask = 0777", smb_text)
+        self.assertIn("force create mode = 0666", smb_text)
+        self.assertIn("directory mask = 2777", smb_text)
+        self.assertIn("force directory mode = 2777", smb_text)
+        self.assertIn("nt acl support = no", smb_text)
+        self.assertIn("map readonly = no", smb_text)
 
 
 class TestComboBoxDropdownStyles(unittest.TestCase):

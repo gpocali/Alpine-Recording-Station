@@ -2,8 +2,10 @@
 # Alpine Recording Station X11 Kiosk Startup Script
 
 APP_LOG="/var/log/alpine-recorder.log"
+umask 0000 2>/dev/null || true
 mkdir -p /var/log /storage
-chmod 0777 /storage 2>/dev/null || true
+chown root:sambashare /storage 2>/dev/null || true
+chmod 2777 /storage 2>/dev/null || chmod 0777 /storage 2>/dev/null || true
 
 # Disable screen saver and power management blanking
 xset s off 2>/dev/null || true

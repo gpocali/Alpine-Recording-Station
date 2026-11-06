@@ -163,11 +163,103 @@ class ConfigManager:
             except OSError as exc:
                 logger.warning("Could not create directory %s: %s", directory, exc)
 
-        # Ensure /storage has permissive rwx permissions for Samba sharing
+        self.enforce_storage_permissions()
+
+    @staticmethod
+    def _resolve_sambashare_gid() -> int:
+        """Return numeric GID for the 'sambashare' group on POSIX systems, or -1 if unavailable."""
         try:
-            os.chmod(self.storage_dir, 0o777)
-        except OSError:
-            pass
+            import grp  # type: ignore[import-not-found]
+
+            return int(grp.getgrnam("sambashare").gr_gid)
+        except Exception:
+            return -1
+
+    def enforce_storage_permissions(self) -> None:
+        """Recursively mask permissions and ownership across /storage for Samba share access.
+
+        Ensures /storage and all subdirectories (excluding .alpine-recorder and lost+found)
+        have 2777 (or 0777) permissions and root:sambashare ownership, and all files inside
+        the shared folder structure have at least 0666 (rw-rw-rw-) permissions.
+        """
+        if not self.storage_dir.is_dir():
+            return
+
+        has_chown = hasattr(os, "chown")
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        target_uid = 0 if is_root else -1
+        target_gid = self._resolve_sambashare_gid() if has_chown else -1
+
+        def _mask_dir(dir_path: Path) -> None:
+            try:
+                st = dir_path.stat()
+                if (st.st_mode & 0o2777) != 0o2777:
+                    try:
+                        os.chmod(dir_path, 0o2777)
+                    except OSError:
+                        os.chmod(dir_path, (st.st_mode & 0o7777) | 0o777)
+                elif (st.st_mode & 0o777) != 0o777:
+                    os.chmod(dir_path, (st.st_mode & 0o7777) | 0o777)
+
+                if has_chown and (
+                    (target_uid >= 0 and st.st_uid != target_uid)
+                    or (target_gid >= 0 and st.st_gid != target_gid)
+                ):
+                    try:
+                        os.chown(dir_path, target_uid, target_gid)
+                    except OSError:
+                        if target_gid >= 0 and st.st_gid != target_gid:
+                            try:
+                                os.chown(dir_path, -1, target_gid)
+                            except OSError:
+                                pass
+            except OSError:
+                pass
+
+        _mask_dir(self.storage_dir)
+
+        skip_names = {".alpine-recorder", "lost+found"}
+        stack: List[Path] = [self.storage_dir]
+
+        while stack:
+            current_dir = stack.pop()
+            try:
+                with os.scandir(current_dir) as it:
+                    for entry in it:
+                        if entry.name in skip_names:
+                            continue
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                dir_p = Path(entry.path)
+                                _mask_dir(dir_p)
+                                stack.append(dir_p)
+                            elif entry.is_file(follow_symlinks=False):
+                                st = entry.stat(follow_symlinks=False)
+                                if (st.st_mode & 0o666) != 0o666:
+                                    try:
+                                        os.chmod(
+                                            entry.path, (st.st_mode & 0o777) | 0o666
+                                        )
+                                    except OSError:
+                                        pass
+                                if has_chown and (
+                                    (target_uid >= 0 and st.st_uid != target_uid)
+                                    or (target_gid >= 0 and st.st_gid != target_gid)
+                                ):
+                                    try:
+                                        os.chown(entry.path, target_uid, target_gid)
+                                    except OSError:
+                                        if target_gid >= 0 and st.st_gid != target_gid:
+                                            try:
+                                                os.chown(entry.path, -1, target_gid)
+                                            except OSError:
+                                                pass
+                        except OSError:
+                            continue
+            except OSError:
+                continue
 
     def load(self) -> RecorderSettings:
         """Load settings from the freshest valid configuration file."""
@@ -245,6 +337,7 @@ class ConfigManager:
         self, project_name: Optional[str] = None
     ) -> List[RecordingEntry]:
         """List all finished WAV files in /storage matching the project name prefix."""
+        self.enforce_storage_permissions()
         prefix_clean = sanitize_project_name(
             project_name if project_name is not None else self.settings.project_name
         )
