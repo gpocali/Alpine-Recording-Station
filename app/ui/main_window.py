@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Alpine Recording Station")
         self.setMinimumSize(640, 420)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
         self._scale = 1.0
         self._active_input_device: Optional[AudioDeviceCapabilities] = None

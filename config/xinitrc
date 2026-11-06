@@ -10,6 +10,9 @@ xset s off 2>/dev/null || true
 xset s noblank 2>/dev/null || true
 xset -dpms 2>/dev/null || true
 
+# Ensure visible arrow mouse cursor on the X11 root window
+xsetroot -cursor_name left_ptr 2>/dev/null || true
+
 # Start lightweight Openbox window manager in background
 openbox --config-file /root/.config/openbox/rc.xml >>"${APP_LOG}" 2>&1 &
 

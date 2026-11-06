@@ -234,6 +234,7 @@ class OnScreenKeyboardDialog(QDialog):
 
         self.setWindowTitle(f"On-Screen Keyboard — {title}")
         self.setModal(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
         # Size responsively to parent window / screen
         parent_win = parent or target.window()

@@ -217,7 +217,7 @@ run_foreground() {
     log_info "Starting Alpine Recording Station X11 session on vt${vt}..."
     log_info "Logs: ${APP_LOG} and ${XORG_LOG}"
 
-    xinit "${XINITRC}" -- /usr/bin/Xorg :0 "vt${vt}" -nocursor -keeptty >"${XORG_LOG}" 2>&1
+    xinit "${XINITRC}" -- /usr/bin/Xorg :0 "vt${vt}" -keeptty >"${XORG_LOG}" 2>&1
     rc=$?
 
     if [ "$rc" -ne 0 ]; then
@@ -245,7 +245,7 @@ run_daemon() {
         start_ts="$(date +%s)"
         printf "%s [INFO] Starting X11 kiosk session on vt%s...\n" "$(date -Iseconds 2>/dev/null || date)" "${DEFAULT_VT}" >>"${APP_LOG}"
 
-        xinit "${XINITRC}" -- /usr/bin/Xorg :0 "vt${DEFAULT_VT}" -nocursor -keeptty >"${XORG_LOG}" 2>&1
+        xinit "${XINITRC}" -- /usr/bin/Xorg :0 "vt${DEFAULT_VT}" -keeptty >"${XORG_LOG}" 2>&1
         rc=$?
         end_ts="$(date +%s)"
         elapsed=$((end_ts - start_ts))

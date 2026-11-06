@@ -130,8 +130,10 @@ if command -v apk >/dev/null 2>&1; then
     apk update
     # shellcheck disable=SC2086
     apk add --no-cache $BASE_PKGS $ARCH_PKGS
-    # Install qt6-qtbase-x11 if split into a separate subpackage on this Alpine release
-    apk add --no-cache qt6-qtbase-x11 2>/dev/null || true
+    # Install qt6-qtbase-x11 and X11 cursor packages if available on this Alpine release
+    for opt_pkg in qt6-qtbase-x11 xsetroot font-cursor-misc libxcursor xcursor-themes adwaita-icon-theme; do
+        apk add --no-cache "$opt_pkg" 2>/dev/null || true
+    done
     log_ok "All Alpine packages installed."
 else
     log_warn "apk package manager not found (non-Alpine environment). Skipping package installation."
@@ -269,11 +271,11 @@ else
     log_info "Preserving existing /root/.config/openbox/rc.xml."
 fi
 
-# Install or upgrade /root/.xinitrc (upgrade automatically if missing crash-loop guard)
-if [ ! -f /root/.xinitrc ] || ! grep -q "ALPINE_RECORDER_SINGLE_RUN" /root/.xinitrc || [ "${FORCE_CONFIG}" -eq 1 ]; then
+# Install or upgrade /root/.xinitrc (upgrade automatically if missing crash-loop guard or cursor init)
+if [ ! -f /root/.xinitrc ] || ! grep -q "ALPINE_RECORDER_SINGLE_RUN" /root/.xinitrc || ! grep -q "left_ptr" /root/.xinitrc || [ "${FORCE_CONFIG}" -eq 1 ]; then
     cp "${SCRIPT_DIR}/config/xinitrc" /root/.xinitrc
     chmod +x /root/.xinitrc
-    log_ok "Installed /root/.xinitrc with crash-loop protection and logging."
+    log_ok "Installed /root/.xinitrc with visible cursor, crash-loop protection, and logging."
 else
     log_info "Preserving existing /root/.xinitrc."
 fi

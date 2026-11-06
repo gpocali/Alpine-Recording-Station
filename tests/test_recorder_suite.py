@@ -388,10 +388,12 @@ class TestPostBootServiceAndRecoveryConfig(unittest.TestCase):
         self.assertIn("run_doctor", launcher_text)
         self.assertIn("do_recover", launcher_text)
         self.assertIn("max_fast_fails=3", launcher_text)
+        self.assertNotIn("-nocursor", launcher_text)
 
         xinit_text = (repo_root / "config" / "xinitrc").read_text(encoding="utf-8")
         self.assertIn("ALPINE_RECORDER_SINGLE_RUN", xinit_text)
         self.assertIn("fast_crashes", xinit_text)
+        self.assertIn("xsetroot -cursor_name left_ptr", xinit_text)
 
 
 if __name__ == "__main__":

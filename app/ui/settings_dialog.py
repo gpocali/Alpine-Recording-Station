@@ -45,6 +45,7 @@ class SettingsDialog(QDialog):
 
         self.setWindowTitle("Settings & Samba Share Administration")
         self.setModal(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         if parent is not None:
             self.resize(
                 max(640, int(parent.width() * 0.78)),
