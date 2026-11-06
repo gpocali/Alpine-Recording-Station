@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -37,6 +38,7 @@ from app.ui.on_screen_keyboard import OnScreenKeyboardController
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.styles import (
     build_main_stylesheet,
+    build_pause_record_button_style,
     build_record_button_style,
     build_talkback_button_style,
     compute_scale_factor,
@@ -72,6 +74,7 @@ class MainWindow(QMainWindow):
         self._active_output_device: Optional[AudioDeviceCapabilities] = None
         self._project_recordings: List[RecordingEntry] = []
         self._talkback_key_held = False
+        self._pause_blink_phase = True
 
         self.osk_controller = OnScreenKeyboardController(
             is_enabled=lambda: bool(self.config_manager.settings.on_screen_keyboard),
@@ -153,7 +156,7 @@ class MainWindow(QMainWindow):
 
         self.mode_toggle_btn = QPushButton()
         self.mode_toggle_btn.setToolTip(
-            "Toggle between Normal Mode and Studio Mode (L=Mic, R=0.5s Tone + Talkback) [Hotkey: M]"
+            "Toggle between Normal Mode and Studio Mode (L=Mic, R=Tone + Talkback) [Hotkey: M]"
         )
         self.mode_toggle_btn.clicked.connect(self._on_toggle_studio_mode)
         top_layout.addWidget(self.mode_toggle_btn)
@@ -184,17 +187,17 @@ class MainWindow(QMainWindow):
         status_row.addWidget(self.format_badge_label)
         self.main_layout.addLayout(status_row)
 
-        # 3. Center Studio Deck: Elapsed Time Counter + Record/Stop Button + Talkback Button
-        deck_frame = QFrame()
-        deck_frame.setStyleSheet(
+        # 3. Center Studio Deck: Elapsed Time Counter + Record/Pause/Stop + Talkback Button
+        self.deck_frame = QFrame()
+        self.deck_frame.setStyleSheet(
             "QFrame#StudioDeck { background-color: #0D1014; border: 1px solid #21262D; border-radius: 12px; }"
         )
-        deck_frame.setObjectName("StudioDeck")
-        deck_layout = QVBoxLayout(deck_frame)
+        self.deck_frame.setObjectName("StudioDeck")
+        deck_layout = QVBoxLayout(self.deck_frame)
         deck_layout.setContentsMargins(16, 12, 16, 14)
         deck_layout.setSpacing(10)
 
-        # Talkback visual indicator banner
+        # Studio Mode / Paused Recording visual indicator banner
         self.talkback_banner = QLabel("STUDIO MODE READY — RECORDING MIC TO LEFT CHANNEL")
         self.talkback_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.talkback_banner.setWordWrap(True)
@@ -209,12 +212,12 @@ class MainWindow(QMainWindow):
         # Graphical Studio VU & Peak Hold Meter (active during standby monitoring & recording)
         self.vu_meter = VuMeterWidget(
             on_reset_peak=self._on_reset_peak_hold,
-            parent=deck_frame,
+            parent=self.deck_frame,
         )
         self.level_bar = self.vu_meter
         deck_layout.addWidget(self.vu_meter)
 
-        # Primary Transport Controls Row (Record/Stop + Studio Talkback)
+        # Primary Transport Controls Row (Record/Stop + Pause/Resume + Studio Talkback)
         controls_row = QHBoxLayout()
         controls_row.setSpacing(16)
 
@@ -228,21 +231,32 @@ class MainWindow(QMainWindow):
         self.record_btn.clicked.connect(self._on_record_button_clicked)
         controls_row.addWidget(self.record_btn, stretch=3)
 
+        self.pause_record_btn = QPushButton("⏸  PAUSE\nRECORDING")
+        self.pause_record_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.pause_record_btn.setToolTip(
+            "Pause or resume the current recording (safely closes the WAV file on disk while paused "
+            "and reopens the same file when resumed) [Hotkey: P or Pause while recording]"
+        )
+        self.pause_record_btn.clicked.connect(self._on_pause_record_button_clicked)
+        controls_row.addWidget(self.pause_record_btn, stretch=2)
+
         self.talkback_btn = QPushButton("🎙  TALKBACK\n(HOLD FOR NOTES)")
         self.talkback_btn.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self.talkback_btn.setToolTip(
             "Momentary Push-to-Talk (Studio Mode): Hold down to mute Left channel, "
-            "emit a 0.5s marker tone on Right channel, and record spoken notes on Right channel "
-            "until released [Hotkey: Hold T]"
+            "emit a press marker tone on Right channel, record spoken notes on Right channel "
+            "while held, and emit a release marker tone when concluded [Hotkey: Hold T]"
         )
         self.talkback_btn.pressed.connect(self._on_talkback_pressed)
         self.talkback_btn.released.connect(self._on_talkback_released)
         controls_row.addWidget(self.talkback_btn, stretch=2)
 
         deck_layout.addLayout(controls_row, stretch=1)
-        self.main_layout.addWidget(deck_frame, stretch=3)
+        self.main_layout.addWidget(self.deck_frame, stretch=3)
 
         # 4. Bottom Pane: Scrollable Project Recordings List & Reference Playback
         takes_frame = QFrame()
@@ -337,6 +351,7 @@ class MainWindow(QMainWindow):
 
         btn_min_h = max(72, int(round(130 * self._scale)))
         self.record_btn.setMinimumHeight(btn_min_h)
+        self.pause_record_btn.setMinimumHeight(btn_min_h)
         self.talkback_btn.setMinimumHeight(btn_min_h)
         self.vu_meter.apply_scale(self._scale)
 
@@ -405,7 +420,11 @@ class MainWindow(QMainWindow):
     def _refresh_transport_styles(self) -> None:
         settings = self.config_manager.settings
         is_rec = self.audio_engine.is_recording
+        is_rec_paused = self.audio_engine.is_record_paused
+        blink_on = self._pause_blink_phase
         dev = self._active_input_device
+        rec_path = self.audio_engine.current_recording_path
+        rec_name = rec_path.name if rec_path is not None else ""
 
         # Mode toggle button text
         if settings.studio_mode:
@@ -423,7 +442,23 @@ class MainWindow(QMainWindow):
         self.project_osk_btn.setVisible(bool(settings.on_screen_keyboard))
         self.project_osk_btn.setEnabled(not is_rec)
 
-        # Hardware & Format labels
+        # Studio Deck Frame Border (high-visibility pulsing amber border when paused)
+        if is_rec_paused:
+            border_col = "#FFDF5D" if blink_on else "#D29922"
+            bg_col = "#1B1408" if blink_on else "#120E06"
+            self.deck_frame.setStyleSheet(
+                f"QFrame#StudioDeck {{ background-color: {bg_col}; border: 3px solid {border_col}; border-radius: 12px; }}"
+            )
+        elif is_rec:
+            self.deck_frame.setStyleSheet(
+                "QFrame#StudioDeck { background-color: #0D1014; border: 2px solid #8E1523; border-radius: 12px; }"
+            )
+        else:
+            self.deck_frame.setStyleSheet(
+                "QFrame#StudioDeck { background-color: #0D1014; border: 1px solid #21262D; border-radius: 12px; }"
+            )
+
+        # Hardware & Format labels + Filename Preview
         if dev is None:
             self.hw_status_label.setText(
                 "⚠ No Valid Audio Interface Connected — Connect USB Audio Interface or Check Settings [F2]"
@@ -436,25 +471,55 @@ class MainWindow(QMainWindow):
                 if settings.studio_mode
                 else ("STEREO (2ch)" if settings.channels >= 2 else "MONO (1ch)")
             )
-            self.hw_status_label.setText(f"Input: {dev.display_name}")
-            self.hw_status_label.setStyleSheet("color: #3FB950; font-weight: 600;")
+            if is_rec_paused:
+                self.hw_status_label.setText(
+                    f"⏸ RECORDING PAUSED (FILE SAVED & CLOSED: {rec_name}) — WAITING TO RESUME"
+                )
+                status_col = "#FFDF5D" if blink_on else "#F0B72F"
+                self.hw_status_label.setStyleSheet(f"color: {status_col}; font-weight: bold;")
+            else:
+                self.hw_status_label.setText(f"Input: {dev.display_name}")
+                self.hw_status_label.setStyleSheet("color: #3FB950; font-weight: 600;")
             self.format_badge_label.setText(
                 f"{settings.bit_depth}-bit  •  {settings.sample_rate:,} Hz  •  {ch_desc}"
             )
 
-        # Record / Stop Button State (Red = recording, Green = ready, Grey = invalid/no device)
+        self._update_filename_preview()
+
+        # Record / Stop Button & Pause / Resume Button States
         if is_rec:
             self.record_btn.setEnabled(True)
-            self.record_btn.setText("■   STOP RECORDING")
             self.record_btn.setStyleSheet(
                 build_record_button_style("recording", self._scale)
             )
-            self.timer_label.setStyleSheet("color: #FF6B7A; font-weight: bold;")
+            self.pause_record_btn.setEnabled(True)
+            if is_rec_paused:
+                self.record_btn.setText("■   STOP & SAVE")
+                self.pause_record_btn.setText("▶   RESUME\nRECORDING")
+                self.pause_record_btn.setStyleSheet(
+                    build_pause_record_button_style(
+                        "paused", self._scale, blink_on=blink_on
+                    )
+                )
+                timer_col = "#FFDF5D" if blink_on else "#D29922"
+                self.timer_label.setStyleSheet(f"color: {timer_col}; font-weight: bold;")
+            else:
+                self.record_btn.setText("■   STOP RECORDING")
+                self.pause_record_btn.setText("⏸   PAUSE\nRECORDING")
+                self.pause_record_btn.setStyleSheet(
+                    build_pause_record_button_style("active", self._scale)
+                )
+                self.timer_label.setStyleSheet("color: #FF6B7A; font-weight: bold;")
         elif dev is not None:
             self.record_btn.setEnabled(True)
             self.record_btn.setText("●   RECORD")
             self.record_btn.setStyleSheet(
                 build_record_button_style("ready", self._scale)
+            )
+            self.pause_record_btn.setEnabled(False)
+            self.pause_record_btn.setText("⏸   PAUSE\nRECORDING")
+            self.pause_record_btn.setStyleSheet(
+                build_pause_record_button_style("disabled", self._scale)
             )
             self.timer_label.setStyleSheet("color: #F0F6FC; font-weight: bold;")
         else:
@@ -463,23 +528,52 @@ class MainWindow(QMainWindow):
             self.record_btn.setStyleSheet(
                 build_record_button_style("disabled", self._scale)
             )
+            self.pause_record_btn.setEnabled(False)
+            self.pause_record_btn.setText("⏸   PAUSE\nRECORDING")
+            self.pause_record_btn.setStyleSheet(
+                build_pause_record_button_style("disabled", self._scale)
+            )
             self.timer_label.setStyleSheet("color: #6E7681; font-weight: bold;")
 
-        # Talkback button & visual banner state
+        # Talkback button & visual banner state (also shows unmistakable Paused Warning Banner!)
         tb_active = self.audio_engine.talkback_active
-        tb_enabled = bool(settings.studio_mode and dev is not None)
+        tb_enabled = bool(
+            settings.studio_mode and dev is not None and not is_rec_paused
+        )
         self.talkback_btn.setVisible(bool(settings.studio_mode))
         self.talkback_btn.setEnabled(tb_enabled)
         self.talkback_btn.setStyleSheet(
             build_talkback_button_style(tb_active, tb_enabled, self._scale)
         )
 
-        if settings.studio_mode:
+        if is_rec_paused:
+            self.talkback_banner.setVisible(True)
+            if settings.studio_mode:
+                self.talkback_btn.setText("🎙  TALKBACK\n(PAUSED)")
+            file_info = f" ({rec_name})" if rec_name else ""
+            self.talkback_banner.setText(
+                f"⚠  RECORDING PAUSED{file_info} — WAV FILE SAVED & CLOSED ON DISK  •  "
+                f"PRESS [RESUME RECORDING] OR [P] TO CONTINUE  ⚠"
+            )
+            if blink_on:
+                self.talkback_banner.setStyleSheet(
+                    "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
+                    "padding: 8px; border-radius: 6px; border: 2px solid #FFDF5D;"
+                )
+            else:
+                self.talkback_banner.setStyleSheet(
+                    "background-color: #3B2300; color: #FFDF5D; font-weight: bold; "
+                    "padding: 8px; border-radius: 6px; border: 2px solid #F0B72F;"
+                )
+        elif settings.studio_mode:
+            press_dur = f"{settings.talkback_tone_duration_sec:g}s"
+            rel_dur = f"{settings.talkback_release_tone_duration_sec:g}s"
+            freq_hz = f"{settings.talkback_tone_hz:g} Hz"
             self.talkback_banner.setVisible(True)
             if tb_active:
                 self.talkback_btn.setText("🎙  TALKBACK ACTIVE\n(RECORDING RIGHT CH)")
                 self.talkback_banner.setText(
-                    "⚡ TALKBACK ACTIVE — LEFT CH MUTED • 0.5s TONE + MIC RECORDING ON RIGHT CH ⚡"
+                    f"⚡ TALKBACK ACTIVE — LEFT CH MUTED • {press_dur} TONE ({freq_hz}) + MIC ON RIGHT CH (RELEASE: {rel_dur}) ⚡"
                 )
                 self.talkback_banner.setStyleSheet(
                     "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
@@ -488,7 +582,7 @@ class MainWindow(QMainWindow):
             else:
                 self.talkback_btn.setText("🎙  TALKBACK\n(HOLD FOR NOTES)")
                 self.talkback_banner.setText(
-                    "STUDIO MODE: MIC RECORDING ON LEFT CH  •  HOLD TALKBACK [T] FOR RIGHT CH NOTES"
+                    f"STUDIO MODE: MIC ON LEFT CH  •  HOLD TALKBACK [T] FOR RIGHT CH NOTES ({freq_hz}: {press_dur} PRESS / {rel_dur} RELEASE)"
                 )
                 self.talkback_banner.setStyleSheet(
                     "background-color: #161B22; color: #58A6FF; font-weight: 600; "
@@ -500,13 +594,28 @@ class MainWindow(QMainWindow):
         self._update_playback_buttons_state()
 
     # -------------------------------------------------------------------------
-    # Recording & Talkback Actions
+    # Recording, Pause/Resume & Talkback Actions
     # -------------------------------------------------------------------------
     def _on_record_button_clicked(self) -> None:
         if self.audio_engine.is_recording:
             self._stop_recording()
         else:
             self._start_recording()
+
+    def _on_pause_record_button_clicked(self) -> None:
+        if not self.audio_engine.is_recording:
+            return
+        self._talkback_key_held = False
+        self.audio_engine.set_talkback(False)
+        paused = self.audio_engine.toggle_pause_recording()
+        self._pause_blink_phase = True
+        self._refresh_transport_styles()
+        if paused:
+            elapsed = self.audio_engine.elapsed_seconds
+            hrs = int(elapsed // 3600)
+            mins = int((elapsed % 3600) // 60)
+            secs = elapsed % 60.0
+            self.timer_label.setText(f"⏸ {hrs:02d}:{mins:02d}:{secs:04.1f}  [PAUSED]")
 
     def _start_recording(self) -> None:
         self._sync_hardware_state()
@@ -528,6 +637,7 @@ class MainWindow(QMainWindow):
             input_channel=settings.input_channel,
             tone_hz=settings.talkback_tone_hz,
             tone_duration_sec=settings.talkback_tone_duration_sec,
+            release_tone_duration_sec=settings.talkback_release_tone_duration_sec,
             on_error=self._on_recording_error_threadsafe,
         )
         self._refresh_transport_styles()
@@ -536,6 +646,7 @@ class MainWindow(QMainWindow):
         self._talkback_key_held = False
         self.audio_engine.set_talkback(False)
         finished_path = self.audio_engine.stop_recording()
+        self.timer_label.setText("00:00:00.0")
         self._refresh_transport_styles()
         self._refresh_recordings_list(select_path=finished_path)
 
@@ -546,6 +657,7 @@ class MainWindow(QMainWindow):
             readings,
             is_recording=self.audio_engine.is_recording,
             has_device=(self._active_input_device is not None),
+            is_paused=self.audio_engine.is_record_paused,
         )
         self.setFocus()
 
@@ -562,7 +674,10 @@ class MainWindow(QMainWindow):
         )
 
     def _on_talkback_pressed(self) -> None:
-        if not self.config_manager.settings.studio_mode:
+        if (
+            not self.config_manager.settings.studio_mode
+            or self.audio_engine.is_record_paused
+        ):
             return
         self.audio_engine.set_talkback(True)
         self._refresh_transport_styles()
@@ -596,10 +711,26 @@ class MainWindow(QMainWindow):
         self.setFocus()
 
     def _update_filename_preview(self) -> None:
+        rec_path = self.audio_engine.current_recording_path
+        if self.audio_engine.is_record_paused and rec_path is not None:
+            self.filename_preview_label.setText(f"⏸ Paused File: {rec_path.name}")
+            self.filename_preview_label.setStyleSheet(
+                "border: none; color: #FFDF5D; font-family: monospace; font-weight: bold;"
+            )
+            return
+        if self.audio_engine.is_recording and rec_path is not None:
+            self.filename_preview_label.setText(f"● Recording: {rec_path.name}")
+            self.filename_preview_label.setStyleSheet(
+                "border: none; color: #FF6B7A; font-family: monospace; font-weight: bold;"
+            )
+            return
         sample_name = generate_recording_filename(
             self.config_manager.settings.project_name
         )
         self.filename_preview_label.setText(f"Next: {sample_name}")
+        self.filename_preview_label.setStyleSheet(
+            "border: none; color: #8B949E; font-family: monospace;"
+        )
 
     def _refresh_recordings_list(self, select_path: Optional[Path] = None) -> None:
         prefix = sanitize_project_name(self.config_manager.settings.project_name)
@@ -728,11 +859,13 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     def _on_ui_tick(self) -> None:
         is_rec = self.audio_engine.is_recording
+        is_rec_paused = self.audio_engine.is_record_paused
         readings = self.audio_engine.get_vu_readings()
         self.vu_meter.set_readings(
             readings,
             is_recording=is_rec,
             has_device=(self._active_input_device is not None),
+            is_paused=is_rec_paused,
         )
 
         if is_rec:
@@ -740,7 +873,16 @@ class MainWindow(QMainWindow):
             hrs = int(elapsed // 3600)
             mins = int((elapsed % 3600) // 60)
             secs = elapsed % 60.0
-            self.timer_label.setText(f"{hrs:02d}:{mins:02d}:{secs:04.1f}")
+            if is_rec_paused:
+                blink_on = (int(time.monotonic() * 2.5) % 2) == 0
+                if blink_on != self._pause_blink_phase:
+                    self._pause_blink_phase = blink_on
+                    self._refresh_transport_styles()
+                self.timer_label.setText(
+                    f"⏸ {hrs:02d}:{mins:02d}:{secs:04.1f}  [PAUSED]"
+                )
+            else:
+                self.timer_label.setText(f"{hrs:02d}:{mins:02d}:{secs:04.1f}")
         elif self.audio_engine.is_playing:
             pos = self.audio_engine.play_position_sec
             dur = self.audio_engine.play_duration_sec
@@ -788,6 +930,10 @@ class MainWindow(QMainWindow):
             if self.record_btn.isEnabled():
                 self._on_record_button_clicked()
             return
+        if key == Qt.Key.Key_Pause:
+            if self.audio_engine.is_recording:
+                self._on_pause_record_button_clicked()
+            return
         if key == Qt.Key.Key_C:
             self._on_reset_peak_hold()
             return
@@ -795,7 +941,10 @@ class MainWindow(QMainWindow):
             self._on_toggle_studio_mode()
             return
         if key == Qt.Key.Key_P:
-            self._on_play_pause_clicked()
+            if self.audio_engine.is_recording:
+                self._on_pause_record_button_clicked()
+            else:
+                self._on_play_pause_clicked()
             return
         if key == Qt.Key.Key_S:
             self._on_stop_playback_clicked()

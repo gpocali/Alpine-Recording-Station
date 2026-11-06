@@ -358,3 +358,78 @@ def build_talkback_button_style(active: bool, enabled: bool, scale: float = 1.0)
         background-color: #264875;
     }}
     """
+
+
+def build_pause_record_button_style(
+    state: str, scale: float = 1.0, blink_on: bool = True
+) -> str:
+    """Return stylesheet for the Pause/Resume Recording button ('active', 'paused', 'disabled')."""
+    font_px = max(16, int(round(24 * scale)))
+    radius = max(12, int(round(16 * scale)))
+
+    if state == "paused":
+        if blink_on:
+            return f"""
+            QPushButton {{
+                background-color: #E36209;
+                color: #FFFFFF;
+                border: 4px solid #FFDF5D;
+                border-radius: {radius}px;
+                font-size: {font_px}px;
+                font-weight: bold;
+                letter-spacing: 1px;
+            }}
+            QPushButton:hover {{
+                background-color: #F0883E;
+            }}
+            QPushButton:pressed {{
+                background-color: #BD561D;
+            }}
+            """
+        return f"""
+        QPushButton {{
+            background-color: #5A3000;
+            color: #FFDF5D;
+            border: 4px solid #F0B72F;
+            border-radius: {radius}px;
+            font-size: {font_px}px;
+            font-weight: bold;
+            letter-spacing: 1px;
+        }}
+        QPushButton:hover {{
+            background-color: #7A4300;
+        }}
+        QPushButton:pressed {{
+            background-color: #3B2300;
+        }}
+        """
+
+    if state == "active":
+        return f"""
+        QPushButton {{
+            background-color: #9E6A03;
+            color: #FFFFFF;
+            border: 3px solid #F0B72F;
+            border-radius: {radius}px;
+            font-size: {font_px}px;
+            font-weight: bold;
+            letter-spacing: 1px;
+        }}
+        QPushButton:hover {{
+            background-color: #BB8009;
+        }}
+        QPushButton:pressed {{
+            background-color: #7D5200;
+        }}
+        """
+
+    return f"""
+    QPushButton {{
+        background-color: #1C2128;
+        color: #545D68;
+        border: 2px solid #30363D;
+        border-radius: {radius}px;
+        font-size: {font_px}px;
+        font-weight: bold;
+    }}
+    """

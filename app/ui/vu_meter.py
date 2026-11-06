@@ -355,17 +355,24 @@ class VuMeterWidget(QFrame):
         readings: VuMeterReadings,
         is_recording: bool = False,
         has_device: bool = True,
+        is_paused: bool = False,
     ) -> None:
         """Update graphical VU meter bars, Peak Hold marker, and digital dBFS readouts."""
         self._readings = readings
         self.canvas.set_state(readings, has_device=has_device)
-        self._refresh_readouts(readings, is_recording=is_recording, has_device=has_device)
+        self._refresh_readouts(
+            readings,
+            is_recording=is_recording,
+            has_device=has_device,
+            is_paused=is_paused,
+        )
 
     def _refresh_readouts(
         self,
         readings: VuMeterReadings,
         is_recording: bool,
         has_device: bool,
+        is_paused: bool = False,
     ) -> None:
         small_px = max(10, int(round(12 * self._scale)))
         btn_pad_v = max(2, int(round(3 * self._scale)))
@@ -376,6 +383,13 @@ class VuMeterWidget(QFrame):
             self.title_label.setText("○ INPUT VU METER (OFFLINE)")
             self.title_label.setStyleSheet(
                 f"border: none; color: #6E7681; font-weight: bold; font-size: {small_px}px;"
+            )
+        elif is_recording and is_paused:
+            self.title_label.setText(
+                "⏸ INPUT VU METER (RECORDING PAUSED — FILE SAVED & CLOSED)"
+            )
+            self.title_label.setStyleSheet(
+                f"border: none; color: #FFDF5D; font-weight: bold; font-size: {small_px}px;"
             )
         elif is_recording:
             self.title_label.setText("● INPUT VU METER (RECORDING)")

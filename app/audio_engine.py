@@ -123,12 +123,13 @@ class StudioTalkbackProcessor:
       - Always outputs 2 channels (Stereo: Left = Ch 0, Right = Ch 1).
       - When Talkback is OFF:
           Left  = Microphone audio (from selected input_channel)
-          Right = Silence (0.0)
+          Right = Silence (0.0), or the release marker tone (default 0.5s)
+                  immediately after Talkback is concluded.
       - When Talkback is ON (momentary push-to-talk):
           Left  = Silence (0.0)
-          Right = First 0.5 seconds is a sine marker tone (e.g. 1000 Hz),
-                  followed immediately by Microphone audio on Right channel
-                  until Talkback is released.
+          Right = First `tone_duration_sec` seconds (default 1.0s) is a sine
+                  marker tone (e.g. 1000 Hz or 440 Hz), followed immediately
+                  by Microphone audio on Right channel until Talkback is released.
     """
 
     def __init__(
@@ -138,7 +139,8 @@ class StudioTalkbackProcessor:
         output_channels: int,
         input_channel: int = 0,
         tone_hz: float = 1000.0,
-        tone_duration_sec: float = 0.5,
+        tone_duration_sec: float = 1.0,
+        release_tone_duration_sec: float = 0.5,
         tone_amplitude: float = 0.5,  # -6 dBFS
     ) -> None:
         self.sample_rate = max(8000, int(sample_rate))
@@ -146,16 +148,35 @@ class StudioTalkbackProcessor:
         self.output_channels = 2 if self.studio_mode else max(1, min(2, int(output_channels)))
         self.input_channel = max(0, int(input_channel))
         self.tone_hz = float(tone_hz)
-        self.tone_duration_sec = float(tone_duration_sec)
+        self.tone_duration_sec = max(0.0, float(tone_duration_sec))
+        self.release_tone_duration_sec = max(0.0, float(release_tone_duration_sec))
         self.tone_amplitude = float(tone_amplitude)
 
         self._lock = threading.Lock()
         self._talkback_active = False
         self._tone_samples_total = int(round(self.sample_rate * self.tone_duration_sec))
         self._tone_samples_emitted = 0
-        self._fade_samples = min(
-            int(round(self.sample_rate * 0.005)),  # 5ms click-free fade
-            max(1, self._tone_samples_total // 4),
+        self._fade_samples = (
+            min(
+                int(round(self.sample_rate * 0.005)),  # 5ms click-free fade
+                max(1, self._tone_samples_total // 4),
+            )
+            if self._tone_samples_total > 0
+            else 0
+        )
+
+        self._release_tone_samples_total = int(
+            round(self.sample_rate * self.release_tone_duration_sec)
+        )
+        # Start at _release_tone_samples_total so no release tone plays until Talkback is concluded
+        self._release_tone_samples_emitted = self._release_tone_samples_total
+        self._release_fade_samples = (
+            min(
+                int(round(self.sample_rate * 0.005)),  # 5ms click-free fade
+                max(1, self._release_tone_samples_total // 4),
+            )
+            if self._release_tone_samples_total > 0
+            else 0
         )
 
     @property
@@ -168,7 +189,39 @@ class StudioTalkbackProcessor:
         with self._lock:
             if active and not self._talkback_active:
                 self._tone_samples_emitted = 0
+                self._release_tone_samples_emitted = self._release_tone_samples_total
+            elif not active and self._talkback_active:
+                self._release_tone_samples_emitted = 0
             self._talkback_active = bool(active)
+
+    def _synthesize_tone_segment(
+        self, start_pos: int, count: int, total_samples: int, fade_samples: int
+    ) -> np.ndarray:
+        """Synthesize a click-free raised-cosine faded sine wave segment."""
+        sample_indices = np.arange(
+            start_pos, start_pos + count, dtype=np.float64
+        )
+        sine_wave = self.tone_amplitude * np.sin(
+            2.0 * math.pi * self.tone_hz * sample_indices / self.sample_rate
+        )
+        envelope = np.ones(count, dtype=np.float64)
+        if fade_samples > 0:
+            fade_in_mask = sample_indices < fade_samples
+            if np.any(fade_in_mask):
+                envelope[fade_in_mask] = 0.5 * (
+                    1.0
+                    - np.cos(
+                        math.pi * sample_indices[fade_in_mask] / fade_samples
+                    )
+                )
+            fade_out_start = total_samples - fade_samples
+            fade_out_mask = sample_indices >= fade_out_start
+            if np.any(fade_out_mask):
+                rel = total_samples - sample_indices[fade_out_mask]
+                envelope[fade_out_mask] = 0.5 * (
+                    1.0 - np.cos(math.pi * rel / fade_samples)
+                )
+        return sine_wave * envelope
 
     def process_block(self, input_frames: np.ndarray) -> np.ndarray:
         """Process a block of normalized float64 samples in range [-1.0, 1.0].
@@ -206,42 +259,34 @@ class StudioTalkbackProcessor:
             tone_total = self._tone_samples_total
 
             if not tb_active:
-                # Normal Studio state: Mic on Left (0), Silence on Right (1)
+                # Normal Studio state: Mic on Left (0), Right (1) plays release tone if concluding, else silence
                 out[:, 0] = mic_signal
+                rel_pos = self._release_tone_samples_emitted
+                rel_total = self._release_tone_samples_total
+                rel_remaining = max(0, rel_total - rel_pos)
+                rel_count = min(num_frames, rel_remaining)
+                if rel_count > 0:
+                    out[:rel_count, 1] = self._synthesize_tone_segment(
+                        rel_pos,
+                        rel_count,
+                        rel_total,
+                        self._release_fade_samples,
+                    )
+                    self._release_tone_samples_emitted += rel_count
                 return out
 
             # Talkback active: Left (0) is muted (zeros).
-            # Right (1) gets the 0.5s tone first, then mic_signal.
+            # Right (1) gets the press tone first, then mic_signal.
             tone_remaining = max(0, tone_total - tone_pos)
             tone_count = min(num_frames, tone_remaining)
 
             if tone_count > 0:
-                sample_indices = np.arange(
-                    tone_pos, tone_pos + tone_count, dtype=np.float64
+                out[:tone_count, 1] = self._synthesize_tone_segment(
+                    tone_pos,
+                    tone_count,
+                    tone_total,
+                    self._fade_samples,
                 )
-                sine_wave = self.tone_amplitude * np.sin(
-                    2.0 * math.pi * self.tone_hz * sample_indices / self.sample_rate
-                )
-                # Apply smooth raised-cosine fade-in and fade-out to avoid clicks
-                envelope = np.ones(tone_count, dtype=np.float64)
-                if self._fade_samples > 0:
-                    fade_in_mask = sample_indices < self._fade_samples
-                    if np.any(fade_in_mask):
-                        envelope[fade_in_mask] = 0.5 * (
-                            1.0
-                            - np.cos(
-                                math.pi * sample_indices[fade_in_mask] / self._fade_samples
-                            )
-                        )
-                    fade_out_start = tone_total - self._fade_samples
-                    fade_out_mask = sample_indices >= fade_out_start
-                    if np.any(fade_out_mask):
-                        rel = tone_total - sample_indices[fade_out_mask]
-                        envelope[fade_out_mask] = 0.5 * (
-                            1.0 - np.cos(math.pi * rel / self._fade_samples)
-                        )
-
-                out[:tone_count, 1] = sine_wave * envelope
                 self._tone_samples_emitted += tone_count
 
             if tone_count < num_frames:
@@ -251,7 +296,11 @@ class StudioTalkbackProcessor:
 
 
 class WavFileWriter:
-    """Streaming RIFF WAVE writer supporting 16-bit, 24-bit, and 32-bit linear PCM."""
+    """Streaming RIFF WAVE writer supporting 16-bit, 24-bit, and 32-bit linear PCM.
+
+    Supports closing the WAV file on pause (flushing valid RIFF/WAVE headers to prevent
+    corruption) and reopening the exact same file in append mode ('r+b') on resume.
+    """
 
     def __init__(
         self,
@@ -259,6 +308,7 @@ class WavFileWriter:
         sample_rate: int,
         channels: int,
         bit_depth: int,
+        append: bool = False,
     ) -> None:
         if bit_depth not in (16, 24, 32):
             raise ValueError(f"Unsupported bit depth: {bit_depth}")
@@ -271,16 +321,60 @@ class WavFileWriter:
         self.byte_rate = self.sample_rate * self.block_align
         self.data_bytes_written = 0
         self.frames_written = 0
+        self._file = None
 
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.filepath.open("wb+")
-        self._write_header(0)
+        if append and self.filepath.is_file() and self.filepath.stat().st_size >= 44:
+            self.reopen()
+        else:
+            self._file = self.filepath.open("wb+")
+            self._write_header(0)
+            try:
+                os.chmod(self.filepath, 0o666)
+            except OSError:
+                pass
+
+    @property
+    def is_open(self) -> bool:
+        """Return True if the underlying OS file handle is currently open."""
+        return self._file is not None and not self._file.closed
+
+    def reopen(self) -> None:
+        """Reopen an existing closed WAV file in 'r+b' mode so new frames append seamlessly."""
+        if self.is_open:
+            return
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        if self.filepath.is_file() and self.filepath.stat().st_size >= 44:
+            self._file = self.filepath.open("r+b")
+            self._file.seek(0, os.SEEK_END)
+            file_size = self._file.tell()
+            raw_data_bytes = max(0, file_size - 44)
+            usable_data_bytes = (
+                (raw_data_bytes // self.block_align) * self.block_align
+                if self.block_align > 0
+                else raw_data_bytes
+            )
+            if usable_data_bytes != raw_data_bytes:
+                self._file.truncate(44 + usable_data_bytes)
+            self.data_bytes_written = usable_data_bytes
+            self.frames_written = (
+                usable_data_bytes // self.block_align if self.block_align > 0 else 0
+            )
+            self._write_header(self.data_bytes_written)
+            self._file.seek(0, os.SEEK_END)
+        else:
+            self._file = self.filepath.open("wb+")
+            self.data_bytes_written = 0
+            self.frames_written = 0
+            self._write_header(0)
         try:
             os.chmod(self.filepath, 0o666)
         except OSError:
             pass
 
     def _write_header(self, data_size: int) -> None:
+        if not self.is_open:
+            return
         riff_size = 36 + data_size
         header = struct.pack(
             "<4sI4s4sIHHIIHH4sI",
@@ -305,6 +399,8 @@ class WavFileWriter:
         """Convert normalized float64 frames in [-1.0, 1.0] to target PCM bytes and write."""
         if frames.size == 0:
             return
+        if not self.is_open:
+            self.reopen()
         clipped = np.clip(frames, -1.0, 1.0)
         num_frames = clipped.shape[0]
         flat = clipped.reshape(-1)
@@ -328,12 +424,12 @@ class WavFileWriter:
 
     def flush_header(self) -> None:
         """Update RIFF and data chunk sizes on disk."""
-        if self._file and not self._file.closed:
+        if self.is_open:
             self._write_header(self.data_bytes_written)
             self._file.flush()
 
     def close(self) -> None:
-        if self._file and not self._file.closed:
+        if self.is_open:
             try:
                 self.flush_header()
             finally:
@@ -625,12 +721,16 @@ class AudioEngine:
         self._desired_monitor_params: Optional[Tuple[AudioDeviceCapabilities, int, int, bool, int, int]] = None
 
         self._record_lock = threading.Lock()
+        self._writer_lock = threading.Lock()
         self._is_recording = False
+        self._is_record_paused = False
         self._stop_record_event = threading.Event()
         self._record_thread: Optional[threading.Thread] = None
         self._record_start_monotonic: float = 0.0
+        self._record_accumulated_sec: float = 0.0
         self._current_processor: Optional[StudioTalkbackProcessor] = None
         self._current_recording_path: Optional[Path] = None
+        self._active_writer: Optional[WavFileWriter] = None
 
         self._play_lock = threading.Lock()
         self._is_playing = False
@@ -1214,11 +1314,30 @@ class AudioEngine:
             return self._is_recording
 
     @property
+    def is_record_paused(self) -> bool:
+        with self._record_lock:
+            return self._is_recording and self._is_record_paused
+
+    @property
+    def current_recording_path(self) -> Optional[Path]:
+        with self._record_lock:
+            return self._current_recording_path
+
+    @property
+    def is_recording_file_open(self) -> bool:
+        with self._writer_lock:
+            return self._active_writer is not None and self._active_writer.is_open
+
+    @property
     def elapsed_seconds(self) -> float:
         with self._record_lock:
             if not self._is_recording:
                 return 0.0
-            return max(0.0, time.monotonic() - self._record_start_monotonic)
+            if self._is_record_paused:
+                return self._record_accumulated_sec
+            return self._record_accumulated_sec + max(
+                0.0, time.monotonic() - self._record_start_monotonic
+            )
 
     @property
     def talkback_active(self) -> bool:
@@ -1227,9 +1346,63 @@ class AudioEngine:
 
     def set_talkback(self, active: bool) -> None:
         """Set momentary Talkback state during recording."""
+        if active and self.is_record_paused:
+            return
         proc = self._current_processor
         if proc is not None:
             proc.set_talkback(active)
+
+    def pause_recording(self) -> bool:
+        """Pause active recording, flushing and closing the WAV file on disk to prevent corruption."""
+        with self._record_lock:
+            if not self._is_recording:
+                return False
+            if self._is_record_paused:
+                return True
+            now = time.monotonic()
+            self._record_accumulated_sec += max(
+                0.0, now - self._record_start_monotonic
+            )
+            self._record_start_monotonic = now
+            self._is_record_paused = True
+            proc = self._current_processor
+
+        if proc is not None:
+            proc.set_talkback(False)
+
+        with self._writer_lock:
+            if self._active_writer is not None and self._active_writer.is_open:
+                self._active_writer.close()
+
+        return True
+
+    def resume_recording(self) -> bool:
+        """Reopen the paused WAV file and resume recording to the same file."""
+        with self._record_lock:
+            if not self._is_recording:
+                return False
+            if not self._is_record_paused:
+                return True
+
+        with self._writer_lock:
+            if self._active_writer is not None and not self._active_writer.is_open:
+                self._active_writer.reopen()
+
+        with self._record_lock:
+            self._record_start_monotonic = time.monotonic()
+            self._is_record_paused = False
+
+        return True
+
+    def toggle_pause_recording(self) -> bool:
+        """Toggle pause/resume on the active recording. Returns True if now paused."""
+        if not self.is_recording:
+            return False
+        if self.is_record_paused:
+            self.resume_recording()
+            return False
+        self.pause_recording()
+        return True
 
     def start_recording(
         self,
@@ -1241,7 +1414,8 @@ class AudioEngine:
         channels: int,
         input_channel: int = 0,
         tone_hz: float = 1000.0,
-        tone_duration_sec: float = 0.5,
+        tone_duration_sec: float = 1.0,
+        release_tone_duration_sec: float = 0.5,
         on_error: Optional[Callable[[str], None]] = None,
     ) -> None:
         """Start recording from the selected hardware device to a WAV file."""
@@ -1261,11 +1435,14 @@ class AudioEngine:
                 input_channel=input_channel,
                 tone_hz=tone_hz,
                 tone_duration_sec=tone_duration_sec,
+                release_tone_duration_sec=release_tone_duration_sec,
             )
             self._current_processor = processor
             self._current_recording_path = output_path
             self._stop_record_event.clear()
             self._is_recording = True
+            self._is_record_paused = False
+            self._record_accumulated_sec = 0.0
             self._record_start_monotonic = time.monotonic()
 
             self._record_thread = threading.Thread(
@@ -1294,9 +1471,17 @@ class AudioEngine:
         if thread is not None and thread.is_alive():
             thread.join(timeout=5.0)
 
+        with self._writer_lock:
+            if self._active_writer is not None and self._active_writer.is_open:
+                self._active_writer.close()
+            self._active_writer = None
+
         with self._record_lock:
             self._is_recording = False
+            self._is_record_paused = False
+            self._record_accumulated_sec = 0.0
             self._current_processor = None
+            self._current_recording_path = None
 
         # Resume live input monitoring so VU meter & Peak Hold remain active
         self._resume_monitoring_if_configured()
@@ -1314,12 +1499,16 @@ class AudioEngine:
     ) -> None:
         writer: Optional[WavFileWriter] = None
         try:
-            writer = WavFileWriter(
-                filepath=output_path,
-                sample_rate=sample_rate,
-                channels=processor.output_channels,
-                bit_depth=bit_depth,
-            )
+            with self._writer_lock:
+                writer = WavFileWriter(
+                    filepath=output_path,
+                    sample_rate=sample_rate,
+                    channels=processor.output_channels,
+                    bit_depth=bit_depth,
+                )
+                self._active_writer = writer
+                if self.is_record_paused:
+                    writer.close()
 
             if device.device_id.startswith("sim:") or not self.alsa.available:
                 self._record_simulated_loop(sample_rate, processor, writer)
@@ -1331,10 +1520,14 @@ class AudioEngine:
             if on_error:
                 on_error(str(exc))
         finally:
-            if writer is not None:
-                writer.close()
+            with self._writer_lock:
+                if writer is not None:
+                    writer.close()
+                if self._active_writer is writer:
+                    self._active_writer = None
             with self._record_lock:
                 self._is_recording = False
+                self._is_record_paused = False
 
     def _record_simulated_loop(
         self,
@@ -1361,12 +1554,21 @@ class AudioEngine:
             )
             self._update_meter_from_block(metered)
 
-            out_block = processor.process_block(in_block)
-            writer.write_float_frames(out_block)
+            if not self.is_record_paused:
+                with self._writer_lock:
+                    if not self.is_record_paused:
+                        if not writer.is_open:
+                            writer.reopen()
+                        out_block = processor.process_block(in_block)
+                        writer.write_float_frames(out_block)
 
-            if t0 - last_header_flush >= 2.0:
-                writer.flush_header()
-                last_header_flush = t0
+                        if t0 - last_header_flush >= 2.0:
+                            writer.flush_header()
+                            last_header_flush = t0
+            else:
+                with self._writer_lock:
+                    if writer.is_open:
+                        writer.close()
 
             elapsed = time.monotonic() - t0
             sleep_for = max(0.001, chunk_duration - elapsed)
@@ -1458,13 +1660,22 @@ class AudioEngine:
                 )
                 self._update_meter_from_block(metered)
 
-                out_float = processor.process_block(in_float)
-                writer.write_float_frames(out_float)
+                if not self.is_record_paused:
+                    with self._writer_lock:
+                        if not self.is_record_paused:
+                            if not writer.is_open:
+                                writer.reopen()
+                            out_float = processor.process_block(in_float)
+                            writer.write_float_frames(out_float)
 
-                now = time.monotonic()
-                if now - last_header_flush >= 2.0:
-                    writer.flush_header()
-                    last_header_flush = now
+                            now = time.monotonic()
+                            if now - last_header_flush >= 2.0:
+                                writer.flush_header()
+                                last_header_flush = now
+                else:
+                    with self._writer_lock:
+                        if writer.is_open:
+                            writer.close()
         finally:
             lib.snd_pcm_drop(pcm)
             lib.snd_pcm_close(pcm)

@@ -18,10 +18,12 @@ An optimized **Alpine Linux** kiosk configuration and fullscreen studio applicat
   - **Normal Mode**: Records Mono (`1ch`) or Stereo (`2ch`) `.wav` files at the selected bit depth and sample rate.
   - **Studio Mode**: Defaults to Stereo (`2ch`) output where:
     - **Left Channel**: Records the microphone take.
-    - **Right Channel**: Silent during normal recording. Holding the **Talkback** button (via mouse, touchscreen, or holding `[T]`) immediately **mutes the Left channel**, emits a **0.5-second 1000 Hz marker tone** on the Right channel, and records spoken notes from the microphone onto the Right channel until released.
+    - **Right Channel**: Silent during normal recording. Holding the **Talkback** button (via mouse, touchscreen, or holding `[T]`) immediately **mutes the Left channel**, emits a configurable **press marker tone** (`1.0 second` by default) on the Right channel, records spoken notes from the microphone onto the Right channel while held, and emits a configurable **release marker tone** (`0.5 seconds` by default) on the Right channel when Talkback is concluded.
+    - **Adjustable Tone Frequency & Durations**: Both the press and release tone durations (`Off / 0.0s` through `3.0s`) and the marker tone frequency (`330 Hz`, `440 Hz`, `528 Hz`, `660 Hz`, `800 Hz`, `1000 Hz / 1 kHz`, `1200 Hz`) are adjustable in **Settings & Samba → Audio & Recording Settings** so you can choose a warmer, easier-on-the-ear tone.
     - Provides high-contrast visual indication whenever Talkback is active, enabling fast visual or AI-assisted assembly in a DAW.
 - **Project Prefix & Take Management**:
   - Output filenames follow the format: `<ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav`.
+  - **Corruption-Safe Record Pause & Resume**: Pausing an active recording (`⏸ PAUSE RECORDING` or pressing `[P]` / `[Pause]`) flushes the RIFF/WAVE header and **closes the `.wav` file on disk** so it cannot be accidentally corrupted while paused, then **reopens the exact same `.wav` file** in append mode when resumed (`▶ RESUME RECORDING`). While paused, the Studio Deck displays unmistakable flashing Amber/Gold warning banners, a pulsing `⏸ HH:MM:SS.d [PAUSED]` timer, a glowing deck border, and a pulsing **Resume Recording** button so a paused session is never forgotten.
   - The scrollable recordings list at the bottom of the UI automatically filters `/storage` to show only recordings matching the active **Project Prefix**, with built-in reference playback (`Play / Pause`, `Stop`).
 - **Samba Share & User Administration**:
   - Shares `/storage` over SMB (`\\<IP>\storage`).
@@ -45,10 +47,11 @@ All buttons display their keyboard hotkeys on mouse hover:
 | Action | Hotkey | Description |
 | :--- | :--- | :--- |
 | **Record / Stop** | `R` or `Space` | Start or stop recording (`Green` = Ready, `Red` = Recording, `Grey` = No/Invalid Interface) |
+| **Pause / Resume Recording** | `P` or `Pause` | Pause active recording (safely closes `.wav` file on disk) or reopen & resume into the same file |
 | **Reset Peak Hold** | `C` | Reset maintained Peak Hold level and `CLIP` indicator on the VU meter |
-| **Talkback (Studio Mode)** | Hold `T` | Momentary push-to-talk: mutes Left ch, plays 0.5s tone + records mic on Right ch while held |
+| **Talkback (Studio Mode)** | Hold `T` | Momentary push-to-talk: mutes Left ch, plays 1.0s press tone + records mic on Right ch while held, then plays 0.5s release tone |
 | **Toggle Mode** | `M` | Switch between Normal Mode and Studio Mode (when stopped) |
-| **Play / Pause Take** | `P` | Play or pause the selected project recording |
+| **Play / Pause Take** | `P` | Play or pause the selected project recording (when not recording) |
 | **Stop Playback** | `S` | Stop reference audio playback |
 | **Settings & Samba Admin** | `F2` or `Ctrl+,` | Open Audio Hardware, Recording Format, and Samba User Administration |
 | **Refresh Hardware & Takes** | `F5` | Rescan ALSA USB devices, `/storage` recordings, and LAN IP |

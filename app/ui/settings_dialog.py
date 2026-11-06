@@ -22,7 +22,11 @@ from PyQt6.QtWidgets import (
 )
 
 from app.audio_engine import AudioDeviceCapabilities, AudioEngine
-from app.config_manager import ConfigManager
+from app.config_manager import (
+    TALKBACK_TONE_DURATION_OPTIONS,
+    TALKBACK_TONE_FREQ_OPTIONS,
+    ConfigManager,
+)
 from app.network_info import get_primary_ip_display
 from app.samba_manager import SambaManager
 from app.ui.on_screen_keyboard import OnScreenKeyboardController
@@ -149,11 +153,11 @@ class SettingsDialog(QDialog):
 
     def _build_audio_tab(self, container: QWidget) -> None:
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(14)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
 
         form = QFormLayout()
-        form.setSpacing(12)
+        form.setSpacing(10)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.input_device_combo = QComboBox()
@@ -188,7 +192,7 @@ class SettingsDialog(QDialog):
             "Normal Mode (Standard Mono / Stereo Recording)", False
         )
         self.mode_combo.addItem(
-            "Studio Mode (Stereo: Left = Mic, Right = 0.5s Tone + Talkback)", True
+            "Studio Mode (Stereo: Left = Mic, Right = Tone + Talkback)", True
         )
         self.mode_combo.setToolTip(
             "Choose between standard recording or Studio Mode with Right-channel Talkback notes"
@@ -209,6 +213,50 @@ class SettingsDialog(QDialog):
             "Which hardware microphone input channel to capture for Mono / Studio Left track"
         )
         form.addRow("Mic Input Channel:", self.input_channel_combo)
+
+        self.tone_freq_combo = QComboBox()
+        for freq_hz, freq_label in TALKBACK_TONE_FREQ_OPTIONS:
+            self.tone_freq_combo.addItem(freq_label, float(freq_hz))
+        self.tone_freq_combo.setToolTip(
+            "Select frequency for Studio Mode talkback press and release marker tones "
+            "(lower tones like 330 Hz or 440 Hz are warmer and easier on the ear)"
+        )
+        self.tone_freq_combo.currentIndexChanged.connect(self._on_mode_changed)
+        form.addRow("Talkback Tone Frequency:", self.tone_freq_combo)
+
+        tone_dur_row = QHBoxLayout()
+        tone_dur_row.setContentsMargins(0, 0, 0, 0)
+        tone_dur_row.setSpacing(10)
+
+        press_lbl = QLabel("Press:")
+        tone_dur_row.addWidget(press_lbl)
+
+        self.press_tone_duration_combo = QComboBox()
+        for dur in TALKBACK_TONE_DURATION_OPTIONS:
+            self.press_tone_duration_combo.addItem(
+                self._format_duration_option(dur, default_sec=1.0), float(dur)
+            )
+        self.press_tone_duration_combo.setToolTip(
+            "Duration of the marker tone on the Right channel when the Talkback button is pressed (Default: 1.0s)"
+        )
+        self.press_tone_duration_combo.currentIndexChanged.connect(self._on_mode_changed)
+        tone_dur_row.addWidget(self.press_tone_duration_combo, stretch=1)
+
+        release_lbl = QLabel("Release:")
+        tone_dur_row.addWidget(release_lbl)
+
+        self.release_tone_duration_combo = QComboBox()
+        for dur in TALKBACK_TONE_DURATION_OPTIONS:
+            self.release_tone_duration_combo.addItem(
+                self._format_duration_option(dur, default_sec=0.5), float(dur)
+            )
+        self.release_tone_duration_combo.setToolTip(
+            "Duration of the marker tone on the Right channel when Talkback mode is concluded/released (Default: 0.5s)"
+        )
+        self.release_tone_duration_combo.currentIndexChanged.connect(self._on_mode_changed)
+        tone_dur_row.addWidget(self.release_tone_duration_combo, stretch=1)
+
+        form.addRow("Talkback Tone Duration:", tone_dur_row)
 
         self.osk_combo = QComboBox()
         self.osk_combo.addItem(
@@ -384,6 +432,22 @@ class SettingsDialog(QDialog):
         ch_idx = self.channels_combo.findData(settings.channels)
         self.channels_combo.setCurrentIndex(ch_idx if ch_idx >= 0 else 0)
 
+        self._select_or_add_float_combo(
+            self.tone_freq_combo,
+            float(settings.talkback_tone_hz),
+            lambda v: f"{v:g} Hz (Custom)",
+        )
+        self._select_or_add_float_combo(
+            self.press_tone_duration_combo,
+            float(settings.talkback_tone_duration_sec),
+            lambda v: self._format_duration_option(v, default_sec=1.0),
+        )
+        self._select_or_add_float_combo(
+            self.release_tone_duration_combo,
+            float(settings.talkback_release_tone_duration_sec),
+            lambda v: self._format_duration_option(v, default_sec=0.5),
+        )
+
         osk_idx = self.osk_combo.findData(bool(settings.on_screen_keyboard))
         self.osk_combo.setCurrentIndex(osk_idx if osk_idx >= 0 else 0)
         self.samba_osk_btn.setVisible(self._is_osk_enabled())
@@ -391,6 +455,32 @@ class SettingsDialog(QDialog):
         # Populate bit depth & sample rate for active input device
         self._update_capabilities_for_current_device(use_saved_values=True)
         self._update_mode_ui_state()
+
+    @staticmethod
+    def _format_duration_option(sec: float, default_sec: float) -> str:
+        val = max(0.0, float(sec))
+        if val <= 0.0:
+            return "Off (0.0s — Disabled)"
+        num_str = f"{val:.1f}" if val == round(val) else f"{val:g}"
+        unit = "second" if abs(val - 1.0) < 1e-6 else "seconds"
+        suffix = " (Default)" if abs(val - default_sec) < 1e-6 else ""
+        return f"{num_str} {unit}{suffix}"
+
+    @staticmethod
+    def _select_or_add_float_combo(
+        combo: QComboBox, target_val: float, label_fn
+    ) -> None:
+        combo.blockSignals(True)
+        try:
+            for idx in range(combo.count()):
+                data = combo.itemData(idx)
+                if data is not None and abs(float(data) - float(target_val)) < 1e-3:
+                    combo.setCurrentIndex(idx)
+                    return
+            combo.addItem(label_fn(float(target_val)), float(target_val))
+            combo.setCurrentIndex(combo.count() - 1)
+        finally:
+            combo.blockSignals(False)
 
     def _register_osk_fields(self) -> None:
         self.osk_controller.register_line_edit(
@@ -518,6 +608,25 @@ class SettingsDialog(QDialog):
 
     def _update_mode_ui_state(self) -> None:
         studio = bool(self.mode_combo.currentData())
+        freq_val = float(self.tone_freq_combo.currentData() or 1000.0)
+        press_val = float(
+            self.press_tone_duration_combo.currentData()
+            if self.press_tone_duration_combo.currentData() is not None
+            else 1.0
+        )
+        rel_val = float(
+            self.release_tone_duration_combo.currentData()
+            if self.release_tone_duration_combo.currentData() is not None
+            else 0.5
+        )
+        freq_str = f"{freq_val:g} Hz"
+        press_str = f"{press_val:g}-second" if press_val > 0 else "disabled (0s)"
+        rel_str = (
+            f"emits a {rel_val:g}-second release tone ({freq_str}) on the Right channel when concluded"
+            if rel_val > 0
+            else "concludes without a release tone (0s)"
+        )
+
         if studio:
             # Studio mode defaults to and enforces Stereo (Left=Mic, Right=Talkback+Tone)
             stereo_idx = self.channels_combo.findData(2)
@@ -527,8 +636,8 @@ class SettingsDialog(QDialog):
             self.mode_hint_label.setText(
                 "Studio Mode Active: Output WAV is Stereo (2-channel). "
                 "Microphone is recorded to the Left channel while the Right channel remains silent. "
-                "Holding the Talkback button mutes the Left channel, emits a 0.5-second marker tone "
-                "on the Right channel, and records spoken notes on the Right channel until released."
+                f"Holding the Talkback button mutes the Left channel, emits a {press_str} marker tone ({freq_str}) "
+                f"on the Right channel, records spoken notes on the Right channel while held, and {rel_str}."
             )
         else:
             self.channels_combo.setEnabled(True)
@@ -547,6 +656,21 @@ class SettingsDialog(QDialog):
         s.studio_mode = bool(self.mode_combo.currentData())
         s.channels = 2 if s.studio_mode else int(self.channels_combo.currentData() or 1)
         s.input_channel = int(self.input_channel_combo.currentData() or 0)
+        s.talkback_tone_hz = float(
+            self.tone_freq_combo.currentData()
+            if self.tone_freq_combo.currentData() is not None
+            else 1000.0
+        )
+        s.talkback_tone_duration_sec = float(
+            self.press_tone_duration_combo.currentData()
+            if self.press_tone_duration_combo.currentData() is not None
+            else 1.0
+        )
+        s.talkback_release_tone_duration_sec = float(
+            self.release_tone_duration_combo.currentData()
+            if self.release_tone_duration_combo.currentData() is not None
+            else 0.5
+        )
         s.on_screen_keyboard = self._is_osk_enabled()
 
         if dev_id:

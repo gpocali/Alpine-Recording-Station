@@ -19,6 +19,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_STORAGE_DIR = "/storage"
 DEFAULT_ETC_CONFIG_DIR = "/etc/alpine-recorder"
 
+TALKBACK_TONE_FREQ_OPTIONS: tuple[tuple[float, str], ...] = (
+    (330.0, "330 Hz (E4 — Warm Low, Very Easy on Ear)"),
+    (440.0, "440 Hz (A4 Concert Pitch — Easy on Ear)"),
+    (528.0, "528 Hz (C5 — Soft Musical Chime)"),
+    (660.0, "660 Hz (E5 — Gentle Mid Marker)"),
+    (800.0, "800 Hz (Soft Studio Marker)"),
+    (1000.0, "1000 Hz / 1 kHz (Standard Broadcast Reference)"),
+    (1200.0, "1200 Hz / 1.2 kHz (Bright Marker)"),
+)
+
+TALKBACK_TONE_DURATION_OPTIONS: tuple[float, ...] = (
+    0.0,
+    0.25,
+    0.5,
+    0.75,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+)
+
 
 def sanitize_project_name(name: str) -> str:
     """Sanitize a project name so it is safe for filenames on Linux and Windows/Samba.
@@ -65,7 +86,8 @@ class RecorderSettings:
     project_name: str = "Session"
     on_screen_keyboard: bool = True  # True = Show touch on-screen keyboard for text inputs
     talkback_tone_hz: float = 1000.0
-    talkback_tone_duration_sec: float = 0.5
+    talkback_tone_duration_sec: float = 1.0
+    talkback_release_tone_duration_sec: float = 0.5
     storage_dir: str = DEFAULT_STORAGE_DIR
     known_device_defaults: dict = field(default_factory=dict)
 

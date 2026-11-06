@@ -32,7 +32,7 @@ from app.samba_manager import SambaManager
 
 
 class TestStudioTalkbackProcessor(unittest.TestCase):
-    def test_studio_mode_routing_and_half_second_tone(self) -> None:
+    def test_studio_mode_routing_default_1s_press_and_05s_release_tone(self) -> None:
         sample_rate = 48000
         proc = StudioTalkbackProcessor(
             sample_rate=sample_rate,
@@ -40,42 +40,83 @@ class TestStudioTalkbackProcessor(unittest.TestCase):
             output_channels=1,  # Studio mode should force 2 channels regardless
             input_channel=0,
             tone_hz=1000.0,
-            tone_duration_sec=0.5,
+            tone_duration_sec=1.0,
+            release_tone_duration_sec=0.5,
             tone_amplitude=0.5,
         )
         self.assertEqual(proc.output_channels, 2)
 
         # Constant mic signal of +0.25 on channel 0
         block_1s = np.full((sample_rate, 1), 0.25, dtype=np.float64)
+        block_2s = np.full((sample_rate * 2, 1), 0.25, dtype=np.float64)
 
-        # 1. Normal Studio state (Talkback OFF): Left = 0.25, Right = 0.0
+        # 1. Normal Studio state (Talkback OFF): Left = 0.25, Right = 0.0 (no release tone initially)
         out_normal = proc.process_block(block_1s)
         self.assertEqual(out_normal.shape, (sample_rate, 2))
         np.testing.assert_allclose(out_normal[:, 0], 0.25)
         np.testing.assert_allclose(out_normal[:, 1], 0.0)
 
-        # 2. Activate Talkback for 1.0 second (48,000 samples):
+        # 2. Activate Talkback for 2.0 seconds (96,000 samples):
         #    - Left channel must be completely muted (0.0)
-        #    - Right channel first 24,000 samples (0.5s) must be the 1000 Hz tone
-        #    - Right channel remaining 24,000 samples (0.5s..1.0s) must be the mic signal (0.25)
+        #    - Right channel first 48,000 samples (1.0s) must be the 1000 Hz press tone
+        #    - Right channel remaining 48,000 samples (1.0s..2.0s) must be the mic signal (0.25)
         proc.set_talkback(True)
-        out_tb = proc.process_block(block_1s)
+        out_tb = proc.process_block(block_2s)
         np.testing.assert_allclose(out_tb[:, 0], 0.0)
 
-        half_sec_samples = sample_rate // 2
-        tone_segment = out_tb[:half_sec_samples, 1]
-        mic_segment = out_tb[half_sec_samples:, 1]
+        one_sec_samples = sample_rate
+        press_tone_segment = out_tb[:one_sec_samples, 1]
+        mic_segment = out_tb[one_sec_samples:, 1]
 
-        # Verify tone segment has expected peak (~0.5) and zero crossings for 1000 Hz
-        self.assertAlmostEqual(float(np.max(np.abs(tone_segment))), 0.5, places=2)
-        # Verify mic segment after 0.5s tone equals the mic input (0.25)
+        # Verify 1.0s press tone segment has expected peak (~0.5)
+        self.assertAlmostEqual(float(np.max(np.abs(press_tone_segment))), 0.5, places=2)
+        # Verify mic segment after 1.0s press tone equals the mic input (0.25)
         np.testing.assert_allclose(mic_segment, 0.25)
 
-        # 3. Release Talkback: Left returns to Mic (0.25), Right returns to Silence (0.0)
+        # 3. Release Talkback (conclude talkback mode):
+        #    - Left channel returns to Mic (0.25)
+        #    - Right channel first 24,000 samples (0.5s) must be the release tone
+        #    - Right channel remaining 24,000 samples (0.5s..1.0s) must return to Silence (0.0)
         proc.set_talkback(False)
         out_released = proc.process_block(block_1s)
         np.testing.assert_allclose(out_released[:, 0], 0.25)
-        np.testing.assert_allclose(out_released[:, 1], 0.0)
+
+        half_sec_samples = sample_rate // 2
+        release_tone_segment = out_released[:half_sec_samples, 1]
+        silent_segment = out_released[half_sec_samples:, 1]
+        self.assertAlmostEqual(float(np.max(np.abs(release_tone_segment))), 0.5, places=2)
+        np.testing.assert_allclose(silent_segment, 0.0)
+
+        # 4. Subsequent blocks remain silent on Right channel
+        out_after = proc.process_block(block_1s)
+        np.testing.assert_allclose(out_after[:, 0], 0.25)
+        np.testing.assert_allclose(out_after[:, 1], 0.0)
+
+    def test_custom_tone_frequency_and_durations(self) -> None:
+        sample_rate = 48000
+        proc = StudioTalkbackProcessor(
+            sample_rate=sample_rate,
+            studio_mode=True,
+            output_channels=2,
+            input_channel=0,
+            tone_hz=440.0,
+            tone_duration_sec=0.5,
+            release_tone_duration_sec=0.25,
+            tone_amplitude=0.5,
+        )
+        block_1s = np.full((sample_rate, 1), 0.25, dtype=np.float64)
+
+        proc.set_talkback(True)
+        out_tb = proc.process_block(block_1s)
+        press_samples = int(0.5 * sample_rate)
+        self.assertAlmostEqual(float(np.max(np.abs(out_tb[:press_samples, 1]))), 0.5, places=2)
+        np.testing.assert_allclose(out_tb[press_samples:, 1], 0.25)
+
+        proc.set_talkback(False)
+        out_rel = proc.process_block(block_1s)
+        rel_samples = int(0.25 * sample_rate)
+        self.assertAlmostEqual(float(np.max(np.abs(out_rel[:rel_samples, 1]))), 0.5, places=2)
+        np.testing.assert_allclose(out_rel[rel_samples:, 1], 0.0)
 
     def test_normal_mode_mono_and_stereo(self) -> None:
         sr = 44100
@@ -121,6 +162,90 @@ class TestWavReadWrite(unittest.TestCase):
                 self.assertEqual(read_bd, bit_depth)
                 self.assertEqual(frames.shape, stereo_sig.shape)
                 np.testing.assert_allclose(frames, stereo_sig, atol=tol)
+
+    def test_wav_pause_close_and_reopen_resume_same_file(self) -> None:
+        import time
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            sr = 48000
+            part1 = np.full((1200, 2), 0.25, dtype=np.float64)
+            part2 = np.full((800, 2), -0.50, dtype=np.float64)
+            expected = np.vstack((part1, part2))
+
+            for bit_depth, tol in ((16, 1e-4), (24, 1e-6), (32, 1e-7)):
+                wav_path = tmp / f"pause_resume_{bit_depth}.wav"
+                writer = WavFileWriter(
+                    wav_path, sample_rate=sr, channels=2, bit_depth=bit_depth
+                )
+                writer.write_float_frames(part1)
+                self.assertTrue(writer.is_open)
+
+                # Simulate Pause: close the file on disk so headers are finalized
+                writer.close()
+                self.assertFalse(writer.is_open)
+
+                # Verify file on disk is completely valid while paused
+                paused_frames, p_sr, p_ch, p_bd = read_wav_as_float64(wav_path)
+                self.assertEqual((p_sr, p_ch, p_bd), (sr, 2, bit_depth))
+                self.assertEqual(paused_frames.shape, part1.shape)
+                np.testing.assert_allclose(paused_frames, part1, atol=tol)
+
+                # Simulate Resume: reopen the exact same file and append part2
+                writer.reopen()
+                self.assertTrue(writer.is_open)
+                writer.write_float_frames(part2)
+                writer.close()
+                self.assertFalse(writer.is_open)
+
+                full_frames, f_sr, f_ch, f_bd = read_wav_as_float64(wav_path)
+                self.assertEqual((f_sr, f_ch, f_bd), (sr, 2, bit_depth))
+                self.assertEqual(full_frames.shape, expected.shape)
+                np.testing.assert_allclose(full_frames, expected, atol=tol)
+
+            # Verify AudioEngine pause_recording() and resume_recording() lifecycle
+            engine = AudioEngine(simulate_if_empty=True)
+            devs = engine.get_capture_devices()
+            self.assertTrue(len(devs) >= 1)
+            rec_file = tmp / "engine_pause_resume.wav"
+
+            engine.start_recording(
+                device=devs[0],
+                output_path=rec_file,
+                sample_rate=48000,
+                bit_depth=24,
+                studio_mode=True,
+                channels=2,
+            )
+            time.sleep(0.12)
+            self.assertTrue(engine.is_recording)
+            self.assertFalse(engine.is_record_paused)
+
+            # Pause recording -> file must be closed on disk and valid
+            self.assertTrue(engine.pause_recording())
+            self.assertTrue(engine.is_recording)
+            self.assertTrue(engine.is_record_paused)
+            self.assertFalse(engine.is_recording_file_open)
+            paused_elapsed = engine.elapsed_seconds
+            size_at_pause = rec_file.stat().st_size
+            self.assertGreater(size_at_pause, 44)
+
+            time.sleep(0.10)
+            # Elapsed timer and file size must stay frozen while paused
+            self.assertAlmostEqual(engine.elapsed_seconds, paused_elapsed, places=3)
+            self.assertEqual(rec_file.stat().st_size, size_at_pause)
+
+            # Resume recording -> same file is reopened and grows
+            self.assertTrue(engine.resume_recording())
+            self.assertTrue(engine.is_recording)
+            self.assertFalse(engine.is_record_paused)
+            time.sleep(0.12)
+
+            finished = engine.stop_recording()
+            self.assertEqual(finished, rec_file)
+            self.assertFalse(engine.is_recording)
+            self.assertFalse(engine.is_record_paused)
+            self.assertGreater(rec_file.stat().st_size, size_at_pause)
 
 
 class TestUsbStreamParser(unittest.TestCase):
@@ -175,10 +300,16 @@ class TestConfigAndProjectFiltering(unittest.TestCase):
             storage = base / "storage"
             etc = base / "etc"
             cm = ConfigManager(storage_dir=str(storage), etc_config_dir=str(etc))
+            self.assertEqual(cm.settings.talkback_tone_duration_sec, 1.0)
+            self.assertEqual(cm.settings.talkback_release_tone_duration_sec, 0.5)
+            self.assertEqual(cm.settings.talkback_tone_hz, 1000.0)
             cm.settings.project_name = "PodcastA"
             cm.settings.sample_rate = 96000
             cm.settings.bit_depth = 24
             cm.settings.studio_mode = True
+            cm.settings.talkback_tone_hz = 440.0
+            cm.settings.talkback_tone_duration_sec = 1.5
+            cm.settings.talkback_release_tone_duration_sec = 0.75
             cm.settings.on_screen_keyboard = False
             cm.save()
 
@@ -206,6 +337,9 @@ class TestConfigAndProjectFiltering(unittest.TestCase):
             self.assertEqual(cm2.settings.sample_rate, 96000)
             self.assertEqual(cm2.settings.bit_depth, 24)
             self.assertTrue(cm2.settings.studio_mode)
+            self.assertEqual(cm2.settings.talkback_tone_hz, 440.0)
+            self.assertEqual(cm2.settings.talkback_tone_duration_sec, 1.5)
+            self.assertEqual(cm2.settings.talkback_release_tone_duration_sec, 0.75)
             self.assertFalse(cm2.settings.on_screen_keyboard)
 
     def test_recursive_storage_permission_masking(self) -> None:
@@ -492,7 +626,10 @@ class TestComboBoxDropdownStyles(unittest.TestCase):
                 samba_manager=sm,
             )
             combos = dlg.findChildren(QComboBox)
-            self.assertGreaterEqual(len(combos), 8)
+            self.assertGreaterEqual(len(combos), 11)
+            self.assertEqual(float(dlg.press_tone_duration_combo.currentData()), 1.0)
+            self.assertEqual(float(dlg.release_tone_duration_combo.currentData()), 0.5)
+            self.assertEqual(float(dlg.tone_freq_combo.currentData()), 1000.0)
             for combo in combos:
                 self.assertIsInstance(combo.itemDelegate(), QStyledItemDelegate)
                 view = combo.view()
