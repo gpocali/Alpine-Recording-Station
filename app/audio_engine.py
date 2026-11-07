@@ -1516,6 +1516,14 @@ class AudioEngine:
         return bool(self._talent_cough_muted or not self._talent_mic_send_enabled)
 
     @property
+    def is_talkback_mute_override(self) -> bool:
+        """Return True when local Talkback is actively overriding a talent microphone mute."""
+        return bool(
+            self.local_talkback_active
+            and (self._talent_cough_muted or not self._talent_mic_send_enabled)
+        )
+
+    @property
     def is_talent_mic_live_to_producer(self) -> bool:
         """Return True when the talent's microphone is permitted to stream to the remote producer."""
         return not self.is_mic_muted

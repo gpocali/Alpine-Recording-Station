@@ -306,6 +306,7 @@ class VuMeterWidget(QFrame):
         self._has_device: bool = False
         self._is_paused: bool = False
         self._is_muted: bool = False
+        self._is_talkback_override: bool = False
 
         self.setObjectName("VuMeterFrame")
         self.setStyleSheet(
@@ -377,6 +378,7 @@ class VuMeterWidget(QFrame):
         has_device: bool = True,
         is_paused: bool = False,
         is_muted: bool = False,
+        is_talkback_override: bool = False,
     ) -> None:
         """Update graphical VU meter bars, Peak Hold marker, and digital dBFS readouts."""
         self._readings = readings
@@ -384,6 +386,7 @@ class VuMeterWidget(QFrame):
         self._has_device = bool(has_device)
         self._is_paused = bool(is_paused)
         self._is_muted = bool(is_muted)
+        self._is_talkback_override = bool(is_talkback_override)
         self.canvas.set_state(readings, has_device=has_device, is_muted=is_muted)
         self._refresh_readouts(
             readings,
@@ -391,6 +394,7 @@ class VuMeterWidget(QFrame):
             has_device=has_device,
             is_paused=is_paused,
             is_muted=is_muted,
+            is_talkback_override=is_talkback_override,
         )
 
     def _refresh_readouts(
@@ -400,6 +404,7 @@ class VuMeterWidget(QFrame):
         has_device: bool,
         is_paused: bool = False,
         is_muted: bool = False,
+        is_talkback_override: bool = False,
     ) -> None:
         small_px = max(10, int(round(12 * self._scale)))
         btn_pad_v = max(2, int(round(3 * self._scale)))
@@ -420,6 +425,11 @@ class VuMeterWidget(QFrame):
             self.title_label.setText(
                 "❚❚ INPUT VU METER (RECORDING PAUSED — FILE SAVED & CLOSED)"
             )
+            self.title_label.setStyleSheet(
+                f"border: none; color: #FFDF5D; font-weight: bold; font-size: {small_px}px;"
+            )
+        elif is_talkback_override:
+            self.title_label.setText("⚡ INPUT VU METER (TALKBACK OVERRIDE)")
             self.title_label.setStyleSheet(
                 f"border: none; color: #FFDF5D; font-weight: bold; font-size: {small_px}px;"
             )
@@ -507,6 +517,7 @@ class VuMeterWidget(QFrame):
             ),
             is_paused=self._is_paused,
             is_muted=self._is_muted,
+            is_talkback_override=self._is_talkback_override,
         )
 
     def value(self) -> int:

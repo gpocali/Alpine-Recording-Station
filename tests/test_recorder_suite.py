@@ -1432,13 +1432,14 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
             self.assertTrue(engine.is_mic_muted)
 
             # 3. Talent ALSO presses Talkback while Producer is holding Talkback:
-            #    - Talent mic temporarily unmutes (is_mic_muted=False, is_talent_mic_live_to_producer=True)
+            #    - Talent mic temporarily unmutes (is_mic_muted=False, is_talent_mic_live_to_producer=True, is_talkback_mute_override=True)
             #    - NO additional press beep is emitted (still 2400 samples)
             engine.set_talkback(True)
             self.assertTrue(engine.local_talkback_active)
             self.assertTrue(engine.remote_talkback_active)
             self.assertTrue(engine.talkback_active)
             self.assertFalse(engine.is_mic_muted)
+            self.assertTrue(engine.is_talkback_mute_override)
             self.assertTrue(engine.is_talent_mic_live_to_producer)
             self.assertEqual(engine.talkback_headset_tone_samples_total, 2400)
 
@@ -1487,12 +1488,13 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
 
             # 5. Talent finishes responding and releases Talkback:
             #    - Single release beep is emitted (2400 + 1200 = 3600 samples)
-            #    - Talent Mute is automatically restored (is_mic_muted=True, VU meter cleared to 0.0)
+            #    - Talent Mute is automatically restored (is_mic_muted=True, is_talkback_mute_override=False, VU meter cleared to 0.0)
             engine.set_talkback(False)
             self.assertFalse(engine.local_talkback_active)
             self.assertFalse(engine.talkback_active)
             self.assertEqual(engine.talkback_headset_tone_samples_total, 2400 + 1200)
             self.assertTrue(engine.is_mic_muted)
+            self.assertFalse(engine.is_talkback_mute_override)
             self.assertFalse(engine.is_talent_mic_live_to_producer)
             self.assertFalse(engine.talent_mic_send_enabled)
             self.assertEqual(engine.get_vu_readings().peak_level, 0.0)

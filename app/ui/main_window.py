@@ -860,12 +860,15 @@ class MainWindow(QMainWindow):
             self.remote_producer_btn.setText("◎ Remote Producer")
             self.remote_producer_btn.setStyleSheet("")
 
-        # Talent Mic Privacy & Cough Button state on Studio Deck (flashes red when muted; temporarily unmutes while local Talkback is active)
+        # Talent Mic Privacy & Cough Button state on Studio Deck (flashes red when muted; VU meter shows Talkback Override while local Talkback is active)
         cough_font_px = max(14, int(round(20 * self._scale)))
         cough_radius = max(12, int(round(16 * self._scale)))
         cough_pad_v = max(6, int(round(8 * self._scale)))
         cough_pad_h = max(8, int(round(10 * self._scale)))
-        is_mute_active = bool(self.audio_engine.is_mic_muted)
+        is_mute_active = bool(
+            self.audio_engine.talent_cough_muted
+            or not self.audio_engine.talent_mic_send_enabled
+        )
         if is_mute_active:
             self.cough_privacy_btn.setText("✕  Muted")
             if blink_on:
@@ -1058,6 +1061,7 @@ class MainWindow(QMainWindow):
             has_device=(self._active_input_device is not None),
             is_paused=self.audio_engine.is_record_paused,
             is_muted=self.audio_engine.is_mic_muted,
+            is_talkback_override=self.audio_engine.is_talkback_mute_override,
         )
 
     def _refresh_storage_status(self) -> None:
@@ -1415,7 +1419,10 @@ class MainWindow(QMainWindow):
         tb_latched_now = self.audio_engine.talkback_latched
         rem_tb_now = self.audio_engine.remote_talkback_active
         prod_count_now = self.remote_producer_server.connected_client_count
-        mute_active_now = bool(self.audio_engine.is_mic_muted)
+        mute_active_now = bool(
+            self.audio_engine.talent_cough_muted
+            or not self.audio_engine.talent_mic_send_enabled
+        )
         now_mono = time.monotonic()
         blink_needed = bool(is_rec_paused or mute_active_now)
         blink_now = ((int(now_mono * 2.5) % 2) == 0) if blink_needed else True
