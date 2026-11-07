@@ -598,6 +598,9 @@ class RemoteProducerServer:
             "sample_rate": int(settings.sample_rate),
             "bit_depth": int(settings.bit_depth),
             "channels": int(settings.effective_channels),
+            "talkback_tone_hz": float(settings.talkback_tone_hz),
+            "talkback_tone_duration_sec": float(settings.talkback_tone_duration_sec),
+            "talkback_release_tone_duration_sec": float(settings.talkback_release_tone_duration_sec),
             "talkback_active": tb_active,
             "remote_talkback_active": bool(self.audio_engine.remote_talkback_active),
             "local_talkback_active": local_tb,
@@ -1612,6 +1615,12 @@ input[type="range"].brand-slider {{
   }};
   let latestStudioMode = true;
   let latestChannels = 2;
+  let latestToneHz = 1000.0;
+  let latestPressToneSec = 1.0;
+  let latestReleaseToneSec = 0.5;
+  let lastObservedTalkbackActive = null;
+  let activeToneOsc = null;
+  let activeToneGain = null;
 
   const loginView = document.getElementById("login-view");
   const consoleView = document.getElementById("console-view");
@@ -1837,6 +1846,51 @@ input[type="range"].brand-slider {{
     }}
   }}
 
+  function playHeadsetTalkbackTone(isPress) {{
+    ensureAudioContext();
+    if (!audioCtx || !monitorGainNode) {{
+      return;
+    }}
+    if (activeToneOsc) {{
+      try {{ activeToneOsc.stop(); }} catch (_e) {{}}
+      try {{ activeToneOsc.disconnect(); }} catch (_e) {{}}
+      activeToneOsc = null;
+    }}
+    if (activeToneGain) {{
+      try {{ activeToneGain.disconnect(); }} catch (_e) {{}}
+      activeToneGain = null;
+    }}
+    const durSec = Number(isPress ? latestPressToneSec : latestReleaseToneSec);
+    const freqHz = Number(latestToneHz) || 1000.0;
+    if (!(durSec > 0) || !(freqHz > 0)) {{
+      return;
+    }}
+    const now = audioCtx.currentTime;
+    const fadeSec = Math.min(0.005, durSec * 0.25);
+    const osc = audioCtx.createOscillator();
+    const toneGain = audioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(freqHz, now);
+    toneGain.gain.setValueAtTime(0.0001, now);
+    toneGain.gain.linearRampToValueAtTime(0.5, now + fadeSec);
+    if (durSec > fadeSec * 2) {{
+      toneGain.gain.setValueAtTime(0.5, now + durSec - fadeSec);
+    }}
+    toneGain.gain.linearRampToValueAtTime(0.0001, now + durSec);
+    osc.connect(toneGain);
+    toneGain.connect(monitorGainNode);
+    osc.start(now);
+    osc.stop(now + durSec);
+    activeToneOsc = osc;
+    activeToneGain = toneGain;
+    osc.onended = function() {{
+      if (activeToneOsc === osc) {{
+        activeToneOsc = null;
+        activeToneGain = null;
+      }}
+    }};
+  }}
+
   async function setTalkbackActive(active) {{
     if (active) {{
       const ok = await ensureMicCapture();
@@ -1849,6 +1903,10 @@ input[type="range"].brand-slider {{
         return;
       }}
       talkbackPressed = true;
+      if (!lastObservedTalkbackActive) {{
+        playHeadsetTalkbackTone(true);
+      }}
+      lastObservedTalkbackActive = true;
       sendJson({{ type: "talkback", active: true }});
       refreshMicAndTalkbackUi();
     }} else {{
@@ -1856,6 +1914,10 @@ input[type="range"].brand-slider {{
         return;
       }}
       talkbackPressed = false;
+      if (lastObservedTalkbackActive) {{
+        playHeadsetTalkbackTone(false);
+      }}
+      lastObservedTalkbackActive = false;
       sendJson({{ type: "talkback", active: false }});
       refreshMicAndTalkbackUi();
     }}
@@ -1986,6 +2048,21 @@ input[type="range"].brand-slider {{
 
     latestStudioMode = Boolean(msg.studio_mode);
     latestChannels = Number(msg.channels || 2);
+    if (msg.talkback_tone_hz !== undefined) {{
+      latestToneHz = Number(msg.talkback_tone_hz);
+    }}
+    if (msg.talkback_tone_duration_sec !== undefined) {{
+      latestPressToneSec = Number(msg.talkback_tone_duration_sec);
+    }}
+    if (msg.talkback_release_tone_duration_sec !== undefined) {{
+      latestReleaseToneSec = Number(msg.talkback_release_tone_duration_sec);
+    }}
+
+    const nowTbActive = Boolean(msg.talkback_active);
+    if (lastObservedTalkbackActive !== null && nowTbActive !== lastObservedTalkbackActive) {{
+      playHeadsetTalkbackTone(nowTbActive);
+    }}
+    lastObservedTalkbackActive = nowTbActive;
 
     if (latestStudioMode) {{
       modeSummary.textContent =

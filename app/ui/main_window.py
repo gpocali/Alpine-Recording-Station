@@ -260,9 +260,9 @@ class HelpDialog(QDialog):
                 "Available in <b>Studio Mode</b>. Hold down <b>Talkback</b> (or hold <code>[T]</code>) "
                 "for momentary push-to-talk slating and session notes:<br>"
                 "• Mutes the Left (Voiceover) channel so notes stay off the primary performance track.<br>"
-                "• Emits a configurable press marker tone on the Right (Talkback) channel.<br>"
+                "• Emits a configurable press marker tone into the headset and on the Right (Talkback) channel so talent knows Talkback is active.<br>"
                 "• Records spoken notes onto the Right channel while held (and sends them to the Remote Producer).<br>"
-                "• Emits a configurable release marker tone on the Right channel when released."
+                "• Emits a configurable release marker tone into the headset and on the Right channel when released."
             ),
             self._build_section_card(
                 "COUGH / MUTED  [Hotkey: Hold B or Click]",
@@ -807,6 +807,11 @@ class MainWindow(QMainWindow):
             self._active_output_device = play_map.get(settings.output_device)
 
         self.audio_engine.set_talkback_output_device(self._active_output_device)
+        self.audio_engine.set_talkback_tone_params(
+            tone_hz=settings.talkback_tone_hz,
+            tone_duration_sec=settings.talkback_tone_duration_sec,
+            release_tone_duration_sec=settings.talkback_release_tone_duration_sec,
+        )
         self._refresh_transport_styles()
 
     def _refresh_transport_styles(self) -> None:

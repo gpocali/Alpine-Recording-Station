@@ -1021,6 +1021,31 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
         # Left channel returns to normal talent mic (0.25)
         self.assertAlmostEqual(float(np.mean(st_rel[:, 0])), 0.25, places=2)
 
+    def test_talkback_press_and_release_headset_tones(self) -> None:
+        engine = AudioEngine(simulate_if_empty=True)
+        devs = engine.get_playback_devices()
+        self.assertTrue(len(devs) >= 1)
+        engine.set_talkback_output_device(devs[0])
+        engine.set_talkback_tone_params(
+            tone_hz=440.0,
+            tone_duration_sec=0.1,
+            release_tone_duration_sec=0.05,
+        )
+
+        # 1. Remote producer presses Talkback -> queues 0.1s (2400 samples @ 24kHz) press tone into headset
+        engine.set_remote_talkback(True)
+        self.assertEqual(engine.talkback_headset_tone_samples_total, 2400)
+
+        # 2. Remote producer releases Talkback -> queues 0.05s (1200 samples @ 24kHz) release tone into headset
+        engine.set_remote_talkback(False)
+        self.assertEqual(engine.talkback_headset_tone_samples_total, 2400 + 1200)
+
+        # 3. Local Talkback button pressed & released -> also queues press and release tones into headset
+        engine.set_talkback(True)
+        self.assertEqual(engine.talkback_headset_tone_samples_total, 3600 + 2400)
+        engine.set_talkback(False)
+        self.assertEqual(engine.talkback_headset_tone_samples_total, 6000 + 1200)
+
     def test_talent_mic_privacy_and_cough_mute_live_listener(self) -> None:
         engine = AudioEngine(simulate_if_empty=True)
         received = []

@@ -131,6 +131,44 @@ def resample_mono_signal(
     return np.interp(src_positions, src_indices, flat)
 
 
+def synthesize_tone_segment(
+    tone_hz: float,
+    tone_amplitude: float,
+    sample_rate: int,
+    start_pos: int,
+    count: int,
+    total_samples: int,
+    fade_samples: int,
+) -> np.ndarray:
+    """Synthesize a click-free raised-cosine faded sine wave segment."""
+    if count <= 0 or total_samples <= 0 or sample_rate <= 0:
+        return np.zeros(max(0, int(count)), dtype=np.float64)
+    sample_indices = np.arange(
+        start_pos, start_pos + count, dtype=np.float64
+    )
+    sine_wave = float(tone_amplitude) * np.sin(
+        2.0 * math.pi * float(tone_hz) * sample_indices / float(sample_rate)
+    )
+    envelope = np.ones(count, dtype=np.float64)
+    if fade_samples > 0:
+        fade_in_mask = sample_indices < fade_samples
+        if np.any(fade_in_mask):
+            envelope[fade_in_mask] = 0.5 * (
+                1.0
+                - np.cos(
+                    math.pi * sample_indices[fade_in_mask] / fade_samples
+                )
+            )
+        fade_out_start = total_samples - fade_samples
+        fade_out_mask = sample_indices >= fade_out_start
+        if np.any(fade_out_mask):
+            rel = total_samples - sample_indices[fade_out_mask]
+            envelope[fade_out_mask] = 0.5 * (
+                1.0 - np.cos(math.pi * rel / fade_samples)
+            )
+    return sine_wave * envelope
+
+
 class StudioTalkbackProcessor:
     """Sample-accurate DSP router for Normal Mode and Studio Mode with Talkback.
 
@@ -257,30 +295,15 @@ class StudioTalkbackProcessor:
         self, start_pos: int, count: int, total_samples: int, fade_samples: int
     ) -> np.ndarray:
         """Synthesize a click-free raised-cosine faded sine wave segment."""
-        sample_indices = np.arange(
-            start_pos, start_pos + count, dtype=np.float64
+        return synthesize_tone_segment(
+            tone_hz=self.tone_hz,
+            tone_amplitude=self.tone_amplitude,
+            sample_rate=self.sample_rate,
+            start_pos=start_pos,
+            count=count,
+            total_samples=total_samples,
+            fade_samples=fade_samples,
         )
-        sine_wave = self.tone_amplitude * np.sin(
-            2.0 * math.pi * self.tone_hz * sample_indices / self.sample_rate
-        )
-        envelope = np.ones(count, dtype=np.float64)
-        if fade_samples > 0:
-            fade_in_mask = sample_indices < fade_samples
-            if np.any(fade_in_mask):
-                envelope[fade_in_mask] = 0.5 * (
-                    1.0
-                    - np.cos(
-                        math.pi * sample_indices[fade_in_mask] / fade_samples
-                    )
-                )
-            fade_out_start = total_samples - fade_samples
-            fade_out_mask = sample_indices >= fade_out_start
-            if np.any(fade_out_mask):
-                rel = total_samples - sample_indices[fade_out_mask]
-                envelope[fade_out_mask] = 0.5 * (
-                    1.0 - np.cos(math.pi * rel / fade_samples)
-                )
-        return sine_wave * envelope
 
     def process_block(
         self,
@@ -833,10 +856,17 @@ class AudioEngine:
         self._live_audio_listeners: List[Callable[[np.ndarray, int, bool], None]] = []
         self._talent_mic_send_enabled: bool = True
         self._talent_cough_muted: bool = False
+        self._local_talkback_active: bool = False
         self._remote_talkback_active: bool = False
         self._last_remote_talkback_peak: float = 0.0
         self._last_remote_talkback_rms: float = 0.0
         self._last_remote_talkback_mono: float = 0.0
+
+        # Talkback marker tone parameters for headset notification on press/release
+        self._talkback_tone_hz: float = 1000.0
+        self._talkback_tone_duration_sec: float = 1.0
+        self._talkback_release_tone_duration_sec: float = 0.5
+        self._talkback_tone_amplitude: float = 0.5
 
         # Live Talkback headphone monitor output for prompting the talent
         self._tb_out_lock = threading.Lock()
@@ -845,6 +875,8 @@ class AudioEngine:
         self._tb_out_device: Optional[AudioDeviceCapabilities] = None
         self._tb_out_thread: Optional[threading.Thread] = None
         self._tb_out_stop_event = threading.Event()
+        self._tb_headset_tone_samples_emitted: int = 0
+        self._tb_headset_tone_samples_total: int = 0
 
     # -------------------------------------------------------------------------
     # Hardware Enumeration
@@ -1519,6 +1551,74 @@ class AudioEngine:
         with self._tb_out_lock:
             self._tb_out_device = device
 
+    def set_talkback_tone_params(
+        self,
+        tone_hz: float = 1000.0,
+        tone_duration_sec: float = 1.0,
+        release_tone_duration_sec: float = 0.5,
+        tone_amplitude: float = 0.5,
+    ) -> None:
+        """Configure the marker tone frequency and durations played into the headset on Talkback press/release."""
+        self._talkback_tone_hz = float(tone_hz)
+        self._talkback_tone_duration_sec = max(0.0, float(tone_duration_sec))
+        self._talkback_release_tone_duration_sec = max(0.0, float(release_tone_duration_sec))
+        self._talkback_tone_amplitude = float(tone_amplitude)
+
+    @property
+    def talkback_headset_tone_samples_emitted(self) -> int:
+        with self._tb_out_lock:
+            return self._tb_headset_tone_samples_emitted
+
+    @property
+    def talkback_headset_tone_samples_total(self) -> int:
+        with self._tb_out_lock:
+            return self._tb_headset_tone_samples_total
+
+    def _emit_headset_talkback_tone(self, is_press: bool) -> None:
+        """Synthesize and queue the Talkback press or release marker tone into the talent headset output."""
+        if self.is_playing:
+            return
+        proc = self._current_processor
+        if proc is not None:
+            tone_hz = proc.tone_hz
+            dur_sec = proc.tone_duration_sec if is_press else proc.release_tone_duration_sec
+            amp = proc.tone_amplitude
+        else:
+            tone_hz = self._talkback_tone_hz
+            dur_sec = (
+                self._talkback_tone_duration_sec
+                if is_press
+                else self._talkback_release_tone_duration_sec
+            )
+            amp = self._talkback_tone_amplitude
+
+        target_sr = 24000
+        total_samples = int(round(target_sr * max(0.0, float(dur_sec))))
+        if total_samples <= 0:
+            if not is_press:
+                with self._tb_out_lock:
+                    self._tb_out_fifo = np.zeros(0, dtype=np.float64)
+            return
+
+        fade_samples = min(
+            int(round(target_sr * 0.005)),  # 5ms click-free fade
+            max(1, total_samples // 4),
+        )
+        tone_samples = synthesize_tone_segment(
+            tone_hz=tone_hz,
+            tone_amplitude=amp,
+            sample_rate=target_sr,
+            start_pos=0,
+            count=total_samples,
+            total_samples=total_samples,
+            fade_samples=fade_samples,
+        )
+        with self._tb_out_lock:
+            # Replace any stale queued samples so the press or release tone plays immediately into the headset
+            self._tb_out_fifo = np.zeros(0, dtype=np.float64)
+            self._tb_headset_tone_samples_total += total_samples
+        self._queue_talkback_headphone_audio(tone_samples, target_sr, is_tone=True)
+
     @property
     def remote_talkback_active(self) -> bool:
         proc = self._current_processor
@@ -1529,7 +1629,9 @@ class AudioEngine:
     @property
     def local_talkback_active(self) -> bool:
         proc = self._current_processor
-        return proc.local_talkback_active if proc is not None else False
+        if proc is not None and self.is_recording and not self.is_record_paused:
+            return proc.local_talkback_active
+        return self._local_talkback_active
 
     @property
     def last_remote_talkback_peak(self) -> float:
@@ -1561,6 +1663,7 @@ class AudioEngine:
         if active and self.is_record_paused:
             self._remote_talkback_active = False
             return
+        was_tb_active = self.talkback_active
         self._remote_talkback_active = bool(active)
         if not active:
             self._last_remote_talkback_peak = 0.0
@@ -1568,6 +1671,11 @@ class AudioEngine:
         proc = self._current_processor
         if proc is not None:
             proc.set_remote_talkback(bool(active))
+        now_tb_active = self.talkback_active
+        if now_tb_active and not was_tb_active:
+            self._emit_headset_talkback_tone(is_press=True)
+        elif not now_tb_active and was_tb_active:
+            self._emit_headset_talkback_tone(is_press=False)
 
     def push_remote_talkback_audio(
         self,
@@ -1596,7 +1704,7 @@ class AudioEngine:
         self._queue_talkback_headphone_audio(flat, sample_rate)
 
     def _queue_talkback_headphone_audio(
-        self, samples: np.ndarray, sample_rate: int
+        self, samples: np.ndarray, sample_rate: int, is_tone: bool = False
     ) -> None:
         if self.is_playing:
             return
@@ -1608,7 +1716,9 @@ class AudioEngine:
         with self._tb_out_lock:
             self._tb_out_rate = target_sr
             combined = np.concatenate((self._tb_out_fifo, np.clip(resampled, -1.0, 1.0)))
-            max_samples = target_sr  # Cap live monitor buffer to 1.0s
+            # Allow up to 4.0s buffer so full marker tones (up to 3.0s) + live voice never truncate the tone
+            max_samples = target_sr * 4 if is_tone else max(target_sr * 2, self._tb_out_fifo.size + resampled.size)
+            max_samples = min(max_samples, target_sr * 5)
             if combined.size > max_samples:
                 combined = combined[-max_samples:]
             self._tb_out_fifo = combined
@@ -1622,7 +1732,7 @@ class AudioEngine:
                 self._tb_out_thread.start()
 
     def _talkback_headphone_worker(self) -> None:
-        """Low-latency playback worker that streams incoming remote producer talkback to the talent's output."""
+        """Low-latency playback worker that streams talkback marker tones and remote producer talkback to the talent's headset."""
         with self._tb_out_lock:
             out_dev = self._tb_out_device
             sr = self._tb_out_rate
@@ -1639,6 +1749,7 @@ class AudioEngine:
                         return
                     take = min(480, self._tb_out_fifo.size)
                     self._tb_out_fifo = self._tb_out_fifo[take:]
+                    self._tb_headset_tone_samples_emitted += take
                 time.sleep(take / float(max(8000, sr)))
             return
 
@@ -1686,6 +1797,7 @@ class AudioEngine:
                         take = min(960, avail)
                         mono_chunk = self._tb_out_fifo[:take]
                         self._tb_out_fifo = self._tb_out_fifo[take:]
+                        self._tb_headset_tone_samples_emitted += take
                     else:
                         mono_chunk = None
 
@@ -1757,15 +1869,23 @@ class AudioEngine:
         proc = self._current_processor
         if proc is not None and self.is_recording and not self.is_record_paused:
             return proc.talkback_active
-        return self._remote_talkback_active
+        return bool(self._local_talkback_active or self._remote_talkback_active)
 
     def set_talkback(self, active: bool) -> None:
-        """Set momentary Talkback state during recording."""
+        """Set momentary Talkback state (during recording or standby monitoring)."""
         if active and self.is_record_paused:
+            self._local_talkback_active = False
             return
+        was_tb_active = self.talkback_active
+        self._local_talkback_active = bool(active)
         proc = self._current_processor
         if proc is not None:
             proc.set_talkback(active)
+        now_tb_active = self.talkback_active
+        if now_tb_active and not was_tb_active:
+            self._emit_headset_talkback_tone(is_press=True)
+        elif not now_tb_active and was_tb_active:
+            self._emit_headset_talkback_tone(is_press=False)
 
     def pause_recording(self) -> bool:
         """Pause active recording, flushing and closing the WAV file on disk to prevent corruption."""
@@ -1782,6 +1902,7 @@ class AudioEngine:
             self._is_record_paused = True
             proc = self._current_processor
 
+        self._local_talkback_active = False
         self._remote_talkback_active = False
         if proc is not None:
             proc.set_talkback(False)
@@ -1840,6 +1961,12 @@ class AudioEngine:
         # Release idle monitor handle so recording thread has exclusive ALSA capture access
         self._stop_monitoring_thread()
 
+        self.set_talkback_tone_params(
+            tone_hz=tone_hz,
+            tone_duration_sec=tone_duration_sec,
+            release_tone_duration_sec=release_tone_duration_sec,
+        )
+
         with self._record_lock:
             if self._is_recording:
                 return
@@ -1854,6 +1981,8 @@ class AudioEngine:
                 tone_duration_sec=tone_duration_sec,
                 release_tone_duration_sec=release_tone_duration_sec,
             )
+            if self._local_talkback_active:
+                processor.set_talkback(True)
             if self._remote_talkback_active:
                 processor.set_remote_talkback(True)
             self._current_processor = processor

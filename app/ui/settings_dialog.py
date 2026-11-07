@@ -651,8 +651,8 @@ class SettingsDialog(QDialog):
             self.mode_hint_label.setText(
                 "Studio Mode Active: Output WAV is Stereo (2-channel). "
                 "Microphone is recorded to the Left channel while the Right channel remains silent. "
-                f"Holding the Talkback button mutes the Left channel, emits a {press_str} marker tone ({freq_str}) "
-                f"on the Right channel, records spoken notes on the Right channel while held, and {rel_str}."
+                f"Holding the Talkback button mutes the Left channel, plays a {press_str} marker tone ({freq_str}) "
+                f"into the headset and on the Right channel, records spoken notes on the Right channel while held, and {rel_str} (and into the headset)."
             )
         else:
             self.channels_combo.setEnabled(True)
