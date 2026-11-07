@@ -116,6 +116,21 @@ class AudioDeviceCapabilities:
         return f"{usb_tag}{self.name} ({self.device_id})"
 
 
+def resample_mono_signal(
+    samples: np.ndarray, src_rate: int, dst_rate: int
+) -> np.ndarray:
+    """Resample a 1D float64 mono audio array from src_rate to dst_rate using linear interpolation."""
+    flat = np.asarray(samples, dtype=np.float64).reshape(-1)
+    if flat.size == 0 or src_rate <= 0 or dst_rate <= 0 or src_rate == dst_rate:
+        return flat.copy()
+    dst_len = max(1, int(round(flat.size * float(dst_rate) / float(src_rate))))
+    if dst_len == flat.size:
+        return flat.copy()
+    src_positions = np.linspace(0.0, float(flat.size - 1), num=dst_len, dtype=np.float64)
+    src_indices = np.arange(flat.size, dtype=np.float64)
+    return np.interp(src_positions, src_indices, flat)
+
+
 class StudioTalkbackProcessor:
     """Sample-accurate DSP router for Normal Mode and Studio Mode with Talkback.
 
@@ -125,18 +140,20 @@ class StudioTalkbackProcessor:
           Left  = Microphone audio (from selected input_channel)
           Right = Silence (0.0), or the release marker tone (default 0.5s)
                   immediately after Talkback is concluded.
-      - When Talkback is ON (momentary push-to-talk):
+      - When Talkback is ON (momentary push-to-talk, local or remote producer):
           Left  = Silence (0.0)
           Right = First `tone_duration_sec` seconds (default 1.0s) is a sine
                   marker tone (e.g. 1000 Hz or 440 Hz), followed immediately
-                  by Microphone audio on Right channel until Talkback is released.
+                  by the mix of the Local Talent Microphone and the Remote
+                  Producer's Talkback audio on the Right channel until
+                  Talkback is released.
     """
 
     def __init__(
         self,
         sample_rate: int,
-        studio_mode: bool,
-        output_channels: int,
+        studio_mode: bool = True,
+        output_channels: int = 2,
         input_channel: int = 0,
         tone_hz: float = 1000.0,
         tone_duration_sec: float = 1.0,
@@ -153,7 +170,10 @@ class StudioTalkbackProcessor:
         self.tone_amplitude = float(tone_amplitude)
 
         self._lock = threading.Lock()
-        self._talkback_active = False
+        self._local_talkback_active = False
+        self._remote_talkback_active = False
+        self._remote_audio_fifo = np.zeros(0, dtype=np.float64)
+        self._max_fifo_samples = self.sample_rate * 4
         self._tone_samples_total = int(round(self.sample_rate * self.tone_duration_sec))
         self._tone_samples_emitted = 0
         self._fade_samples = (
@@ -182,17 +202,56 @@ class StudioTalkbackProcessor:
     @property
     def talkback_active(self) -> bool:
         with self._lock:
-            return self._talkback_active
+            return self._local_talkback_active or self._remote_talkback_active
+
+    @property
+    def local_talkback_active(self) -> bool:
+        with self._lock:
+            return self._local_talkback_active
+
+    @property
+    def remote_talkback_active(self) -> bool:
+        with self._lock:
+            return self._remote_talkback_active
+
+    def _apply_talkback_transition_locked(self, was_active: bool, now_active: bool) -> None:
+        if now_active and not was_active:
+            self._tone_samples_emitted = 0
+            self._release_tone_samples_emitted = self._release_tone_samples_total
+        elif not now_active and was_active:
+            self._release_tone_samples_emitted = 0
+            self._remote_audio_fifo = np.zeros(0, dtype=np.float64)
 
     def set_talkback(self, active: bool) -> None:
-        """Activate or deactivate momentary Talkback mode."""
+        """Activate or deactivate local momentary Talkback mode."""
         with self._lock:
-            if active and not self._talkback_active:
-                self._tone_samples_emitted = 0
-                self._release_tone_samples_emitted = self._release_tone_samples_total
-            elif not active and self._talkback_active:
-                self._release_tone_samples_emitted = 0
-            self._talkback_active = bool(active)
+            was_active = self._local_talkback_active or self._remote_talkback_active
+            self._local_talkback_active = bool(active)
+            now_active = self._local_talkback_active or self._remote_talkback_active
+            self._apply_talkback_transition_locked(was_active, now_active)
+
+    def set_remote_talkback(self, active: bool) -> None:
+        """Activate or deactivate Remote Producer momentary Talkback mode."""
+        with self._lock:
+            was_active = self._local_talkback_active or self._remote_talkback_active
+            self._remote_talkback_active = bool(active)
+            now_active = self._local_talkback_active or self._remote_talkback_active
+            self._apply_talkback_transition_locked(was_active, now_active)
+
+    def push_remote_audio(
+        self, samples: np.ndarray, input_sample_rate: int = 0
+    ) -> None:
+        """Queue incoming Remote Producer talkback audio for Right-channel Studio Mode recording."""
+        src_sr = int(input_sample_rate) if int(input_sample_rate) > 0 else self.sample_rate
+        resampled = resample_mono_signal(samples, src_sr, self.sample_rate)
+        if resampled.size == 0:
+            return
+        clipped = np.clip(resampled, -1.0, 1.0)
+        with self._lock:
+            combined = np.concatenate((self._remote_audio_fifo, clipped))
+            if combined.size > self._max_fifo_samples:
+                combined = combined[-self._max_fifo_samples :]
+            self._remote_audio_fifo = combined
 
     def _synthesize_tone_segment(
         self, start_pos: int, count: int, total_samples: int, fade_samples: int
@@ -223,11 +282,19 @@ class StudioTalkbackProcessor:
                 )
         return sine_wave * envelope
 
-    def process_block(self, input_frames: np.ndarray) -> np.ndarray:
+    def process_block(
+        self,
+        input_frames: np.ndarray,
+        local_mic_muted: bool = False,
+    ) -> np.ndarray:
         """Process a block of normalized float64 samples in range [-1.0, 1.0].
 
         Args:
             input_frames: Shape (num_frames, hw_channels) float64 array.
+            local_mic_muted: If True (e.g. talent Cough/Privacy mute active),
+                suppresses the local mic from being mixed onto the Right
+                channel during remote-initiated Talkback unless local Talkback
+                is explicitly held.
 
         Returns:
             Output array of shape (num_frames, output_channels) in float64 [-1.0, 1.0].
@@ -250,11 +317,13 @@ class StudioTalkbackProcessor:
                 return input_frames[:, :2].copy()
             return np.column_stack((mic_signal, mic_signal))
 
-        # Studio Mode: always Stereo (Left = Take audio, Right = Talkback tone + notes)
+        # Studio Mode: always Stereo (Left = Take audio, Right = Talkback tone + mixed Producer & Local Mic)
         out = np.zeros((num_frames, 2), dtype=np.float64)
 
         with self._lock:
-            tb_active = self._talkback_active
+            local_tb = self._local_talkback_active
+            remote_tb = self._remote_talkback_active
+            tb_active = local_tb or remote_tb
             tone_pos = self._tone_samples_emitted
             tone_total = self._tone_samples_total
 
@@ -276,7 +345,8 @@ class StudioTalkbackProcessor:
                 return out
 
             # Talkback active: Left (0) is muted (zeros).
-            # Right (1) gets the press tone first, then mic_signal.
+            # Right (1) gets the press tone first, then mixes both the Local Talent Mic
+            # and the Remote Producer's Talkback audio onto the Right channel.
             tone_remaining = max(0, tone_total - tone_pos)
             tone_count = min(num_frames, tone_remaining)
 
@@ -290,7 +360,19 @@ class StudioTalkbackProcessor:
                 self._tone_samples_emitted += tone_count
 
             if tone_count < num_frames:
-                out[tone_count:, 1] = mic_signal[tone_count:]
+                voice_count = num_frames - tone_count
+                rem_seg = np.zeros(voice_count, dtype=np.float64)
+                if self._remote_audio_fifo.size > 0:
+                    avail = min(voice_count, self._remote_audio_fifo.size)
+                    rem_seg[:avail] = self._remote_audio_fifo[:avail]
+                    self._remote_audio_fifo = self._remote_audio_fifo[avail:]
+
+                if local_mic_muted and not local_tb:
+                    local_seg = np.zeros(voice_count, dtype=np.float64)
+                else:
+                    local_seg = mic_signal[tone_count:]
+
+                out[tone_count:, 1] = np.clip(local_seg + rem_seg, -1.0, 1.0)
 
         return out
 
@@ -740,6 +822,22 @@ class AudioEngine:
         self._play_position_sec: float = 0.0
         self._play_duration_sec: float = 0.0
         self._playing_filepath: Optional[Path] = None
+
+        # Remote Producer bidirectional audio & privacy/cough state
+        self._live_listeners_lock = threading.Lock()
+        self._live_audio_listeners: List[Callable[[np.ndarray, int, bool], None]] = []
+        self._talent_mic_send_enabled: bool = True
+        self._talent_cough_muted: bool = False
+        self._remote_talkback_active: bool = False
+        self._last_remote_talkback_peak: float = 0.0
+
+        # Live Talkback headphone monitor output for prompting the talent
+        self._tb_out_lock = threading.Lock()
+        self._tb_out_fifo = np.zeros(0, dtype=np.float64)
+        self._tb_out_rate: int = 24000
+        self._tb_out_device: Optional[AudioDeviceCapabilities] = None
+        self._tb_out_thread: Optional[threading.Thread] = None
+        self._tb_out_stop_event = threading.Event()
 
     # -------------------------------------------------------------------------
     # Hardware Enumeration
@@ -1217,6 +1315,7 @@ class AudioEngine:
                 in_block, studio_mode, channels, input_channel
             )
             self._update_meter_from_block(metered)
+            self._dispatch_live_input_block(metered, sample_rate)
 
             elapsed = time.monotonic() - t0
             sleep_for = max(0.005, chunk_duration - elapsed)
@@ -1301,6 +1400,235 @@ class AudioEngine:
                     in_float, studio_mode, channels, input_channel
                 )
                 self._update_meter_from_block(metered)
+                self._dispatch_live_input_block(metered, sample_rate)
+        finally:
+            lib.snd_pcm_drop(pcm)
+            lib.snd_pcm_close(pcm)
+
+    # -------------------------------------------------------------------------
+    # Remote Producer Bidirectional Audio & Privacy / Cough Controls
+    # -------------------------------------------------------------------------
+    @property
+    def talent_mic_send_enabled(self) -> bool:
+        return self._talent_mic_send_enabled
+
+    def set_talent_mic_send_enabled(self, enabled: bool) -> None:
+        """Enable or disable sending the talent's live microphone feed to the remote producer."""
+        self._talent_mic_send_enabled = bool(enabled)
+
+    @property
+    def talent_cough_muted(self) -> bool:
+        return self._talent_cough_muted
+
+    def set_talent_cough_muted(self, muted: bool) -> None:
+        """Set momentary Cough / Privacy mute state on the talent's producer feed."""
+        self._talent_cough_muted = bool(muted)
+
+    @property
+    def is_talent_mic_live_to_producer(self) -> bool:
+        """Return True when the talent's microphone is permitted to stream to the remote producer."""
+        return bool(self._talent_mic_send_enabled and not self._talent_cough_muted)
+
+    def register_live_audio_listener(
+        self, callback: Callable[[np.ndarray, int, bool], None]
+    ) -> None:
+        """Register a listener `(mono_frames, sample_rate, is_muted)` for live talent mic streaming."""
+        with self._live_listeners_lock:
+            if callback not in self._live_audio_listeners:
+                self._live_audio_listeners.append(callback)
+
+    def unregister_live_audio_listener(
+        self, callback: Callable[[np.ndarray, int, bool], None]
+    ) -> None:
+        with self._live_listeners_lock:
+            if callback in self._live_audio_listeners:
+                self._live_audio_listeners.remove(callback)
+
+    def _dispatch_live_input_block(
+        self, metered_block: np.ndarray, sample_rate: int
+    ) -> None:
+        with self._live_listeners_lock:
+            listeners = list(self._live_audio_listeners)
+        if not listeners or metered_block.size == 0:
+            return
+
+        if metered_block.ndim == 2:
+            mono = metered_block[:, 0]
+        else:
+            mono = metered_block.reshape(-1)
+
+        is_muted = not self.is_talent_mic_live_to_producer
+        payload = np.zeros_like(mono) if is_muted else mono
+        for cb in listeners:
+            try:
+                cb(payload, sample_rate, is_muted)
+            except Exception as exc:
+                logger.debug("Live audio listener error: %s", exc)
+
+    def set_talkback_output_device(
+        self, device: Optional[AudioDeviceCapabilities]
+    ) -> None:
+        """Configure the output device used for live remote producer talkback headphone monitoring."""
+        with self._tb_out_lock:
+            self._tb_out_device = device
+
+    @property
+    def remote_talkback_active(self) -> bool:
+        proc = self._current_processor
+        if proc is not None and self.is_recording and not self.is_record_paused:
+            return proc.remote_talkback_active
+        return self._remote_talkback_active
+
+    @property
+    def local_talkback_active(self) -> bool:
+        proc = self._current_processor
+        return proc.local_talkback_active if proc is not None else False
+
+    @property
+    def last_remote_talkback_peak(self) -> float:
+        return self._last_remote_talkback_peak
+
+    def set_remote_talkback(self, active: bool) -> None:
+        """Set momentary Talkback state triggered by a connected Remote Producer."""
+        if active and self.is_record_paused:
+            self._remote_talkback_active = False
+            return
+        self._remote_talkback_active = bool(active)
+        if not active:
+            self._last_remote_talkback_peak = 0.0
+        proc = self._current_processor
+        if proc is not None:
+            proc.set_remote_talkback(bool(active))
+
+    def push_remote_talkback_audio(
+        self, samples: np.ndarray, sample_rate: int = 24000
+    ) -> None:
+        """Feed incoming Remote Producer microphone audio to both Studio Mode Right-Ch recording and Talent headphones."""
+        flat = np.asarray(samples, dtype=np.float64).reshape(-1)
+        if flat.size == 0:
+            return
+        self._last_remote_talkback_peak = float(np.max(np.abs(flat)))
+
+        # 1. If recording in Studio Mode (and not paused), feed into StudioTalkbackProcessor Right channel
+        proc = self._current_processor
+        if proc is not None and self.is_recording and not self.is_record_paused:
+            proc.push_remote_audio(flat, input_sample_rate=sample_rate)
+
+        # 2. Queue for low-latency headphone monitoring so the talent hears the producer's prompt
+        self._queue_talkback_headphone_audio(flat, sample_rate)
+
+    def _queue_talkback_headphone_audio(
+        self, samples: np.ndarray, sample_rate: int
+    ) -> None:
+        if self.is_playing:
+            return
+        target_sr = 24000
+        resampled = resample_mono_signal(samples, sample_rate, target_sr)
+        if resampled.size == 0:
+            return
+
+        with self._tb_out_lock:
+            self._tb_out_rate = target_sr
+            combined = np.concatenate((self._tb_out_fifo, np.clip(resampled, -1.0, 1.0)))
+            max_samples = target_sr  # Cap live monitor buffer to 1.0s
+            if combined.size > max_samples:
+                combined = combined[-max_samples:]
+            self._tb_out_fifo = combined
+
+            if self._tb_out_thread is None or not self._tb_out_thread.is_alive():
+                self._tb_out_stop_event.clear()
+                self._tb_out_thread = threading.Thread(
+                    target=self._talkback_headphone_worker,
+                    daemon=True,
+                )
+                self._tb_out_thread.start()
+
+    def _talkback_headphone_worker(self) -> None:
+        """Low-latency playback worker that streams incoming remote producer talkback to the talent's output."""
+        with self._tb_out_lock:
+            out_dev = self._tb_out_device
+            sr = self._tb_out_rate
+
+        if (
+            out_dev is None
+            or out_dev.device_id.startswith("sim:")
+            or not self.alsa.available
+        ):
+            # Simulated drain loop
+            while not self._tb_out_stop_event.is_set():
+                with self._tb_out_lock:
+                    if self._tb_out_fifo.size == 0:
+                        return
+                    take = min(480, self._tb_out_fifo.size)
+                    self._tb_out_fifo = self._tb_out_fifo[take:]
+                time.sleep(take / float(max(8000, sr)))
+            return
+
+        assert self.alsa.lib is not None
+        lib = self.alsa.lib
+        dev_str = out_dev.device_id
+        if dev_str.startswith("hw:"):
+            dev_str = "plug" + dev_str
+
+        pcm = ctypes.c_void_p()
+        err = lib.snd_pcm_open(
+            ctypes.byref(pcm),
+            dev_str.encode("ascii"),
+            SND_PCM_STREAM_PLAYBACK,
+            0,
+        )
+        if err < 0 or not pcm:
+            with self._tb_out_lock:
+                self._tb_out_fifo = np.zeros(0, dtype=np.float64)
+            return
+
+        hw_params = ctypes.c_void_p()
+        lib.snd_pcm_hw_params_malloc(ctypes.byref(hw_params))
+        out_ch = 2
+        try:
+            lib.snd_pcm_hw_params_any(pcm, hw_params)
+            lib.snd_pcm_hw_params_set_access(pcm, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)
+            lib.snd_pcm_hw_params_set_format(pcm, hw_params, SND_PCM_FORMAT_S16_LE)
+            if lib.snd_pcm_hw_params_set_channels(pcm, hw_params, out_ch) < 0:
+                out_ch = 1
+                lib.snd_pcm_hw_params_set_channels(pcm, hw_params, out_ch)
+            lib.snd_pcm_hw_params_set_rate(pcm, hw_params, sr, 0)
+            if lib.snd_pcm_hw_params(pcm, hw_params) < 0:
+                return
+        finally:
+            lib.snd_pcm_hw_params_free(hw_params)
+
+        lib.snd_pcm_prepare(pcm)
+        idle_ticks = 0
+        try:
+            while not self._tb_out_stop_event.is_set() and not self.is_playing:
+                with self._tb_out_lock:
+                    avail = self._tb_out_fifo.size
+                    if avail > 0:
+                        take = min(960, avail)
+                        mono_chunk = self._tb_out_fifo[:take]
+                        self._tb_out_fifo = self._tb_out_fifo[take:]
+                    else:
+                        mono_chunk = None
+
+                if mono_chunk is None:
+                    idle_ticks += 1
+                    if idle_ticks > 25:  # Close idle playback stream after ~500ms of silence
+                        break
+                    time.sleep(0.02)
+                    continue
+
+                idle_ticks = 0
+                if out_ch == 2:
+                    stereo = np.column_stack((mono_chunk, mono_chunk))
+                    pcm16 = np.round(np.clip(stereo, -1.0, 1.0) * 32767.0).astype("<i2")
+                else:
+                    pcm16 = np.round(np.clip(mono_chunk, -1.0, 1.0) * 32767.0).astype("<i2")
+
+                raw = pcm16.tobytes()
+                written = lib.snd_pcm_writei(pcm, raw, mono_chunk.size)
+                if written < 0:
+                    lib.snd_pcm_recover(pcm, int(written), 1)
         finally:
             lib.snd_pcm_drop(pcm)
             lib.snd_pcm_close(pcm)
@@ -1349,7 +1677,9 @@ class AudioEngine:
     @property
     def talkback_active(self) -> bool:
         proc = self._current_processor
-        return proc.talkback_active if proc else False
+        if proc is not None and self.is_recording and not self.is_record_paused:
+            return proc.talkback_active
+        return self._remote_talkback_active
 
     def set_talkback(self, active: bool) -> None:
         """Set momentary Talkback state during recording."""
@@ -1374,8 +1704,10 @@ class AudioEngine:
             self._is_record_paused = True
             proc = self._current_processor
 
+        self._remote_talkback_active = False
         if proc is not None:
             proc.set_talkback(False)
+            proc.set_remote_talkback(False)
 
         with self._writer_lock:
             if self._active_writer is not None and self._active_writer.is_open:
@@ -1444,6 +1776,8 @@ class AudioEngine:
                 tone_duration_sec=tone_duration_sec,
                 release_tone_duration_sec=release_tone_duration_sec,
             )
+            if self._remote_talkback_active:
+                processor.set_remote_talkback(True)
             self._current_processor = processor
             self._current_recording_path = output_path
             self._stop_record_event.clear()
@@ -1560,13 +1894,17 @@ class AudioEngine:
                 processor.input_channel,
             )
             self._update_meter_from_block(metered)
+            self._dispatch_live_input_block(metered, sample_rate)
 
             if not self.is_record_paused:
                 with self._writer_lock:
                     if not self.is_record_paused:
                         if not writer.is_open:
                             writer.reopen()
-                        out_block = processor.process_block(in_block)
+                        out_block = processor.process_block(
+                            in_block,
+                            local_mic_muted=not self.is_talent_mic_live_to_producer,
+                        )
                         writer.write_float_frames(out_block)
 
                         if t0 - last_header_flush >= 1.0:
@@ -1666,13 +2004,17 @@ class AudioEngine:
                     processor.input_channel,
                 )
                 self._update_meter_from_block(metered)
+                self._dispatch_live_input_block(metered, sample_rate)
 
                 if not self.is_record_paused:
                     with self._writer_lock:
                         if not self.is_record_paused:
                             if not writer.is_open:
                                 writer.reopen()
-                            out_float = processor.process_block(in_float)
+                            out_float = processor.process_block(
+                                in_float,
+                                local_mic_muted=not self.is_talent_mic_live_to_producer,
+                            )
                             writer.write_float_frames(out_float)
 
                             now = time.monotonic()

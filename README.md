@@ -25,6 +25,16 @@ An optimized **Alpine Linux** kiosk configuration and fullscreen studio applicat
     - **Right Channel**: Silent during normal recording. Holding the **Talkback** button (via mouse, touchscreen, or holding `[T]`) immediately **mutes the Left channel**, emits a configurable **press marker tone** (`1.0 second` by default) on the Right channel, records spoken notes from the microphone onto the Right channel while held, and emits a configurable **release marker tone** (`0.5 seconds` by default) on the Right channel when Talkback is concluded.
     - **Adjustable Tone Frequency & Durations**: Both the press and release tone durations (`Off / 0.0s` through `3.0s`) and the marker tone frequency (`330 Hz`, `440 Hz`, `528 Hz`, `660 Hz`, `800 Hz`, `1000 Hz / 1 kHz`, `1200 Hz`) are adjustable in **Settings & Samba → Audio & Recording Settings** so you can choose a warmer, easier-on-the-ear tone.
     - Provides high-contrast visual indication whenever Talkback is active, enabling fast visual or AI-assisted assembly in a DAW.
+- **Remote Producer Option (Guided VO over HTTPS / WSS)**:
+  - Optional low-latency, bidirectional audio & telemetry web console (`https://<IP>:8443/`) that allows a remote producer or director to listen live to the talent's performance and use a momentary **Talkback** control (`Hold T` or `Space`) to prompt the talent in real time.
+  - **Full Mix-Minus & Right-Channel Producer + Talent Mix**:
+    - **Right Channel (Studio Mode Talkback Track)**: Whenever Talkback is active (triggered by either the Remote Producer or the Local Talent), the Left (VO) channel is muted (`0.0`) and **both the Remote Producer's voice and the Local Talent's microphone** are summed onto the Right channel (between the press and release marker tones) so two-way direction and talent responses are captured together on the Talkback track.
+    - **Mix-Minus to Remote Producer**: The live stream sent to the Remote Producer contains **only the Local Talent's microphone** (minus the producer's own voice and marker tones).
+    - **Mix-Minus to Local Talent Headphones**: The headphone monitor output feeds **only the Remote Producer's Talkback audio** to the local talent's headphones (minus the local talent's microphone, preventing software-loopback echo).
+  - **Stripped-Down Studio Web UI**: Matches the talent's dark studio theme with a live 60-segment LED VU & Peak Hold meter, elapsed timer, recording/pause/talkback state banner, session take count, and remaining storage time, while intentionally omitting hardware configuration, Samba administration, and transport mutation controls so the talent retains full independent control.
+  - **SSL/TLS by Default with Easy Certificate Replacement**: Automatically generates a valid X.509 v3 self-signed certificate (with SANs for `localhost` and LAN IPv4 addresses) out of the box, and supports one-click replacement with CA-issued certificates dropped into `/storage/ssl/` (`server.crt` + `server.key`) over Samba or via custom certificate paths.
+  - **Session-Tied Authentication, QR Code & Invite Link**: Generates a unique **Session ID** (`ARS-XXXX`), 6-digit **Session Passcode (PIN)**, scannable **QR Code**, and copyable HTTPS invite link; rotating the session immediately revokes prior tokens, cookies, and active WebSocket connections.
+  - **Bidirectional Mic Privacy & Cough Controls**: Both the local Talent Studio Deck (`◉ MIC TO PRODUCER` / `Hold [B]` Cough Mute) and the Remote Producer web console (`Send Producer Mic` switch defaulting to `OFF (Private)` + `Hold [C]` / `[M]` Cough Mute) provide dedicated privacy and cough controls so neither microphone is ever unexpectedly hot.
 - **Project Prefix & Take Management**:
   - Output filenames follow the format: `<ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav`.
   - **Corruption-Safe Record Pause & Resume**: Pausing an active recording (`⏸ PAUSE RECORDING` or pressing `[P]` / `[Pause]`) flushes the RIFF/WAVE header and **closes the `.wav` file on disk** so it cannot be accidentally corrupted while paused, then **reopens the exact same `.wav` file** in append mode when resumed (`▶ RESUME RECORDING`). While paused, the Studio Deck displays unmistakable flashing Amber/Gold warning banners, a pulsing `⏸ HH:MM:SS.d [PAUSED]` timer, a glowing deck border, and a pulsing **Resume Recording** button so a paused session is never forgotten.
@@ -54,6 +64,8 @@ All buttons display their keyboard hotkeys on mouse hover:
 | **Pause / Resume Recording** | `P` or `Pause` | Pause active recording (safely closes `.wav` file on disk) or reopen & resume into the same file |
 | **Reset Peak Hold** | `C` | Reset maintained Peak Hold level and `CLIP` indicator on the VU meter |
 | **Talkback (Studio Mode)** | Hold `T` | Momentary push-to-talk: mutes Left ch, plays 1.0s press tone + records mic on Right ch while held, then plays 0.5s release tone |
+| **Mic to Producer / Cough Mute** | Hold `B` (or Click) | Hold `B` for momentary Cough Mute of feed to Remote Producer, or click button to toggle persistent Privacy Mute |
+| **Remote Producer & SSL Setup** | `F3` | Open Guided VO Remote Producer setup dialog (QR code, session link, passcode rotation, and SSL certificate import) |
 | **Toggle Mode** | `M` | Switch between Normal Mode and Studio Mode (when stopped) |
 | **Play / Pause Take** | `P` | Play or pause the selected project recording (when not recording) |
 | **Stop Playback** | `S` | Stop reference audio playback |
@@ -142,7 +154,11 @@ alpine-recorder recover       # Emergency recovery: stop Xorg, clean tty1 config
 - [`app/config_manager.py`](app/config_manager.py) — Persistent settings manager, project prefix filter, and `<Project>_yyyy-mm-dd_HH.MM.SS_TZ.wav` filename generator.
 - [`app/samba_manager.py`](app/samba_manager.py) — Samba user administration (`add_user`, `change_password`, `remove_user`) with automatic `lbu commit`.
 - [`app/network_info.py`](app/network_info.py) — LAN IPv4 address discovery for the subtle status bar display.
+- [`app/qr_code.py`](app/qr_code.py) — Pure-Python ISO/IEC 18004 QR Code matrix and SVG generator for session invite links.
+- [`app/ssl_manager.py`](app/ssl_manager.py) — Default X.509 v3 self-signed certificate generator and `/storage/ssl` issued-certificate importer.
+- [`app/remote_producer.py`](app/remote_producer.py) — HTTPS + RFC 6455 WebSocket server, session-bound authenticator, and stripped-down Guided VO Remote Producer web console.
 - [`app/ui/main_window.py`](app/ui/main_window.py) — Responsive fullscreen PyQt6 studio interface.
+- [`app/ui/remote_producer_dialog.py`](app/ui/remote_producer_dialog.py) — Remote Producer session setup, QR code display, passcode rotation, and SSL certificate dialog.
 - [`app/ui/vu_meter.py`](app/ui/vu_meter.py) — Graphical studio LED VU & Peak Hold meter widget (`-60` to `0 dBFS`) for live input level setting.
 - [`app/ui/storage_monitor.py`](app/ui/storage_monitor.py) — Graphical `/storage` drive utilization bar (`0%` to `100%`), low-space/critical warning panel, and real-time recording time remaining monitor.
 - [`app/ui/settings_dialog.py`](app/ui/settings_dialog.py) — Audio hardware settings, On-Screen Keyboard toggle, Exit to Console action, and Samba user administration dialog.

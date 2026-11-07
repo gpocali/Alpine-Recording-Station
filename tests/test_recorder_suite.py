@@ -881,5 +881,279 @@ class TestUiGlyphsAndButtonMnemonics(unittest.TestCase):
         self.assertIn('"Audio && Recording Settings"', settings_text)
 
 
+class TestRemoteProducerAndSslSuite(unittest.TestCase):
+    def test_qr_code_matrix_and_svg_generation(self) -> None:
+        from app.qr_code import encode_qr_matrix, qr_matrix_to_svg
+
+        url = "https://192.168.1.50:8443/?session=ARS-1A2B&token=abc123xyz"
+        matrix = encode_qr_matrix(url)
+        self.assertGreaterEqual(len(matrix), 21)
+        self.assertEqual(len(matrix), len(matrix[0]))
+        # Top-left finder pattern corner is always dark
+        self.assertTrue(matrix[0][0])
+        self.assertTrue(matrix[0][6])
+        self.assertTrue(matrix[6][0])
+
+        svg = qr_matrix_to_svg(matrix)
+        self.assertIn("<svg", svg)
+        self.assertIn("<path", svg)
+
+    def test_ssl_certificate_generation_and_drop_import(self) -> None:
+        from app.ssl_manager import SslCertificateManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cert_dir = base / "etc_ssl"
+            drop_dir = base / "storage_ssl"
+            mgr = SslCertificateManager(cert_dir=cert_dir, drop_dir=drop_dir)
+
+            ok, msg = mgr.ensure_certificates()
+            self.assertTrue(ok, msg)
+            info = mgr.get_certificate_info()
+            self.assertTrue(info.valid)
+            self.assertEqual(info.mode, "self-signed")
+            self.assertTrue(len(info.fingerprint_sha256) > 20)
+
+            # Verify SSLContext creation succeeds
+            ctx = mgr.create_ssl_context()
+            self.assertIsNotNone(ctx)
+
+            # Simulate dropping issued certificate pair into /storage/ssl
+            other_dir = base / "issued"
+            other_mgr = SslCertificateManager(cert_dir=other_dir, drop_dir= base / "unused")
+            other_mgr.ensure_certificates()
+            drop_dir.mkdir(parents=True, exist_ok=True)
+            (drop_dir / "server.crt").write_bytes(other_mgr.default_cert_path.read_bytes())
+            (drop_dir / "server.key").write_bytes(other_mgr.default_key_path.read_bytes())
+
+            imported_ok, import_msg = mgr.import_from_drop_dir()
+            self.assertTrue(imported_ok, import_msg)
+            info_after = mgr.get_certificate_info()
+            self.assertTrue(info_after.valid)
+            self.assertEqual(info_after.mode, "custom-imported")
+
+    def test_studio_talkback_remote_producer_routing(self) -> None:
+        sr = 8000
+        proc = StudioTalkbackProcessor(
+            sample_rate=sr,
+            studio_mode=True,
+            output_channels=2,
+            tone_hz=440.0,
+            tone_duration_sec=0.1,
+            release_tone_duration_sec=0.05,
+        )
+        talent_mic = np.full(800, 0.25, dtype=np.float64)
+
+        # Normal state: Talent mic on Left, silence on Right
+        st_normal = proc.process_block(talent_mic)
+        self.assertAlmostEqual(float(np.mean(np.abs(st_normal[:, 0]))), 0.25, places=3)
+        self.assertAlmostEqual(float(np.max(np.abs(st_normal[:, 1]))), 0.0, places=5)
+
+        # Activate Remote Producer Talkback and push remote voice samples
+        proc.set_remote_talkback(True)
+        remote_voice = np.full(2400, 0.45, dtype=np.float64)
+        proc.push_remote_audio(remote_voice, input_sample_rate=sr)
+
+        # Block 1 (800 frames = 0.1s): Left channel muted, Right channel plays press marker tone
+        st_press_tone = proc.process_block(talent_mic)
+        self.assertAlmostEqual(float(np.max(np.abs(st_press_tone[:, 0]))), 0.0, places=5)
+        self.assertGreater(float(np.max(np.abs(st_press_tone[:, 1]))), 0.3)
+
+        # Block 2 (800 frames): Left channel still muted, Right channel mixes Producer (0.45) + Local Mic (0.25) = 0.70
+        st_rem_voice = proc.process_block(talent_mic)
+        self.assertAlmostEqual(float(np.max(np.abs(st_rem_voice[:, 0]))), 0.0, places=5)
+        self.assertAlmostEqual(float(np.mean(st_rem_voice[:, 1])), 0.70, places=2)
+
+        # Block 3 (800 frames) with local_mic_muted=True (Cough/Privacy mute): Right channel records only Producer (0.45)
+        st_cough_muted = proc.process_block(talent_mic, local_mic_muted=True)
+        self.assertAlmostEqual(float(np.max(np.abs(st_cough_muted[:, 0]))), 0.0, places=5)
+        self.assertAlmostEqual(float(np.mean(st_cough_muted[:, 1])), 0.45, places=2)
+
+        # Release Remote Producer Talkback -> emits 0.05s (400 frames) release marker tone on Right
+        proc.set_remote_talkback(False)
+        st_rel = proc.process_block(talent_mic)
+        self.assertGreater(float(np.max(np.abs(st_rel[:400, 1]))), 0.3)
+        # Left channel returns to normal talent mic (0.25)
+        self.assertAlmostEqual(float(np.mean(st_rel[:, 0])), 0.25, places=2)
+
+    def test_talent_mic_privacy_and_cough_mute_live_listener(self) -> None:
+        engine = AudioEngine(simulate_if_empty=True)
+        received = []
+
+        def listener(mono: np.ndarray, sr: int, is_muted: bool) -> None:
+            received.append((mono.copy(), sr, is_muted))
+
+        engine.register_live_audio_listener(listener)
+        sample_block = np.full(480, 0.25, dtype=np.float32)
+
+        # Default: talent mic send enabled, not cough muted
+        engine._dispatch_live_input_block(sample_block, 48000)
+        self.assertEqual(len(received), 1)
+        self.assertFalse(received[-1][2])
+        self.assertAlmostEqual(float(np.mean(received[-1][0])), 0.25, places=3)
+
+        # Momentary cough mute -> listener receives zeroed samples & is_muted=True
+        engine.set_talent_cough_muted(True)
+        engine._dispatch_live_input_block(sample_block, 48000)
+        self.assertTrue(received[-1][2])
+        self.assertAlmostEqual(float(np.max(np.abs(received[-1][0]))), 0.0, places=6)
+
+        # Release cough mute, disable mic send for privacy -> still muted
+        engine.set_talent_cough_muted(False)
+        engine.set_talent_mic_send_enabled(False)
+        engine._dispatch_live_input_block(sample_block, 48000)
+        self.assertTrue(received[-1][2])
+        self.assertAlmostEqual(float(np.max(np.abs(received[-1][0]))), 0.0, places=6)
+
+        engine.unregister_live_audio_listener(listener)
+
+    def test_remote_producer_https_and_websocket_session(self) -> None:
+        import json
+        import os
+        import socket
+        import ssl
+        import struct
+        import urllib.request
+        from app.remote_producer import FRAME_PRODUCER_AUDIO, RemoteProducerServer, read_ws_frame
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cm = ConfigManager(storage_dir=base / "storage", etc_config_dir=base / "etc")
+            engine = AudioEngine(simulate_if_empty=True)
+            server = RemoteProducerServer(
+                audio_engine=engine,
+                config_manager=cm,
+                host="127.0.0.1",
+                port=0,
+            )
+            self.assertTrue(server.start(port=0))
+            try:
+                port = server.port
+                self.assertGreater(port, 0)
+
+                client_ctx = ssl.create_default_context()
+                client_ctx.check_hostname = False
+                client_ctx.verify_mode = ssl.CERT_NONE
+
+                # 1. Unauthenticated /api/status returns 401
+                req = urllib.request.Request(f"https://127.0.0.1:{port}/api/status")
+                with self.assertRaises(urllib.error.HTTPError) as ctx_err:
+                    urllib.request.urlopen(req, context=client_ctx, timeout=5)
+                self.assertEqual(ctx_err.exception.code, 401)
+
+                # 2. Authenticate via /api/login with session passcode
+                login_body = json.dumps({
+                    "session_id": server.session.session_id,
+                    "password": server.session.session_passcode,
+                }).encode("utf-8")
+                login_req = urllib.request.Request(
+                    f"https://127.0.0.1:{port}/api/login",
+                    data=login_body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(login_req, context=client_ctx, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    login_data = json.loads(resp.read().decode("utf-8"))
+                    self.assertTrue(login_data["ok"])
+                    auth_token = login_data["auth_token"]
+
+                # 3. Authenticated /api/status succeeds
+                status_req = urllib.request.Request(
+                    f"https://127.0.0.1:{port}/api/status",
+                    headers={"Authorization": f"Bearer {auth_token}"},
+                )
+                with urllib.request.urlopen(status_req, context=client_ctx, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    st_data = json.loads(resp.read().decode("utf-8"))
+                    self.assertTrue(st_data["authenticated"])
+                    self.assertEqual(st_data["session_id"], server.session.session_id)
+
+                # 4. Connect over WSS (/ws/producer) and test Mic Gate + Remote Talkback
+                raw_sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+                tls_sock = client_ctx.wrap_socket(raw_sock, server_hostname="127.0.0.1")
+                try:
+                    ws_handshake = (
+                        f"GET /ws/producer?auth={auth_token} HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{port}\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Connection: Upgrade\r\n"
+                        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n"
+                    )
+                    tls_sock.sendall(ws_handshake.encode("ascii"))
+                    resp_hdr = b""
+                    while b"\r\n\r\n" not in resp_hdr:
+                        chunk = tls_sock.recv(1024)
+                        if not chunk:
+                            break
+                        resp_hdr += chunk
+                    self.assertIn(b"101 Switching Protocols", resp_hdr)
+
+                    # Read initial state frame
+                    frame = read_ws_frame(tls_sock)
+                    self.assertIsNotNone(frame)
+                    opcode, payload = frame
+                    self.assertEqual(opcode, 0x1)
+                    init_state = json.loads(payload.decode("utf-8"))
+                    self.assertEqual(init_state["type"], "state")
+
+                    # Helper to send masked client WebSocket frame
+                    def send_masked(op: int, data: bytes) -> None:
+                        mask = os.urandom(4)
+                        hdr = bytearray([0x80 | op])
+                        n = len(data)
+                        if n < 126:
+                            hdr.append(0x80 | n)
+                        else:
+                            hdr.append(0x80 | 126)
+                            hdr.extend(struct.pack("!H", n))
+                        hdr.extend(mask)
+                        masked = bytes(data[i] ^ mask[i & 3] for i in range(n))
+                        tls_sock.sendall(bytes(hdr) + masked)
+
+                    # Arm producer mic and activate talkback
+                    send_masked(0x1, json.dumps({
+                        "type": "mic_state",
+                        "send_enabled": True,
+                        "cough_muted": False,
+                    }).encode("utf-8"))
+                    send_masked(0x1, json.dumps({
+                        "type": "talkback",
+                        "active": True,
+                    }).encode("utf-8"))
+
+                    # Wait briefly for server to process
+                    deadline = time.time() + 2.0
+                    while time.time() < deadline and not engine.remote_talkback_active:
+                        time.sleep(0.02)
+                    self.assertTrue(engine.remote_talkback_active)
+                    self.assertTrue(engine.talkback_active)
+
+                    # Push a binary producer audio frame
+                    pcm = (np.full(240, 0.5, dtype=np.float32) * 32767.0).astype("<i2").tobytes()
+                    bin_pkt = struct.pack("<BBH", FRAME_PRODUCER_AUDIO, 0, 240) + pcm
+                    send_masked(0x2, bin_pkt)
+
+                    # Cough-muting producer mic immediately drops remote talkback
+                    send_masked(0x1, json.dumps({
+                        "type": "mic_state",
+                        "send_enabled": True,
+                        "cough_muted": True,
+                    }).encode("utf-8"))
+                    deadline = time.time() + 2.0
+                    while time.time() < deadline and engine.remote_talkback_active:
+                        time.sleep(0.02)
+                    self.assertFalse(engine.remote_talkback_active)
+                finally:
+                    tls_sock.close()
+
+                # 5. Rotating session invalidates previous auth token
+                server.rotate_session()
+                self.assertFalse(server.session.verify_auth_token(auth_token))
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

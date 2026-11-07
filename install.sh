@@ -114,6 +114,7 @@ BASE_PKGS="
     eudev
     util-linux
     iproute2
+    openssl
 "
 
 ARCH_PKGS=""
@@ -202,6 +203,7 @@ if ! mountpoint -q "${STORAGE_DIR}" 2>/dev/null; then
     mount "${STORAGE_DIR}" 2>/dev/null || mount -a 2>/dev/null || true
 fi
 mkdir -p "${STORAGE_DIR}/.alpine-recorder"
+mkdir -p "${STORAGE_DIR}/ssl"
 mkdir -p "${APK_CACHE_DIR}"
 chown root:sambashare "${STORAGE_DIR}" 2>/dev/null || true
 chmod 2777 "${STORAGE_DIR}" 2>/dev/null || chmod 0777 "${STORAGE_DIR}"
@@ -250,7 +252,11 @@ if command -v python3 >/dev/null 2>&1; then
         "${APP_DEST}/app/config_manager.py" \
         "${APP_DEST}/app/samba_manager.py" \
         "${APP_DEST}/app/network_info.py" \
+        "${APP_DEST}/app/qr_code.py" \
+        "${APP_DEST}/app/ssl_manager.py" \
+        "${APP_DEST}/app/remote_producer.py" \
         "${APP_DEST}/app/ui/main_window.py" \
+        "${APP_DEST}/app/ui/remote_producer_dialog.py" \
         "${APP_DEST}/app/ui/vu_meter.py" \
         "${APP_DEST}/app/ui/storage_monitor.py" \
         "${APP_DEST}/app/ui/settings_dialog.py" \

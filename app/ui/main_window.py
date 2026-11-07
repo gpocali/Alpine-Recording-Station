@@ -33,8 +33,10 @@ from app.config_manager import (
     sanitize_project_name,
 )
 from app.network_info import get_primary_ip_display
+from app.remote_producer import RemoteProducerServer
 from app.samba_manager import SambaManager
 from app.ui.on_screen_keyboard import OnScreenKeyboardController
+from app.ui.remote_producer_dialog import RemoteProducerDialog
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.styles import (
     build_main_stylesheet,
@@ -58,12 +60,32 @@ class MainWindow(QMainWindow):
         audio_engine: AudioEngine,
         samba_manager: SambaManager,
         fullscreen: bool = True,
+        remote_producer_server: Optional[RemoteProducerServer] = None,
     ) -> None:
         super().__init__()
         self.config_manager = config_manager
         self.audio_engine = audio_engine
         self.samba_manager = samba_manager
         self._fullscreen_requested = fullscreen
+
+        # Sync initial Talent Mic Send (Privacy / Cough) state from saved settings
+        self.audio_engine.set_talent_mic_send_enabled(
+            bool(getattr(self.config_manager.settings, "remote_producer_send_talent_mic", True))
+        )
+
+        if remote_producer_server is not None:
+            self.remote_producer_server = remote_producer_server
+            self.remote_producer_server.status_provider = self._build_remote_producer_extra_status
+        else:
+            self.remote_producer_server = RemoteProducerServer(
+                audio_engine=self.audio_engine,
+                config_manager=self.config_manager,
+                status_provider=self._build_remote_producer_extra_status,
+            )
+            if getattr(self.config_manager.settings, "remote_producer_enabled", False):
+                self.remote_producer_server.start(
+                    port=int(getattr(self.config_manager.settings, "remote_producer_port", 8443))
+                )
 
         self.setWindowTitle("Alpine Recording Station")
         self.setMinimumSize(640, 420)
@@ -75,6 +97,11 @@ class MainWindow(QMainWindow):
         self._active_output_device: Optional[AudioDeviceCapabilities] = None
         self._project_recordings: List[RecordingEntry] = []
         self._talkback_key_held = False
+        self._cough_key_held = False
+        self._cough_btn_press_mono: float = 0.0
+        self._last_observed_tb_active = False
+        self._last_observed_remote_tb = False
+        self._last_observed_producer_count = 0
         self._pause_blink_phase = True
         self._last_storage_refresh_monotonic: float = 0.0
 
@@ -162,6 +189,13 @@ class MainWindow(QMainWindow):
         )
         self.mode_toggle_btn.clicked.connect(self._on_toggle_studio_mode)
         top_layout.addWidget(self.mode_toggle_btn)
+
+        self.remote_producer_btn = QPushButton("◎ Remote Producer")
+        self.remote_producer_btn.setToolTip(
+            "Open Remote Producer (Guided VO) Session Setup, QR Code, Link, and SSL Certificate Management [Hotkey: F3]"
+        )
+        self.remote_producer_btn.clicked.connect(self._open_remote_producer_dialog)
+        top_layout.addWidget(self.remote_producer_btn)
 
         self.settings_btn = QPushButton("⚙ Settings && Samba")
         self.settings_btn.setToolTip(
@@ -256,6 +290,18 @@ class MainWindow(QMainWindow):
         self.talkback_btn.pressed.connect(self._on_talkback_pressed)
         self.talkback_btn.released.connect(self._on_talkback_released)
         controls_row.addWidget(self.talkback_btn, stretch=2)
+
+        self.cough_privacy_btn = QPushButton("◉  MIC TO PRODUCER: ON\n(HOLD [B] COUGH / CLICK MUTE)")
+        self.cough_privacy_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.cough_privacy_btn.setToolTip(
+            "Talent Privacy & Cough Control: Hold down (or hold [B]) for momentary Cough Mute, "
+            "or click to toggle sending your microphone live to the Remote Producer"
+        )
+        self.cough_privacy_btn.pressed.connect(self._on_cough_privacy_pressed)
+        self.cough_privacy_btn.released.connect(self._on_cough_privacy_released)
+        controls_row.addWidget(self.cough_privacy_btn, stretch=2)
 
         deck_layout.addLayout(controls_row, stretch=1)
         self.main_layout.addWidget(self.deck_frame, stretch=3)
@@ -359,6 +405,7 @@ class MainWindow(QMainWindow):
         self.record_btn.setMinimumHeight(btn_min_h)
         self.pause_record_btn.setMinimumHeight(btn_min_h)
         self.talkback_btn.setMinimumHeight(btn_min_h)
+        self.cough_privacy_btn.setMinimumHeight(btn_min_h)
         self.vu_meter.apply_scale(self._scale)
         self.storage_monitor.apply_scale(self._scale)
 
@@ -422,6 +469,7 @@ class MainWindow(QMainWindow):
         else:
             self._active_output_device = play_map.get(settings.output_device)
 
+        self.audio_engine.set_talkback_output_device(self._active_output_device)
         self._refresh_transport_styles()
 
     def _refresh_transport_styles(self) -> None:
@@ -448,6 +496,50 @@ class MainWindow(QMainWindow):
         self.project_edit.setEnabled(not is_rec)
         self.project_osk_btn.setVisible(bool(settings.on_screen_keyboard))
         self.project_osk_btn.setEnabled(not is_rec)
+
+        # Remote Producer Top Bar Button state
+        if self.remote_producer_server.is_running:
+            p_count = self.remote_producer_server.connected_client_count
+            if self.audio_engine.remote_talkback_active:
+                self.remote_producer_btn.setText("⚡ Producer: TALKBACK")
+                self.remote_producer_btn.setStyleSheet(
+                    "background-color: #E36209; color: #FFFFFF; border: 2px solid #FFDF5D; font-weight: bold;"
+                )
+            elif p_count > 0:
+                self.remote_producer_btn.setText(f"● Producer: Connected ({p_count})")
+                self.remote_producer_btn.setStyleSheet(
+                    "background-color: #0F2D1E; color: #7EE787; border: 1px solid #2EA043; font-weight: bold;"
+                )
+            else:
+                self.remote_producer_btn.setText(f"◎ Producer: Ready (:{self.remote_producer_server.port})")
+                self.remote_producer_btn.setStyleSheet(
+                    "background-color: #161F2C; color: #79C0FF; border: 1px solid #388BFD; font-weight: bold;"
+                )
+        else:
+            self.remote_producer_btn.setText("◎ Remote Producer")
+            self.remote_producer_btn.setStyleSheet("")
+
+        # Talent Mic Privacy & Cough Button state on Studio Deck
+        cough_font_px = max(13, int(round(18 * self._scale)))
+        cough_radius = max(10, int(round(14 * self._scale)))
+        if self.audio_engine.talent_cough_muted:
+            self.cough_privacy_btn.setText("✕  COUGH MUTE ACTIVE\n(PRODUCER FEED MUTED)")
+            self.cough_privacy_btn.setStyleSheet(
+                f"QPushButton {{ background-color: #8E1523; color: #FFFFFF; border: 3px solid #FF6B7A; "
+                f"border-radius: {cough_radius}px; font-size: {cough_font_px}px; font-weight: bold; }}"
+            )
+        elif not self.audio_engine.talent_mic_send_enabled:
+            self.cough_privacy_btn.setText("○  MIC TO PRODUCER: OFF\n(PRIVACY MUTE — CLICK FOR ON)")
+            self.cough_privacy_btn.setStyleSheet(
+                f"QPushButton {{ background-color: #3D1114; color: #FFA198; border: 2px solid #F85149; "
+                f"border-radius: {cough_radius}px; font-size: {cough_font_px}px; font-weight: bold; }}"
+            )
+        else:
+            self.cough_privacy_btn.setText("◉  MIC TO PRODUCER: ON\n(HOLD [B] COUGH / CLICK MUTE)")
+            self.cough_privacy_btn.setStyleSheet(
+                f"QPushButton {{ background-color: #12261A; color: #7EE787; border: 2px solid #2EA043; "
+                f"border-radius: {cough_radius}px; font-size: {cough_font_px}px; font-weight: bold; }}"
+            )
 
         # Studio Deck Frame Border (high-visibility pulsing amber border when paused)
         if is_rec_paused:
@@ -578,10 +670,16 @@ class MainWindow(QMainWindow):
             freq_hz = f"{settings.talkback_tone_hz:g} Hz"
             self.talkback_banner.setVisible(True)
             if tb_active:
-                self.talkback_btn.setText("◉  TALKBACK ACTIVE\n(RECORDING RIGHT CH)")
-                self.talkback_banner.setText(
-                    f"⚡ TALKBACK ACTIVE — LEFT CH MUTED • {press_dur} TONE ({freq_hz}) + MIC ON RIGHT CH (RELEASE: {rel_dur}) ⚡"
-                )
+                if self.audio_engine.remote_talkback_active:
+                    self.talkback_btn.setText("⚡  REMOTE TALKBACK\n(PRODUCER + MIC ON R)")
+                    self.talkback_banner.setText(
+                        f"⚡ REMOTE PRODUCER TALKBACK ACTIVE — LEFT CH MUTED • {press_dur} TONE ({freq_hz}) + PRODUCER && LOCAL MIC ON RIGHT CH (MIX-MINUS) ⚡"
+                    )
+                else:
+                    self.talkback_btn.setText("◉  TALKBACK ACTIVE\n(RECORDING RIGHT CH)")
+                    self.talkback_banner.setText(
+                        f"⚡ TALKBACK ACTIVE — LEFT CH MUTED • {press_dur} TONE ({freq_hz}) + MIC ON RIGHT CH (RELEASE: {rel_dur}) ⚡"
+                    )
                 self.talkback_banner.setStyleSheet(
                     "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
                     "padding: 6px; border-radius: 6px; border: 2px solid #FFDF5D;"
@@ -595,6 +693,13 @@ class MainWindow(QMainWindow):
                     "background-color: #161B22; color: #58A6FF; font-weight: 600; "
                     "padding: 6px; border-radius: 6px; border: 1px solid #1F6FEB;"
                 )
+        elif self.audio_engine.remote_talkback_active:
+            self.talkback_banner.setVisible(True)
+            self.talkback_banner.setText("⚡ REMOTE PRODUCER TALKBACK ACTIVE — PROMPTING TALENT ⚡")
+            self.talkback_banner.setStyleSheet(
+                "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
+                "padding: 6px; border-radius: 6px; border: 2px solid #FFDF5D;"
+            )
         else:
             self.talkback_banner.setVisible(False)
 
@@ -703,6 +808,44 @@ class MainWindow(QMainWindow):
     def _on_talkback_released(self) -> None:
         self.audio_engine.set_talkback(False)
         self._refresh_transport_styles()
+
+    def _on_cough_privacy_pressed(self) -> None:
+        self._cough_btn_press_mono = time.monotonic()
+        self.audio_engine.set_talent_cough_muted(True)
+        self._refresh_transport_styles()
+
+    def _on_cough_privacy_released(self) -> None:
+        held_sec = time.monotonic() - self._cough_btn_press_mono
+        self.audio_engine.set_talent_cough_muted(False)
+        if held_sec < 0.25:
+            # Quick tap toggles persistent Mic Send (Privacy Mute)
+            next_state = not self.audio_engine.talent_mic_send_enabled
+            self.audio_engine.set_talent_mic_send_enabled(next_state)
+            self.config_manager.settings.remote_producer_send_talent_mic = next_state
+            self.config_manager.save(commit_lbu=True)
+        self._refresh_transport_styles()
+
+    def _build_remote_producer_extra_status(self) -> dict:
+        rec_path = self.audio_engine.current_recording_path
+        active_take = rec_path.name if rec_path is not None else (
+            self._project_recordings[0].filename if self._project_recordings else ""
+        )
+        return {
+            "project_name": self.config_manager.settings.project_name or "Session",
+            "take_count": len(self._project_recordings),
+            "active_take_name": active_take,
+        }
+
+    def _open_remote_producer_dialog(self) -> None:
+        dlg = RemoteProducerDialog(
+            remote_server=self.remote_producer_server,
+            audio_engine=self.audio_engine,
+            config_manager=self.config_manager,
+            parent=self,
+        )
+        dlg.exec()
+        self._refresh_transport_styles()
+        self.setFocus()
 
     def _on_toggle_studio_mode(self) -> None:
         if self.audio_engine.is_recording:
@@ -888,6 +1031,20 @@ class MainWindow(QMainWindow):
             is_paused=is_rec_paused,
         )
 
+        # Detect asynchronous changes from Remote Producer (talkback or client connection)
+        tb_now = self.audio_engine.talkback_active
+        rem_tb_now = self.audio_engine.remote_talkback_active
+        prod_count_now = self.remote_producer_server.connected_client_count
+        if (
+            tb_now != self._last_observed_tb_active
+            or rem_tb_now != self._last_observed_remote_tb
+            or prod_count_now != self._last_observed_producer_count
+        ):
+            self._last_observed_tb_active = tb_now
+            self._last_observed_remote_tb = rem_tb_now
+            self._last_observed_producer_count = prod_count_now
+            self._refresh_transport_styles()
+
         now_mono = time.monotonic()
         if is_rec:
             elapsed = self.audio_engine.elapsed_seconds
@@ -947,6 +1104,13 @@ class MainWindow(QMainWindow):
                 self._on_talkback_pressed()
             return
 
+        # Momentary Cough / Privacy Mute Hotkey [B]
+        if key == Qt.Key.Key_B:
+            if not event.isAutoRepeat() and not self._cough_key_held:
+                self._cough_key_held = True
+                self._on_cough_privacy_pressed()
+            return
+
         if event.isAutoRepeat():
             return
 
@@ -979,6 +1143,9 @@ class MainWindow(QMainWindow):
         ):
             self._open_settings_dialog()
             return
+        if key == Qt.Key.Key_F3:
+            self._open_remote_producer_dialog()
+            return
         if key == Qt.Key.Key_F5:
             self._on_manual_refresh()
             return
@@ -1003,9 +1170,15 @@ class MainWindow(QMainWindow):
                 self._talkback_key_held = False
                 self._on_talkback_released()
             return
+        if event.key() == Qt.Key.Key_B and not event.isAutoRepeat():
+            if self._cough_key_held:
+                self._cough_key_held = False
+                self._on_cough_privacy_released()
+            return
         super().keyReleaseEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.remote_producer_server.stop()
         self.audio_engine.stop_monitoring()
         self.audio_engine.stop_recording()
         self.audio_engine.stop_playback()

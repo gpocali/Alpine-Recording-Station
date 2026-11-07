@@ -95,6 +95,11 @@ class RecorderSettings:
     talkback_tone_hz: float = 1000.0
     talkback_tone_duration_sec: float = 1.0
     talkback_release_tone_duration_sec: float = 0.5
+    remote_producer_enabled: bool = False
+    remote_producer_port: int = 8443
+    remote_producer_send_talent_mic: bool = True
+    ssl_cert_path: str = ""
+    ssl_key_path: str = ""
     storage_dir: str = DEFAULT_STORAGE_DIR
     known_device_defaults: dict = field(default_factory=dict)
 
