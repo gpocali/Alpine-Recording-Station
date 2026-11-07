@@ -579,7 +579,7 @@ class MainWindow(QMainWindow):
         controls_row = QHBoxLayout()
         controls_row.setSpacing(16)
 
-        self.record_btn = QPushButton("Record")
+        self.record_btn = QPushButton("●  Record")
         self.record_btn.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
@@ -589,7 +589,7 @@ class MainWindow(QMainWindow):
         self.record_btn.clicked.connect(self._on_record_button_clicked)
         controls_row.addWidget(self.record_btn, stretch=3)
 
-        self.pause_record_btn = QPushButton("Pause")
+        self.pause_record_btn = QPushButton("❚❚  Pause")
         self.pause_record_btn.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
@@ -599,7 +599,7 @@ class MainWindow(QMainWindow):
         self.pause_record_btn.clicked.connect(self._on_pause_record_button_clicked)
         controls_row.addWidget(self.pause_record_btn, stretch=2)
 
-        self.talkback_btn = QPushButton("Talkback")
+        self.talkback_btn = QPushButton("◉  Talkback")
         self.talkback_btn.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
@@ -610,7 +610,7 @@ class MainWindow(QMainWindow):
         self.talkback_btn.released.connect(self._on_talkback_released)
         controls_row.addWidget(self.talkback_btn, stretch=2)
 
-        self.cough_privacy_btn = QPushButton("Cough")
+        self.cough_privacy_btn = QPushButton("◉  Cough")
         self.cough_privacy_btn.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
@@ -852,7 +852,7 @@ class MainWindow(QMainWindow):
             or not self.audio_engine.talent_mic_send_enabled
         )
         if is_mute_active:
-            self.cough_privacy_btn.setText("Muted")
+            self.cough_privacy_btn.setText("✕  Muted")
             if blink_on:
                 bg_col = "#D72638"
                 fg_col = "#FFFFFF"
@@ -867,7 +867,7 @@ class MainWindow(QMainWindow):
                 f"font-size: {cough_font_px}px; font-weight: bold; }}"
             )
         else:
-            self.cough_privacy_btn.setText("Cough")
+            self.cough_privacy_btn.setText("◉  Cough")
             self.cough_privacy_btn.setStyleSheet(
                 f"QPushButton {{ background-color: #12261A; color: #7EE787; border: 3px solid #2EA043; "
                 f"border-radius: {cough_radius}px; padding: {cough_pad_v}px {cough_pad_h}px; "
@@ -917,13 +917,13 @@ class MainWindow(QMainWindow):
         # Record / Recording & Pause / Paused Button States
         if is_rec:
             self.record_btn.setEnabled(True)
-            self.record_btn.setText("Recording")
+            self.record_btn.setText("■  Recording")
             self.record_btn.setStyleSheet(
                 build_record_button_style("recording", self._scale)
             )
             self.pause_record_btn.setEnabled(True)
             if is_rec_paused:
-                self.pause_record_btn.setText("Paused")
+                self.pause_record_btn.setText("▶  Paused")
                 self.pause_record_btn.setStyleSheet(
                     build_pause_record_button_style(
                         "paused", self._scale, blink_on=blink_on
@@ -932,31 +932,31 @@ class MainWindow(QMainWindow):
                 timer_col = "#FFDF5D" if blink_on else "#D29922"
                 self.timer_label.setStyleSheet(f"color: {timer_col}; font-weight: bold;")
             else:
-                self.pause_record_btn.setText("Pause")
+                self.pause_record_btn.setText("❚❚  Pause")
                 self.pause_record_btn.setStyleSheet(
                     build_pause_record_button_style("active", self._scale)
                 )
                 self.timer_label.setStyleSheet("color: #FF6B7A; font-weight: bold;")
         elif dev is not None:
             self.record_btn.setEnabled(True)
-            self.record_btn.setText("Record")
+            self.record_btn.setText("●  Record")
             self.record_btn.setStyleSheet(
                 build_record_button_style("ready", self._scale)
             )
             self.pause_record_btn.setEnabled(False)
-            self.pause_record_btn.setText("Pause")
+            self.pause_record_btn.setText("❚❚  Pause")
             self.pause_record_btn.setStyleSheet(
                 build_pause_record_button_style("disabled", self._scale)
             )
             self.timer_label.setStyleSheet("color: #F0F6FC; font-weight: bold;")
         else:
             self.record_btn.setEnabled(False)
-            self.record_btn.setText("Record")
+            self.record_btn.setText("●  Record")
             self.record_btn.setStyleSheet(
                 build_record_button_style("disabled", self._scale)
             )
             self.pause_record_btn.setEnabled(False)
-            self.pause_record_btn.setText("Pause")
+            self.pause_record_btn.setText("❚❚  Pause")
             self.pause_record_btn.setStyleSheet(
                 build_pause_record_button_style("disabled", self._scale)
             )
@@ -969,7 +969,7 @@ class MainWindow(QMainWindow):
         )
         self.talkback_btn.setVisible(bool(settings.studio_mode))
         self.talkback_btn.setEnabled(tb_enabled)
-        self.talkback_btn.setText("Talkback")
+        self.talkback_btn.setText("⚡  Talkback" if tb_active else "◉  Talkback")
         self.talkback_btn.setStyleSheet(
             build_talkback_button_style(tb_active, tb_enabled, self._scale)
         )
