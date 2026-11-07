@@ -1103,7 +1103,12 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                     self.assertTrue(login_data["ok"])
                     auth_token = login_data["auth_token"]
 
-                # 3. Authenticated /api/status succeeds
+                # 3. Authenticated /api/status succeeds & Studio Mode VU channels report dBFS
+                engine._update_meter_from_block(np.full((480, 1), 0.25, dtype=np.float64))
+                snap_idle = server.build_status_snapshot()
+                self.assertAlmostEqual(snap_idle["vu"]["channel_peaks"][0], -12.0, delta=0.5)
+                self.assertEqual(snap_idle["vu"]["channel_peaks"][1], -60.0)
+
                 status_req = urllib.request.Request(
                     f"https://127.0.0.1:{port}/api/status",
                     headers={"Authorization": f"Bearer {auth_token}"},

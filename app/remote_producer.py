@@ -40,7 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from app.audio_engine import AudioEngine, resample_mono_signal
+from app.audio_engine import AudioEngine, linear_to_dbfs, resample_mono_signal
 from app.config_manager import ConfigManager
 from app.network_info import get_lan_ip_addresses
 from app.qr_code import encode_qr_matrix, qr_matrix_to_svg
@@ -123,8 +123,8 @@ class WebSocketConnection:
         self.connected_at = time.time()
         self.send_lock = threading.Lock()
         self.closed = False
-        # Producer client mic & talkback state
-        self.mic_send_enabled = False  # Off by default so producer mic is not hot
+        # Producer client talkback & monitor state (producer mic is push-to-talk via Talkback)
+        self.mic_send_enabled = True
         self.cough_muted = False
         self.talkback_active = False
         self.listen_enabled = True
@@ -279,6 +279,7 @@ class RemoteProducerServer:
         self._clients_lock = threading.Lock()
         self._clients: Dict[str, WebSocketConnection] = {}
         self._cert_info: Optional[CertificateInfo] = None
+        self._tb_peak_hold_db: float = -60.0
 
     @property
     def is_running(self) -> bool:
@@ -321,7 +322,7 @@ class RemoteProducerServer:
     def get_qr_svg(self, include_invite_token: bool = True, host_override: Optional[str] = None) -> str:
         url = self.get_session_url(include_invite_token=include_invite_token, host_override=host_override)
         matrix = encode_qr_matrix(url)
-        return qr_matrix_to_svg(matrix, border=3)
+        return qr_matrix_to_svg(matrix, border=4, dark_color="#000000")
 
     def get_qr_matrix(self, include_invite_token: bool = True, host_override: Optional[str] = None) -> List[List[bool]]:
         url = self.get_session_url(include_invite_token=include_invite_token, host_override=host_override)
@@ -516,6 +517,75 @@ class RemoteProducerServer:
             storage_rem = str(extra.get("storage_remaining", "--"))
             storage_lvl = str(extra.get("storage_level", "ok"))
 
+        talent_live = bool(self.audio_engine.is_talent_mic_live_to_producer)
+        tb_active = bool(self.audio_engine.talkback_active)
+        local_tb = bool(self.audio_engine.local_talkback_active)
+
+        if not vu.active or vu.peak_hold_level <= 1e-5:
+            self._tb_peak_hold_db = -60.0
+
+        if settings.studio_mode:
+            # Channel 0: VO (L) — Talent VO Track (muted during Talkback or when Talent Mic is muted/cough-muted)
+            if not tb_active and talent_live:
+                vo_peak_db = round(float(linear_to_dbfs(vu.peak_level)), 1)
+                vo_rms_db = round(float(linear_to_dbfs(vu.rms_level)), 1)
+            else:
+                vo_peak_db = -60.0
+                vo_rms_db = -60.0
+            vo_hold_db = (
+                round(float(linear_to_dbfs(vu.peak_hold_level)), 1)
+                if talent_live
+                else -60.0
+            )
+
+            # Channel 1: TB (R) — Talkback Track (only active while Talkback is engaged)
+            if tb_active:
+                rem_peak, rem_rms = self.audio_engine.get_remote_talkback_levels()
+                loc_peak = vu.peak_level if (local_tb or talent_live) else 0.0
+                loc_rms = vu.rms_level if (local_tb or talent_live) else 0.0
+                tb_peak_lin = min(1.0, loc_peak + rem_peak)
+                tb_rms_lin = min(1.0, math.sqrt(loc_rms * loc_rms + rem_rms * rem_rms))
+                tb_peak_db = round(float(linear_to_dbfs(tb_peak_lin)), 1)
+                tb_rms_db = round(float(linear_to_dbfs(tb_rms_lin)), 1)
+                if tb_peak_db > self._tb_peak_hold_db:
+                    self._tb_peak_hold_db = tb_peak_db
+            else:
+                tb_peak_db = -60.0
+                tb_rms_db = -60.0
+            tb_hold_db = round(float(self._tb_peak_hold_db), 1)
+
+            ch_peaks_db = [vo_peak_db, tb_peak_db]
+            ch_rms_db = [vo_rms_db, tb_rms_db]
+            ch_holds_db = [vo_hold_db, tb_hold_db]
+            overall_peak_db = tb_peak_db if tb_active else vo_peak_db
+            overall_rms_db = tb_rms_db if tb_active else vo_rms_db
+            overall_hold_db = max(vo_hold_db, tb_hold_db)
+        else:
+            eff_ch = max(1, min(2, int(settings.effective_channels)))
+            if talent_live:
+                raw_peaks = list(vu.channel_peaks[:eff_ch]) if vu.channel_peaks else [vu.peak_level]
+                raw_rms = list(vu.channel_rms[:eff_ch]) if vu.channel_rms else [vu.rms_level]
+                raw_holds = list(vu.channel_peak_holds[:eff_ch]) if vu.channel_peak_holds else [vu.peak_hold_level]
+                while len(raw_peaks) < eff_ch:
+                    raw_peaks.append(raw_peaks[0] if raw_peaks else 0.0)
+                while len(raw_rms) < eff_ch:
+                    raw_rms.append(raw_rms[0] if raw_rms else 0.0)
+                while len(raw_holds) < eff_ch:
+                    raw_holds.append(raw_holds[0] if raw_holds else 0.0)
+                ch_peaks_db = [round(float(linear_to_dbfs(x)), 1) for x in raw_peaks]
+                ch_rms_db = [round(float(linear_to_dbfs(x)), 1) for x in raw_rms]
+                ch_holds_db = [round(float(linear_to_dbfs(x)), 1) for x in raw_holds]
+                overall_peak_db = round(float(vu.peak_db), 1)
+                overall_rms_db = round(float(vu.rms_db), 1)
+                overall_hold_db = round(float(vu.peak_hold_db), 1)
+            else:
+                ch_peaks_db = [-60.0] * eff_ch
+                ch_rms_db = [-60.0] * eff_ch
+                ch_holds_db = [-60.0] * eff_ch
+                overall_peak_db = -60.0
+                overall_rms_db = -60.0
+                overall_hold_db = -60.0
+
         return {
             "type": "state",
             "session_id": self.session.session_id,
@@ -528,10 +598,10 @@ class RemoteProducerServer:
             "sample_rate": int(settings.sample_rate),
             "bit_depth": int(settings.bit_depth),
             "channels": int(settings.effective_channels),
-            "talkback_active": bool(self.audio_engine.talkback_active),
+            "talkback_active": tb_active,
             "remote_talkback_active": bool(self.audio_engine.remote_talkback_active),
-            "local_talkback_active": bool(self.audio_engine.local_talkback_active),
-            "talent_mic_live": bool(self.audio_engine.is_talent_mic_live_to_producer),
+            "local_talkback_active": local_tb,
+            "talent_mic_live": talent_live,
             "talent_mic_send_enabled": bool(self.audio_engine.talent_mic_send_enabled),
             "talent_cough_muted": bool(self.audio_engine.talent_cough_muted),
             "connected_producers": int(self.connected_client_count),
@@ -540,13 +610,13 @@ class RemoteProducerServer:
             "storage_remaining": storage_rem,
             "storage_level": storage_lvl,
             "vu": {
-                "rms_db": round(float(vu.rms_db), 1),
-                "peak_db": round(float(vu.peak_db), 1),
-                "peak_hold_db": round(float(vu.peak_hold_db), 1),
-                "clipped": bool(vu.clipped),
-                "channel_peaks": [round(float(x), 1) for x in (vu.channel_peaks or (vu.peak_db,))],
-                "channel_rms": [round(float(x), 1) for x in (vu.channel_rms or (vu.rms_db,))],
-                "channel_peak_holds": [round(float(x), 1) for x in (vu.channel_peak_holds or (vu.peak_hold_db,))],
+                "rms_db": overall_rms_db,
+                "peak_db": overall_peak_db,
+                "peak_hold_db": overall_hold_db,
+                "clipped": bool(vu.clipped and talent_live),
+                "channel_peaks": ch_peaks_db,
+                "channel_rms": ch_rms_db,
+                "channel_peak_holds": ch_holds_db,
             },
         }
 
@@ -1303,46 +1373,15 @@ input[type="range"].brand-slider {{
     background: linear-gradient(to right, var(--brand-color) var(--progress), #30363D var(--progress));
   }}
 }}
-/* Privacy / Cough & Talkback Buttons */
-.btn-mic-gate {{
-  width: 100%;
-  padding: 12px 14px;
-  border-radius: 8px;
-  font-size: 13px;
-  font-weight: 700;
-  cursor: pointer;
-  border: 2px solid #30363D;
-  background: #21262D;
-  color: #C9D1D9;
-  transition: all 0.12s ease;
-}}
-.btn-mic-gate.armed {{
-  background: #0F2D1E;
-  border-color: #2EA043;
-  color: #7EE787;
-}}
-.btn-cough {{
-  width: 100%;
-  margin-top: 10px;
-  padding: 11px 14px;
-  border-radius: 8px;
-  font-size: 13px;
-  font-weight: 700;
-  cursor: pointer;
-  border: 2px solid #388BFD;
-  background: #161F2C;
-  color: #79C0FF;
-  user-select: none;
-  touch-action: none;
-}}
-.btn-cough.cough-active {{
-  background: #3D1114;
-  border-color: #F85149;
-  color: #FFA198;
-}}
+/* Talkback Button */
 .btn-talkback {{
   width: 100%;
-  padding: 20px 18px;
+  min-height: 64px;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 18px;
   border-radius: 10px;
   font-size: 16px;
   font-weight: 700;
@@ -1353,7 +1392,7 @@ input[type="range"].brand-slider {{
   color: #F2CC60;
   user-select: none;
   touch-action: none;
-  transition: all 0.1s ease;
+  transition: background-color 0.1s ease, border-color 0.1s ease, color 0.1s ease;
 }}
 .btn-talkback:disabled {{
   background: #161B22;
@@ -1376,9 +1415,26 @@ input[type="range"].brand-slider {{
   font-size: 12px;
   color: var(--text-secondary);
 }}
+@keyframes muteFlashRed {{
+  0%, 49% {{
+    background-color: #D72638;
+    color: #FFFFFF;
+    border-color: #FF7B72;
+  }}
+  50%, 100% {{
+    background-color: #490B11;
+    color: #FFA198;
+    border-color: #D72638;
+  }}
+}}
 .pill-muted {{
-  color: #FFA198;
+  color: #FFFFFF;
+  background-color: #D72638;
+  border: 1px solid #FF7B72;
+  border-radius: 5px;
+  padding: 2px 8px;
   font-weight: 700;
+  animation: muteFlashRed 0.8s steps(1, end) infinite;
 }}
 .pill-live {{
   color: #7EE787;
@@ -1497,33 +1553,23 @@ input[type="range"].brand-slider {{
         </div>
       </div>
 
-      <!-- Producer Mic Privacy & Cough Switch Card -->
+      <!-- Momentary Talkback Prompt Card -->
       <div class="card">
         <div class="card-header">
-          <span class="card-title">2. PRODUCER MIC PRIVACY &amp; COUGH GATE</span>
-          <span class="badge" id="mic-privacy-badge">MIC LOCKED (PRIVATE)</span>
+          <span class="card-title">2. DIRECT TALENT — STUDIO TALKBACK</span>
+          <span class="badge badge-conn-ok" id="talkback-mode-badge">PUSH-TO-TALK</span>
         </div>
-        <button type="button" class="btn-mic-gate" id="btn-mic-arm" aria-pressed="false">
-          ○ Send Producer Mic: OFF (Private — Click to Arm)
+        <button type="button" class="btn-talkback" id="btn-talkback">
+          ◉ TALKBACK — HOLD TO PROMPT TALENT [Hold T or Space]
         </button>
-        <button type="button" class="btn-cough" id="btn-cough" disabled>
-          Hold to Cough / Privacy Mute [Hold C or Click M]
-        </button>
+        <div style="margin-top:8px; font-size:12px; color:#8B949E;" id="talkback-hint">
+          Hold Talkback button or [T] / [Space] to speak to the talent
+        </div>
       </div>
     </div>
 
-    <!-- Momentary Talkback Prompt Deck -->
-    <div class="card" style="margin-top:14px;">
-      <div class="card-header">
-        <span class="card-title">3. DIRECT TALENT — STUDIO TALKBACK</span>
-        <span style="font-size:12px; color:#8B949E;" id="talkback-hint">
-          Arm "Send Producer Mic" above to enable Talkback
-        </span>
-      </div>
-      <button type="button" class="btn-talkback" id="btn-talkback" disabled>
-        ◉ TALKBACK — HOLD TO PROMPT TALENT [Hold T or Space]
-      </button>
-      <div class="status-Strip" style="margin-top:10px;">
+    <div class="card" style="margin-top:14px; padding:12px 18px;">
+      <div class="status-Strip">
         <span>Mix-Minus Active: You hear the Talent Mic; Talent headphones hear your Talkback. In Studio Mode, Track R mixes Producer + Talent Mic with marker tones while Track L (VO) is muted.</span>
         <span id="rtt-readout">Link Latency: -- ms</span>
       </div>
@@ -1548,12 +1594,10 @@ input[type="range"].brand-slider {{
   let listenEnabled = true;
   let monitorVolume = 1.0;
 
-  // Producer Mic capture (Producer -> Talent Talkback)
+  // Producer Mic capture (Producer -> Talent Talkback, push-to-talk only)
   let micStream = null;
   let micSourceNode = null;
   let micProcessorNode = null;
-  let micSendEnabled = false; // Default OFF for producer privacy
-  let coughMuted = false;
   let talkbackPressed = false;
 
   // Latest VU state
@@ -1595,9 +1639,6 @@ input[type="range"].brand-slider {{
   const sliderVolume = document.getElementById("monitor-volume");
   const lblVolume = document.getElementById("monitor-volume-val");
 
-  const btnMicArm = document.getElementById("btn-mic-arm");
-  const micPrivacyBadge = document.getElementById("mic-privacy-badge");
-  const btnCough = document.getElementById("btn-cough");
   const btnTalkback = document.getElementById("btn-talkback");
   const talkbackHint = document.getElementById("talkback-hint");
   const rttReadout = document.getElementById("rtt-readout");
@@ -1714,7 +1755,7 @@ input[type="range"].brand-slider {{
     }}
   }});
 
-  // Mic Privacy Gate & Cough Controls
+  // Push-to-Talk Talkback Capture (Producer -> Talent)
   async function ensureMicCapture() {{
     ensureAudioContext();
     if (micStream) {{
@@ -1737,7 +1778,7 @@ input[type="range"].brand-slider {{
       micSourceNode = audioCtx.createMediaStreamSource(micStream);
       micProcessorNode = audioCtx.createScriptProcessor(1024, 1, 1);
       micProcessorNode.onaudioprocess = function(ev) {{
-        if (!micSendEnabled || coughMuted || !talkbackPressed) {{
+        if (!talkbackPressed) {{
           return;
         }}
         if (!ws || ws.readyState !== WebSocket.OPEN) {{
@@ -1769,8 +1810,6 @@ input[type="range"].brand-slider {{
 
   function stopMicCapture() {{
     talkbackPressed = false;
-    micSendEnabled = false;
-    coughMuted = false;
     if (micProcessorNode) {{
       try {{ micProcessorNode.disconnect(); }} catch (_e) {{}}
       micProcessorNode = null;
@@ -1787,115 +1826,44 @@ input[type="range"].brand-slider {{
   }}
 
   function refreshMicAndTalkbackUi() {{
-    const effectivelyLive = micSendEnabled && !coughMuted;
-    btnMicArm.setAttribute("aria-pressed", micSendEnabled ? "true" : "false");
-    if (micSendEnabled) {{
-      btnMicArm.className = "btn-mic-gate armed";
-      btnMicArm.textContent = "◉ Send Producer Mic: ARMED (Click to Lock for Privacy)";
-      btnCough.disabled = false;
-    }} else {{
-      btnMicArm.className = "btn-mic-gate";
-      btnMicArm.textContent = "○ Send Producer Mic: OFF (Private — Click to Arm)";
-      btnCough.disabled = true;
-    }}
-
-    if (!micSendEnabled) {{
-      micPrivacyBadge.textContent = "MIC LOCKED (PRIVATE)";
-      micPrivacyBadge.className = "badge";
-      btnTalkback.disabled = true;
-      talkbackHint.textContent = "Arm 'Send Producer Mic' above to enable Talkback";
-    }} else if (coughMuted) {{
-      micPrivacyBadge.textContent = "COUGH MUTED";
-      micPrivacyBadge.className = "badge badge-conn-warn";
-      btnCough.className = "btn-cough cough-active";
-      btnCough.textContent = "✕ COUGH MUTE ACTIVE — Release or Click [M] to Unmute";
-      btnTalkback.disabled = true;
-      talkbackHint.textContent = "Producer Mic is cough-muted";
-    }} else {{
-      micPrivacyBadge.textContent = "MIC ARMED (PUSH-TO-TALK)";
-      micPrivacyBadge.className = "badge badge-conn-ok";
-      btnCough.className = "btn-cough";
-      btnCough.textContent = "Hold to Cough / Privacy Mute [Hold C or Press M]";
-      btnTalkback.disabled = false;
-      talkbackHint.textContent = talkbackPressed
-        ? "⚡ TRANSMITTING TO TALENT & TALKBACK TRACK"
-        : "Ready — Hold Talkback button or [T] / [Space] to prompt talent";
-    }}
-
-    if (talkbackPressed && effectivelyLive) {{
+    if (talkbackPressed) {{
       btnTalkback.className = "btn-talkback talkback-live";
       btnTalkback.textContent = "⚡ TALKBACK ON AIR — PROMPTING TALENT (RELEASE TO END)";
+      talkbackHint.textContent = "⚡ Transmitting to Talent Headphones & Studio Talkback Track (R)";
     }} else {{
       btnTalkback.className = "btn-talkback";
       btnTalkback.textContent = "◉ TALKBACK — HOLD TO PROMPT TALENT [Hold T or Space]";
+      talkbackHint.textContent = "Hold Talkback button or [T] / [Space] to speak to the talent";
     }}
   }}
 
-  btnMicArm.addEventListener("click", async function() {{
-    if (!micSendEnabled) {{
+  async function setTalkbackActive(active) {{
+    if (active) {{
       const ok = await ensureMicCapture();
       if (!ok) {{
+        talkbackPressed = false;
+        refreshMicAndTalkbackUi();
         return;
       }}
-      micSendEnabled = true;
-      coughMuted = false;
+      if (talkbackPressed) {{
+        return;
+      }}
+      talkbackPressed = true;
+      sendJson({{ type: "talkback", active: true }});
+      refreshMicAndTalkbackUi();
     }} else {{
-      setTalkbackActive(false);
-      stopMicCapture();
+      if (!talkbackPressed) {{
+        return;
+      }}
+      talkbackPressed = false;
+      sendJson({{ type: "talkback", active: false }});
+      refreshMicAndTalkbackUi();
     }}
-    sendJson({{
-      type: "mic_state",
-      send_enabled: micSendEnabled,
-      cough_muted: coughMuted
-    }});
-    refreshMicAndTalkbackUi();
-  }});
-
-  function setCoughMuted(active) {{
-    if (!micSendEnabled) {{
-      return;
-    }}
-    coughMuted = Boolean(active);
-    if (coughMuted && talkbackPressed) {{
-      setTalkbackActive(false);
-    }}
-    sendJson({{
-      type: "mic_state",
-      send_enabled: micSendEnabled,
-      cough_muted: coughMuted
-    }});
-    refreshMicAndTalkbackUi();
-  }}
-
-  btnCough.addEventListener("pointerdown", function(ev) {{
-    ev.preventDefault();
-    setCoughMuted(true);
-  }});
-  btnCough.addEventListener("pointerup", function(ev) {{
-    ev.preventDefault();
-    setCoughMuted(false);
-  }});
-  btnCough.addEventListener("pointerleave", function() {{
-    if (coughMuted) {{
-      setCoughMuted(false);
-    }}
-  }});
-
-  function setTalkbackActive(active) {{
-    const next = Boolean(active && micSendEnabled && !coughMuted);
-    if (talkbackPressed === next) {{
-      return;
-    }}
-    talkbackPressed = next;
-    sendJson({{ type: "talkback", active: talkbackPressed }});
-    refreshMicAndTalkbackUi();
   }}
 
   btnTalkback.addEventListener("pointerdown", function(ev) {{
     ev.preventDefault();
-    if (!btnTalkback.disabled) {{
-      setTalkbackActive(true);
-    }}
+    setTalkbackActive(true);
   }});
   btnTalkback.addEventListener("pointerup", function(ev) {{
     ev.preventDefault();
@@ -1910,23 +1878,15 @@ input[type="range"].brand-slider {{
     }}
   }});
 
-  // Keyboard shortcuts: [T] or [Space] for momentary Talkback, [C] momentary cough, [M] toggle cough
+  // Keyboard shortcuts: [T] or [Space] for momentary Talkback
   window.addEventListener("keydown", function(ev) {{
     if (!isAuthenticated) return;
     const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : "";
     if (tag === "input" || tag === "textarea") return;
 
     if ((ev.code === "KeyT" || ev.code === "Space") && !ev.repeat) {{
-      if (micSendEnabled && !coughMuted) {{
-        ev.preventDefault();
-        setTalkbackActive(true);
-      }}
-    }} else if (ev.code === "KeyC" && !ev.repeat) {{
       ev.preventDefault();
-      setCoughMuted(true);
-    }} else if (ev.code === "KeyM" && !ev.repeat) {{
-      ev.preventDefault();
-      setCoughMuted(!coughMuted);
+      setTalkbackActive(true);
     }}
   }});
 
@@ -1934,8 +1894,6 @@ input[type="range"].brand-slider {{
     if (!isAuthenticated) return;
     if (ev.code === "KeyT" || ev.code === "Space") {{
       setTalkbackActive(false);
-    }} else if (ev.code === "KeyC") {{
-      setCoughMuted(false);
     }}
   }});
 
@@ -1960,8 +1918,8 @@ input[type="range"].brand-slider {{
       hdrConn.className = "badge badge-conn-ok";
       sendJson({{
         type: "mic_state",
-        send_enabled: micSendEnabled,
-        cough_muted: coughMuted
+        send_enabled: true,
+        cough_muted: false
       }});
       sendJson({{ type: "listen_state", enabled: listenEnabled }});
 
@@ -2067,8 +2025,11 @@ input[type="range"].brand-slider {{
     if (msg.talent_mic_live) {{
       talentFeedBadge.textContent = "◉ Talent Mic Feed: LIVE";
       talentFeedBadge.className = "pill-live";
+    }} else if (msg.talent_cough_muted) {{
+      talentFeedBadge.textContent = "✕ Talent Mic Feed: COUGH MUTE ACTIVE";
+      talentFeedBadge.className = "pill-muted";
     }} else {{
-      talentFeedBadge.textContent = "○ Talent Mic Feed: MUTED FOR PRIVACY / COUGH";
+      talentFeedBadge.textContent = "○ Talent Mic Feed: MUTED FOR PRIVACY";
       talentFeedBadge.className = "pill-muted";
     }}
 
@@ -2120,7 +2081,9 @@ input[type="range"].brand-slider {{
 
   // 60-Segment LED VU & Peak Hold Canvas Renderer (Matching Talent UI)
   function dbToNorm(db) {{
-    const clamped = Math.max(-60.0, Math.min(0.0, Number(db) || -60.0));
+    const num = Number(db);
+    const validDb = Number.isFinite(num) ? num : -60.0;
+    const clamped = Math.max(-60.0, Math.min(0.0, validDb));
     return (clamped + 60.0) / 60.0;
   }}
 
@@ -2132,9 +2095,9 @@ input[type="range"].brand-slider {{
     ctx.fillRect(0, 0, w, h);
 
     const labels = latestStudioMode ? ["VO (L)", "TB (R)"] : (latestChannels >= 2 ? ["CH 1", "CH 2"] : ["MONO"]);
-    const peaks = latestVu.channel_peaks || [latestVu.peak_db];
-    const rmsList = latestVu.channel_rms || [latestVu.rms_db];
-    const holds = latestVu.channel_peak_holds || [latestVu.peak_hold_db];
+    const peaks = Array.isArray(latestVu.channel_peaks) ? latestVu.channel_peaks : [-60.0, -60.0];
+    const rmsList = Array.isArray(latestVu.channel_rms) ? latestVu.channel_rms : [-60.0, -60.0];
+    const holds = Array.isArray(latestVu.channel_peak_holds) ? latestVu.channel_peak_holds : [-60.0, -60.0];
 
     const leftPad = 64;
     const rightPad = 24;
@@ -2151,36 +2114,45 @@ input[type="range"].brand-slider {{
       ctx.font = "bold 12px monospace";
       ctx.fillText(labels[chIdx], 10, rowY + rowH - 6);
 
-      const peakNorm = dbToNorm(peaks[chIdx] !== undefined ? peaks[chIdx] : latestVu.peak_db);
-      const rmsNorm = dbToNorm(rmsList[chIdx] !== undefined ? rmsList[chIdx] : latestVu.rms_db);
-      const holdNorm = dbToNorm(holds[chIdx] !== undefined ? holds[chIdx] : latestVu.peak_hold_db);
+      const chPeakDb = peaks[chIdx] !== undefined ? peaks[chIdx] : -60.0;
+      const chRmsDb = rmsList[chIdx] !== undefined ? rmsList[chIdx] : -60.0;
+      const chHoldDb = holds[chIdx] !== undefined ? holds[chIdx] : -60.0;
+
+      const peakNorm = dbToNorm(chPeakDb);
+      const rmsNorm = dbToNorm(chRmsDb);
+      const holdNorm = dbToNorm(chHoldDb);
 
       const activePeakSegs = Math.round(peakNorm * numSegments);
       const activeRmsSegs = Math.round(rmsNorm * numSegments);
       const holdSeg = Math.min(numSegments - 1, Math.round(holdNorm * (numSegments - 1)));
 
       for (let s = 0; s < numSegments; s++) {{
-        const segDb = -60.0 + (s / numSegments) * 60.0;
-        let onColor = "#2EA043";
-        let dimColor = "#12261A";
+        const segDb = -60.0 + ((s + 1) / numSegments) * 60.0;
+        let rmsColor = "#3FB950";
+        let peakColor = "#2EA043";
+        let dimColor = "#112618";
         if (segDb >= -6.0) {{
-          onColor = "#F85149";
+          rmsColor = "#FF4444";
+          peakColor = "#F85149";
           dimColor = "#2D1215";
         }} else if (segDb >= -18.0) {{
-          onColor = "#D29922";
-          dimColor = "#2B2111";
+          rmsColor = "#F0B72F";
+          peakColor = "#D29922";
+          dimColor = "#2B2311";
         }}
 
         const x = leftPad + s * (segW + segGap);
-        if (s < activeRmsSegs || s < activePeakSegs) {{
-          ctx.fillStyle = onColor;
+        if (s < activeRmsSegs) {{
+          ctx.fillStyle = rmsColor;
+        }} else if (s < activePeakSegs) {{
+          ctx.fillStyle = peakColor;
         }} else {{
           ctx.fillStyle = dimColor;
         }}
         ctx.fillRect(x, rowY, segW, rowH);
 
-        if (s === holdSeg && holdNorm > 0.02) {{
-          ctx.fillStyle = "#F0F6FC";
+        if (s === holdSeg && holdNorm > 0.005) {{
+          ctx.fillStyle = chHoldDb >= -3.0 ? "#FF5555" : (chHoldDb >= -18.0 ? "#FFDF5D" : "#58A6FF");
           ctx.fillRect(x, rowY, Math.max(2, segW), rowH);
         }}
       }}

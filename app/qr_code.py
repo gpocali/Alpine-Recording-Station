@@ -113,21 +113,21 @@ def _place_alignment_pattern(
 def _write_format_bits(
     matrix: List[List[bool]], reserved: List[List[bool]], mask: int
 ) -> None:
-    """Place 15-bit format info for ECC Level L (binary 01) and given mask."""
+    """Place 15-bit format info for ECC Level L (binary 01) and given mask (MSB bit 14 to LSB bit 0)."""
     size = len(matrix)
     fmt = _bch_format_bits(0b01, mask)
 
-    # Around top-left finder
+    # Around top-left finder: ordered from Format Bit 14 (MSB) down to Format Bit 0 (LSB)
     coords_tl = [
         (8, 0), (8, 1), (8, 2), (8, 3), (8, 4), (8, 5), (8, 7), (8, 8),
         (7, 8), (5, 8), (4, 8), (3, 8), (2, 8), (1, 8), (0, 8),
     ]
     for i, (r, c) in enumerate(coords_tl):
-        bit = bool((fmt >> i) & 1)
+        bit = bool((fmt >> (14 - i)) & 1)
         matrix[r][c] = bit
         reserved[r][c] = True
 
-    # Bottom-left and top-right
+    # Bottom-left and top-right: ordered from Format Bit 14 (MSB) down to Format Bit 0 (LSB)
     coords_tr_bl = [
         (size - 1, 8), (size - 2, 8), (size - 3, 8), (size - 4, 8),
         (size - 5, 8), (size - 6, 8), (size - 7, 8),
@@ -135,7 +135,7 @@ def _write_format_bits(
         (8, size - 4), (8, size - 3), (8, size - 2), (8, size - 1),
     ]
     for i, (r, c) in enumerate(coords_tr_bl):
-        bit = bool((fmt >> i) & 1)
+        bit = bool((fmt >> (14 - i)) & 1)
         matrix[r][c] = bit
         reserved[r][c] = True
 

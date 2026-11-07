@@ -830,6 +830,8 @@ class AudioEngine:
         self._talent_cough_muted: bool = False
         self._remote_talkback_active: bool = False
         self._last_remote_talkback_peak: float = 0.0
+        self._last_remote_talkback_rms: float = 0.0
+        self._last_remote_talkback_mono: float = 0.0
 
         # Live Talkback headphone monitor output for prompting the talent
         self._tb_out_lock = threading.Lock()
@@ -1310,6 +1312,8 @@ class AudioEngine:
             t0 = time.monotonic()
             in_block = self._generate_simulated_input_block(chunk_frames, sample_rate, phase)
             phase += chunk_frames
+            if self._talent_cough_muted:
+                in_block = np.zeros_like(in_block)
 
             metered = self._extract_metered_input(
                 in_block, studio_mode, channels, input_channel
@@ -1396,6 +1400,8 @@ class AudioEngine:
                 in_float = self._decode_alsa_bytes(
                     raw_slice, int(frames_read), hw_channels, alsa_fmt
                 )
+                if self._talent_cough_muted:
+                    in_float = np.zeros_like(in_float)
                 metered = self._extract_metered_input(
                     in_float, studio_mode, channels, input_channel
                 )
@@ -1488,6 +1494,27 @@ class AudioEngine:
     def last_remote_talkback_peak(self) -> float:
         return self._last_remote_talkback_peak
 
+    def get_remote_talkback_levels(self) -> Tuple[float, float]:
+        """Return (peak_linear, rms_linear) for remote producer talkback with smooth decay."""
+        if not self.remote_talkback_active:
+            return (0.0, 0.0)
+        now = time.monotonic()
+        dt = max(0.0, now - self._last_remote_talkback_mono)
+        if dt > 0.06 and (self._last_remote_talkback_peak > 0.0 or self._last_remote_talkback_rms > 0.0):
+            decay = 0.70 ** min(20.0, dt / 0.05)
+            self._last_remote_talkback_peak = (
+                self._last_remote_talkback_peak * decay
+                if self._last_remote_talkback_peak > 1e-4
+                else 0.0
+            )
+            self._last_remote_talkback_rms = (
+                self._last_remote_talkback_rms * decay
+                if self._last_remote_talkback_rms > 1e-4
+                else 0.0
+            )
+            self._last_remote_talkback_mono = now
+        return (self._last_remote_talkback_peak, self._last_remote_talkback_rms)
+
     def set_remote_talkback(self, active: bool) -> None:
         """Set momentary Talkback state triggered by a connected Remote Producer."""
         if active and self.is_record_paused:
@@ -1496,6 +1523,7 @@ class AudioEngine:
         self._remote_talkback_active = bool(active)
         if not active:
             self._last_remote_talkback_peak = 0.0
+            self._last_remote_talkback_rms = 0.0
         proc = self._current_processor
         if proc is not None:
             proc.set_remote_talkback(bool(active))
@@ -1512,7 +1540,11 @@ class AudioEngine:
         flat = np.asarray(samples, dtype=np.float64).reshape(-1)
         if flat.size == 0:
             return
-        self._last_remote_talkback_peak = float(np.max(np.abs(flat)))
+        blk_peak = float(np.max(np.abs(flat)))
+        blk_rms = float(np.sqrt(np.mean(np.square(flat))))
+        self._last_remote_talkback_peak = max(blk_peak, self._last_remote_talkback_peak * 0.80)
+        self._last_remote_talkback_rms = max(blk_rms, self._last_remote_talkback_rms * 0.80)
+        self._last_remote_talkback_mono = time.monotonic()
 
         # 1. If recording in Studio Mode (and not paused), feed into StudioTalkbackProcessor Right channel
         proc = self._current_processor
@@ -1891,6 +1923,8 @@ class AudioEngine:
             t0 = time.monotonic()
             in_block = self._generate_simulated_input_block(chunk_frames, sample_rate, phase)
             phase += chunk_frames
+            if self._talent_cough_muted:
+                in_block = np.zeros_like(in_block)
 
             metered = self._extract_metered_input(
                 in_block,
@@ -2002,6 +2036,8 @@ class AudioEngine:
                 in_float = self._decode_alsa_bytes(
                     raw_slice, int(frames_read), hw_channels, alsa_fmt
                 )
+                if self._talent_cough_muted:
+                    in_float = np.zeros_like(in_float)
                 metered = self._extract_metered_input(
                     in_float,
                     processor.studio_mode,

@@ -136,7 +136,31 @@ def build_main_stylesheet(scale: float = 1.0) -> str:
         border-top: 1px solid #21262D;
     }}
 
-    QLineEdit, QComboBox, QListWidget {{
+    QFrame#CardFrame {{
+        background-color: #161B22;
+        border: 1px solid #30363D;
+        border-radius: {radius}px;
+    }}
+
+    QLabel#SectionHeader {{
+        color: #79C0FF;
+        font-size: {small_font}px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+    }}
+
+    QCheckBox {{
+        color: #F0F6FC;
+        font-size: {base_font}px;
+        font-weight: 600;
+        spacing: {max(6, int(round(8 * scale)))}px;
+    }}
+
+    QCheckBox:disabled {{
+        color: #6E7681;
+    }}
+
+    QLineEdit, QComboBox, QListWidget, QSpinBox {{
         background-color: #161B22;
         color: #F0F6FC;
         border: 1px solid #30363D;
@@ -147,7 +171,7 @@ def build_main_stylesheet(scale: float = 1.0) -> str:
         selection-color: #FFFFFF;
     }}
 
-    QLineEdit:focus, QComboBox:focus, QListWidget:focus {{
+    QLineEdit:focus, QComboBox:focus, QListWidget:focus, QSpinBox:focus {{
         border: 2px solid #388BFD;
     }}
 
@@ -332,7 +356,7 @@ def build_talkback_button_style(active: bool, enabled: bool, scale: float = 1.0)
         QPushButton {{
             background-color: #1C2128;
             color: #545D68;
-            border: 2px dashed #30363D;
+            border: 3px dashed #30363D;
             border-radius: {radius}px;
             padding: {pad_v}px {pad_h}px;
             font-size: {font_px}px;
@@ -344,7 +368,7 @@ def build_talkback_button_style(active: bool, enabled: bool, scale: float = 1.0)
         QPushButton {{
             background-color: #E36209;
             color: #FFFFFF;
-            border: 4px solid #FFDF5D;
+            border: 3px solid #FFDF5D;
             border-radius: {radius}px;
             padding: {pad_v}px {pad_h}px;
             font-size: {font_px}px;
@@ -382,7 +406,7 @@ def build_pause_record_button_style(
             QPushButton {{
                 background-color: #E36209;
                 color: #FFFFFF;
-                border: 4px solid #FFDF5D;
+                border: 3px solid #FFDF5D;
                 border-radius: {radius}px;
                 padding: {pad_v}px {pad_h}px;
                 font-size: {font_px}px;
@@ -399,7 +423,7 @@ def build_pause_record_button_style(
         QPushButton {{
             background-color: #5A3000;
             color: #FFDF5D;
-            border: 4px solid #F0B72F;
+            border: 3px solid #F0B72F;
             border-radius: {radius}px;
             padding: {pad_v}px {pad_h}px;
             font-size: {font_px}px;
@@ -436,7 +460,7 @@ def build_pause_record_button_style(
     QPushButton {{
         background-color: #1C2128;
         color: #545D68;
-        border: 2px solid #30363D;
+        border: 3px solid #30363D;
         border-radius: {radius}px;
         padding: {pad_v}px {pad_h}px;
         font-size: {font_px}px;

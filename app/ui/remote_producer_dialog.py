@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QGuiApplication, QPainter
+from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QPalette
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -50,8 +50,8 @@ class QrCodeWidget(QWidget):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._matrix: List[List[bool]] = []
-        self.setMinimumSize(188, 188)
-        self.setMaximumSize(220, 220)
+        self.setMinimumSize(200, 200)
+        self.setMaximumSize(240, 240)
 
     def set_url(self, url: str) -> None:
         if not url:
@@ -78,7 +78,7 @@ class QrCodeWidget(QWidget):
             return
 
         size = len(self._matrix)
-        border = 3
+        border = 4
         total_modules = size + border * 2
         side = min(w, h)
         scale = max(1, side // total_modules)
@@ -86,7 +86,7 @@ class QrCodeWidget(QWidget):
         ox = (w - qr_px) // 2
         oy = (h - qr_px) // 2
 
-        dark = QColor("#0D1014")
+        dark = QColor("#000000")
         for r, row in enumerate(self._matrix):
             for c, val in enumerate(row):
                 if val:
@@ -137,6 +137,15 @@ class RemoteProducerDialog(QDialog):
         self.setStyleSheet(build_main_stylesheet(self._scale))
         for combo in self.findChildren(QComboBox):
             configure_combo_box_popup(combo, self._scale)
+        chk_fg = QColor("#F0F6FC")
+        for chk in self.findChildren(QCheckBox):
+            pal = chk.palette()
+            for grp in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+                pal.setColor(grp, QPalette.ColorRole.WindowText, chk_fg)
+                pal.setColor(grp, QPalette.ColorRole.Text, chk_fg)
+                pal.setColor(grp, QPalette.ColorRole.ButtonText, chk_fg)
+            chk.setPalette(pal)
+            chk.setStyleSheet("color: #F0F6FC; font-weight: 600;")
         self.osk_controller.attach_to_container(self)
         self._refresh_all()
 

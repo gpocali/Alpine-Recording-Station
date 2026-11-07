@@ -215,6 +215,7 @@ class MainWindow(QMainWindow):
         self._last_observed_tb_active = False
         self._last_observed_remote_tb = False
         self._last_observed_producer_count = 0
+        self._last_observed_mute_state = False
         self._pause_blink_phase = True
         self._last_storage_refresh_monotonic: float = 0.0
 
@@ -334,13 +335,13 @@ class MainWindow(QMainWindow):
         self.level_bar = self.vu_meter
         deck_layout.addWidget(self.vu_meter)
 
-        # Primary Transport Controls Row (Record/Stop + Pause/Resume + Studio Talkback)
+        # Primary Transport Controls Row (Record/Stop + Pause/Resume + Studio Talkback + Cough/Privacy)
         controls_row = QHBoxLayout()
         controls_row.setSpacing(16)
 
         self.record_btn = QPushButton("●  RECORD")
         self.record_btn.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
         self.record_btn.setToolTip(
             "Start or stop audio recording to /storage [Hotkey: R or Space]"
@@ -350,7 +351,7 @@ class MainWindow(QMainWindow):
 
         self.pause_record_btn = QPushButton("❚❚  PAUSE\nRECORDING")
         self.pause_record_btn.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
         self.pause_record_btn.setToolTip(
             "Pause or resume the current recording (safely closes the WAV file on disk while paused "
@@ -361,7 +362,7 @@ class MainWindow(QMainWindow):
 
         self.talkback_btn = QPushButton("◉  TALKBACK\n(HOLD FOR NOTES)")
         self.talkback_btn.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
         self.talkback_btn.setToolTip(
             "Momentary Push-to-Talk (Studio Mode): Hold down to mute Left channel, "
@@ -372,12 +373,12 @@ class MainWindow(QMainWindow):
         self.talkback_btn.released.connect(self._on_talkback_released)
         controls_row.addWidget(self.talkback_btn, stretch=2)
 
-        self.cough_privacy_btn = QPushButton("◉  MIC TO PRODUCER: ON\n(HOLD [B] COUGH / CLICK MUTE)")
+        self.cough_privacy_btn = QPushButton("◉  COUGH / MIC SEND: ON\n(HOLD [B] COUGH • CLICK PRIVACY)")
         self.cough_privacy_btn.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
         self.cough_privacy_btn.setToolTip(
-            "Talent Privacy & Cough Control: Hold down (or hold [B]) for momentary Cough Mute, "
+            "Talent Cough & Mic Privacy Control: Hold down (or hold [B]) for momentary Cough Mute, "
             "or click to toggle sending your microphone live to the Remote Producer"
         )
         self.cough_privacy_btn.pressed.connect(self._on_cough_privacy_pressed)
@@ -491,10 +492,19 @@ class MainWindow(QMainWindow):
         self.timer_label.setFont(timer_font)
 
         btn_min_h = max(68, int(round(120 * self._scale)))
-        self.record_btn.setMinimumHeight(btn_min_h)
-        self.pause_record_btn.setMinimumHeight(btn_min_h)
-        self.talkback_btn.setMinimumHeight(btn_min_h)
-        self.cough_privacy_btn.setMinimumHeight(btn_min_h)
+        self.record_btn.setFixedHeight(btn_min_h)
+        self.pause_record_btn.setFixedHeight(btn_min_h)
+        self.talkback_btn.setFixedHeight(btn_min_h)
+        self.cough_privacy_btn.setFixedHeight(btn_min_h)
+
+        # Static relative widths for header and playback bar buttons so they never resize on click
+        self.remote_producer_btn.setFixedWidth(max(195, int(round(250 * self._scale))))
+        self.settings_btn.setFixedWidth(max(150, int(round(190 * self._scale))))
+        self.project_prefix_btn.setFixedWidth(max(135, int(round(170 * self._scale))))
+        self.play_btn.setFixedWidth(max(130, int(round(165 * self._scale))))
+        self.stop_play_btn.setFixedWidth(max(90, int(round(115 * self._scale))))
+        self.refresh_takes_btn.setFixedWidth(max(105, int(round(135 * self._scale))))
+
         self.vu_meter.apply_scale(self._scale)
         self.storage_monitor.apply_scale(self._scale)
 
@@ -595,26 +605,45 @@ class MainWindow(QMainWindow):
             self.remote_producer_btn.setText("◎ Remote Producer")
             self.remote_producer_btn.setStyleSheet("")
 
-        # Talent Mic Privacy & Cough Button state on Studio Deck
+        # Talent Mic Privacy & Cough Button state on Studio Deck (flashes red when muted)
         cough_font_px = max(13, int(round(18 * self._scale)))
-        cough_radius = max(10, int(round(14 * self._scale)))
-        if self.audio_engine.talent_cough_muted:
-            self.cough_privacy_btn.setText("✕  COUGH MUTE ACTIVE\n(PRODUCER FEED MUTED)")
+        cough_radius = max(12, int(round(16 * self._scale)))
+        cough_pad_v = max(6, int(round(8 * self._scale)))
+        cough_pad_h = max(8, int(round(10 * self._scale)))
+        is_mute_active = bool(
+            self.audio_engine.talent_cough_muted
+            or not self.audio_engine.talent_mic_send_enabled
+        )
+        if is_mute_active:
+            if self.audio_engine.talent_cough_muted:
+                self.cough_privacy_btn.setText(
+                    "✕  COUGH MUTE ACTIVE\n(MIC MUTED — RELEASE TO UNMUTE)"
+                )
+            else:
+                self.cough_privacy_btn.setText(
+                    "○  MIC TO PRODUCER: OFF\n(PRIVACY MUTE — CLICK FOR ON)"
+                )
+            if blink_on:
+                bg_col = "#D72638"
+                fg_col = "#FFFFFF"
+                border_col = "#FF7B72"
+            else:
+                bg_col = "#490B11"
+                fg_col = "#FFA198"
+                border_col = "#D72638"
             self.cough_privacy_btn.setStyleSheet(
-                f"QPushButton {{ background-color: #8E1523; color: #FFFFFF; border: 3px solid #FF6B7A; "
-                f"border-radius: {cough_radius}px; font-size: {cough_font_px}px; font-weight: bold; }}"
-            )
-        elif not self.audio_engine.talent_mic_send_enabled:
-            self.cough_privacy_btn.setText("○  MIC TO PRODUCER: OFF\n(PRIVACY MUTE — CLICK FOR ON)")
-            self.cough_privacy_btn.setStyleSheet(
-                f"QPushButton {{ background-color: #3D1114; color: #FFA198; border: 2px solid #F85149; "
-                f"border-radius: {cough_radius}px; font-size: {cough_font_px}px; font-weight: bold; }}"
+                f"QPushButton {{ background-color: {bg_col}; color: {fg_col}; border: 3px solid {border_col}; "
+                f"border-radius: {cough_radius}px; padding: {cough_pad_v}px {cough_pad_h}px; "
+                f"font-size: {cough_font_px}px; font-weight: bold; }}"
             )
         else:
-            self.cough_privacy_btn.setText("◉  MIC TO PRODUCER: ON\n(HOLD [B] COUGH / CLICK MUTE)")
+            self.cough_privacy_btn.setText(
+                "◉  COUGH / MIC SEND: ON\n(HOLD [B] COUGH • CLICK PRIVACY)"
+            )
             self.cough_privacy_btn.setStyleSheet(
-                f"QPushButton {{ background-color: #12261A; color: #7EE787; border: 2px solid #2EA043; "
-                f"border-radius: {cough_radius}px; font-size: {cough_font_px}px; font-weight: bold; }}"
+                f"QPushButton {{ background-color: #12261A; color: #7EE787; border: 3px solid #2EA043; "
+                f"border-radius: {cough_radius}px; padding: {cough_pad_v}px {cough_pad_h}px; "
+                f"font-size: {cough_font_px}px; font-weight: bold; }}"
             )
 
         # Studio Deck Frame Border (high-visibility pulsing amber border when paused)
@@ -1124,31 +1153,38 @@ class MainWindow(QMainWindow):
             is_paused=is_rec_paused,
         )
 
-        # Detect asynchronous changes from Remote Producer (talkback or client connection)
+        # Detect asynchronous changes from Remote Producer (talkback, client connection, or mute state)
         tb_now = self.audio_engine.talkback_active
         rem_tb_now = self.audio_engine.remote_talkback_active
         prod_count_now = self.remote_producer_server.connected_client_count
+        mute_active_now = bool(
+            self.audio_engine.talent_cough_muted
+            or not self.audio_engine.talent_mic_send_enabled
+        )
+        now_mono = time.monotonic()
+        blink_needed = bool(is_rec_paused or mute_active_now)
+        blink_now = ((int(now_mono * 2.5) % 2) == 0) if blink_needed else True
+
         if (
             tb_now != self._last_observed_tb_active
             or rem_tb_now != self._last_observed_remote_tb
             or prod_count_now != self._last_observed_producer_count
+            or mute_active_now != self._last_observed_mute_state
+            or blink_now != self._pause_blink_phase
         ):
             self._last_observed_tb_active = tb_now
             self._last_observed_remote_tb = rem_tb_now
             self._last_observed_producer_count = prod_count_now
+            self._last_observed_mute_state = mute_active_now
+            self._pause_blink_phase = blink_now
             self._refresh_transport_styles()
 
-        now_mono = time.monotonic()
         if is_rec:
             elapsed = self.audio_engine.elapsed_seconds
             hrs = int(elapsed // 3600)
             mins = int((elapsed % 3600) // 60)
             secs = elapsed % 60.0
             if is_rec_paused:
-                blink_on = (int(now_mono * 2.5) % 2) == 0
-                if blink_on != self._pause_blink_phase:
-                    self._pause_blink_phase = blink_on
-                    self._refresh_transport_styles()
                 self.timer_label.setText(
                     f"❚❚ {hrs:02d}:{mins:02d}:{secs:04.1f}  [PAUSED]"
                 )
