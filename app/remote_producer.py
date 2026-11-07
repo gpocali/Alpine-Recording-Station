@@ -260,6 +260,7 @@ class RemoteProducerServer:
         self.audio_engine = audio_engine
         self.config_manager = config_manager
         self.ssl_manager = ssl_manager or SslCertificateManager(
+            config_manager=config_manager,
             cert_dir=Path(config_manager.etc_config_dir) / "ssl",
             drop_dir=Path(config_manager.storage_dir) / "ssl",
         )

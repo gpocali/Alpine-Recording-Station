@@ -1501,9 +1501,14 @@ class AudioEngine:
             proc.set_remote_talkback(bool(active))
 
     def push_remote_talkback_audio(
-        self, samples: np.ndarray, sample_rate: int = 24000
+        self,
+        samples: np.ndarray,
+        sample_rate: int = 24000,
+        input_sample_rate: Optional[int] = None,
     ) -> None:
         """Feed incoming Remote Producer microphone audio to both Studio Mode Right-Ch recording and Talent headphones."""
+        if input_sample_rate is not None:
+            sample_rate = int(input_sample_rate)
         flat = np.asarray(samples, dtype=np.float64).reshape(-1)
         if flat.size == 0:
             return

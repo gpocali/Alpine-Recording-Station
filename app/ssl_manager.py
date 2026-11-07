@@ -38,6 +38,7 @@ class CertificateInfo:
     exists: bool = False
     valid: bool = False
     is_self_signed: bool = True
+    mode: str = "self-signed"
     subject: str = ""
     issuer: str = ""
     not_before: str = ""
@@ -50,7 +51,11 @@ class CertificateInfo:
     def status_summary(self) -> str:
         if not self.exists or not self.valid:
             return f"Invalid / Missing ({self.error or 'No certificate'})"
-        kind = "Self-Signed Default Certificate" if self.is_self_signed else "Issued / Custom Certificate"
+        kind = (
+            "Self-Signed Default Certificate"
+            if self.mode == "self-signed"
+            else "Issued / Custom Certificate"
+        )
         exp = f" • Expires: {self.not_after}" if self.not_after else ""
         return f"{kind}{exp}"
 
@@ -315,44 +320,126 @@ def generate_self_signed_pem_pair(
 class SslCertificateManager:
     """Manages default and custom/issued SSL certificates for the Remote Producer HTTPS server."""
 
-    def __init__(self, config_manager) -> None:
+    def __init__(
+        self,
+        config_manager=None,
+        *,
+        cert_dir: Optional[Path | str] = None,
+        drop_dir: Optional[Path | str] = None,
+    ) -> None:
+        if config_manager is not None and isinstance(config_manager, (str, Path)) and cert_dir is None:
+            cert_dir = Path(config_manager)
+            config_manager = None
+
         self.config_manager = config_manager
+
+        if cert_dir is not None:
+            self._cert_dir = Path(cert_dir)
+        elif self.config_manager is not None:
+            self._cert_dir = Path(self.config_manager.etc_config_dir) / "ssl"
+        else:
+            self._cert_dir = Path("/etc/alpine-recorder/ssl")
+
+        if drop_dir is not None:
+            self._drop_dir = Path(drop_dir)
+        elif self.config_manager is not None:
+            self._drop_dir = Path(self.config_manager.storage_dir) / "ssl"
+        else:
+            self._drop_dir = Path("/storage/ssl")
+
+    @property
+    def cert_dir(self) -> Path:
+        return self._cert_dir
+
+    @property
+    def drop_dir(self) -> Path:
+        return self._drop_dir
 
     @property
     def storage_ssl_dir(self) -> Path:
-        return self.config_manager.storage_dir / ".alpine-recorder" / "ssl"
+        if self.config_manager is not None:
+            return Path(self.config_manager.storage_dir) / ".alpine-recorder" / "ssl"
+        return self._cert_dir
 
     @property
     def etc_ssl_dir(self) -> Path:
-        return self.config_manager.etc_config_dir / "ssl"
+        return self._cert_dir
 
     @property
     def samba_drop_ssl_dir(self) -> Path:
         """Public directory inside /storage where admins can drop issued SSL certs over Samba."""
-        return self.config_manager.storage_dir / "ssl"
+        return self._drop_dir
 
-    def resolve_cert_and_key_paths(self) -> Tuple[Path, Path]:
-        """Return the active (cert_path, key_path), respecting custom paths in settings if valid."""
-        s = self.config_manager.settings
-        custom_cert = getattr(s, "ssl_cert_path", "").strip()
-        custom_key = getattr(s, "ssl_key_path", "").strip()
+    @property
+    def default_cert_path(self) -> Path:
+        return self._cert_dir / DEFAULT_CERT_FILENAME
 
-        if custom_cert and custom_key:
-            cp = Path(custom_cert)
-            kp = Path(custom_key)
+    @property
+    def default_key_path(self) -> Path:
+        return self._cert_dir / DEFAULT_KEY_FILENAME
+
+    @property
+    def _mode_marker_path(self) -> Path:
+        return self._cert_dir / ".cert_mode"
+
+    def _read_stored_mode(self) -> str:
+        try:
+            if self._mode_marker_path.is_file():
+                m = self._mode_marker_path.read_text(encoding="utf-8").strip()
+                if m in ("self-signed", "custom-imported"):
+                    return m
+        except OSError:
+            pass
+        return "self-signed"
+
+    def _write_stored_mode(self, mode: str) -> None:
+        for ssl_dir in self._persistent_dirs():
+            try:
+                ssl_dir.mkdir(parents=True, exist_ok=True)
+                (ssl_dir / ".cert_mode").write_text(mode, encoding="utf-8")
+            except OSError:
+                pass
+
+    def _persistent_dirs(self) -> List[Path]:
+        dirs = [self._cert_dir]
+        if self.config_manager is not None:
+            st_dir = self.storage_ssl_dir
+            if st_dir != self._cert_dir:
+                dirs.append(st_dir)
+        return dirs
+
+    def resolve_cert_and_key_paths(
+        self,
+        custom_cert_path: Optional[Path | str] = None,
+        custom_key_path: Optional[Path | str] = None,
+    ) -> Tuple[Path, Path, str]:
+        """Return the active (cert_path, key_path, mode), respecting custom paths if valid."""
+        c_override = str(custom_cert_path or "").strip()
+        k_override = str(custom_key_path or "").strip()
+        if (not c_override or not k_override) and self.config_manager is not None:
+            s = self.config_manager.settings
+            c_override = c_override or getattr(s, "ssl_cert_path", "").strip()
+            k_override = k_override or getattr(s, "ssl_key_path", "").strip()
+
+        if c_override and k_override:
+            cp = Path(c_override)
+            kp = Path(k_override)
             if cp.is_file() and kp.is_file():
-                return cp, kp
+                return cp, kp, "custom-path"
 
-        storage_cert = self.storage_ssl_dir / DEFAULT_CERT_FILENAME
-        storage_key = self.storage_ssl_dir / DEFAULT_KEY_FILENAME
-        etc_cert = self.etc_ssl_dir / DEFAULT_CERT_FILENAME
-        etc_key = self.etc_ssl_dir / DEFAULT_KEY_FILENAME
-
-        if storage_cert.is_file() and storage_key.is_file():
-            return storage_cert, storage_key
+        stored_mode = self._read_stored_mode()
+        etc_cert = self._cert_dir / DEFAULT_CERT_FILENAME
+        etc_key = self._cert_dir / DEFAULT_KEY_FILENAME
         if etc_cert.is_file() and etc_key.is_file():
-            return etc_cert, etc_key
-        return storage_cert, storage_key
+            return etc_cert, etc_key, stored_mode
+
+        if self.config_manager is not None:
+            storage_cert = self.storage_ssl_dir / DEFAULT_CERT_FILENAME
+            storage_key = self.storage_ssl_dir / DEFAULT_KEY_FILENAME
+            if storage_cert.is_file() and storage_key.is_file():
+                return storage_cert, storage_key, stored_mode
+
+        return etc_cert, etc_key, stored_mode
 
     def ensure_drop_dir_readme(self) -> None:
         """Create /storage/ssl/README-SSL.txt so users can easily drop in issued certificates."""
@@ -375,25 +462,26 @@ class SslCertificateManager:
         except OSError:
             pass
 
-    def ensure_certificates(self, force_regenerate: bool = False) -> Tuple[Path, Path]:
+    def ensure_certificates(self, force_regenerate: bool = False) -> Tuple[bool, str]:
         """Ensure valid SSL certificate and key files exist, generating a default self-signed pair if needed."""
         self.ensure_drop_dir_readme()
-        cert_path, key_path = self.resolve_cert_and_key_paths()
+        cert_path, key_path, _mode = self.resolve_cert_and_key_paths()
 
         if not force_regenerate and cert_path.is_file() and key_path.is_file():
-            if self.validate_pair(cert_path, key_path)[0]:
+            valid, _vmsg = self.validate_pair(cert_path, key_path)
+            if valid:
                 self._sync_to_mirror_dirs(cert_path, key_path)
-                return cert_path, key_path
+                return True, f"SSL certificate ready ({cert_path})."
 
         # Check if user placed certificates in /storage/ssl drop folder
         if not force_regenerate:
-            ok, _msg = self.import_from_drop_dir()
+            ok, import_msg = self.import_from_drop_dir()
             if ok:
-                return self.resolve_cert_and_key_paths()
+                return True, import_msg
 
         return self.generate_default_self_signed()
 
-    def generate_default_self_signed(self) -> Tuple[Path, Path]:
+    def generate_default_self_signed(self) -> Tuple[bool, str]:
         """Generate a fresh self-signed certificate including current LAN IPs and save to persistent paths."""
         lan_ips = get_lan_ip_addresses()
         cert_pem = ""
@@ -408,19 +496,26 @@ class SslCertificateManager:
                 logger.debug("openssl CLI generation skipped, using built-in generator: %s", exc)
 
         if not cert_pem or not key_pem:
-            cert_pem, key_pem = generate_self_signed_pem_pair(
-                common_name="Alpine Recording Station",
-                organization="Alpine Recording Station",
-                san_ips=lan_ips,
-                san_dns=["localhost", "alpine-recorder.local"],
-            )
+            try:
+                cert_pem, key_pem = generate_self_signed_pem_pair(
+                    common_name="Alpine Recording Station",
+                    organization="Alpine Recording Station",
+                    san_ips=lan_ips,
+                    san_dns=["localhost", "alpine-recorder.local"],
+                )
+            except Exception as exc:
+                return False, f"Failed to generate self-signed SSL certificate: {exc}"
 
-        self._write_pem_to_persistent_dirs(cert_pem, key_pem)
-        # Clear any broken custom overrides so default paths are active
-        self.config_manager.settings.ssl_cert_path = ""
-        self.config_manager.settings.ssl_key_path = ""
-        self.config_manager.save()
-        return self.resolve_cert_and_key_paths()
+        self._write_pem_to_persistent_dirs(cert_pem, key_pem, mode="self-signed")
+        if self.config_manager is not None:
+            self.config_manager.settings.ssl_cert_path = ""
+            self.config_manager.settings.ssl_key_path = ""
+            self.config_manager.save()
+        cert_path, key_path, _mode = self.resolve_cert_and_key_paths()
+        ok, msg = self.validate_pair(cert_path, key_path)
+        if ok:
+            return True, f"Generated default self-signed SSL certificate ({cert_path})."
+        return False, msg
 
     @staticmethod
     def _generate_via_openssl_cli(openssl_bin: str, lan_ips: Sequence[str]) -> Tuple[str, str]:
@@ -479,8 +574,10 @@ class SslCertificateManager:
             _ = res
             return c_path.read_text(encoding="utf-8"), k_path.read_text(encoding="utf-8")
 
-    def _write_pem_to_persistent_dirs(self, cert_pem: str, key_pem: str) -> None:
-        for ssl_dir in (self.storage_ssl_dir, self.etc_ssl_dir):
+    def _write_pem_to_persistent_dirs(
+        self, cert_pem: str, key_pem: str, mode: str = "self-signed"
+    ) -> None:
+        for ssl_dir in self._persistent_dirs():
             try:
                 ssl_dir.mkdir(parents=True, exist_ok=True)
                 c_file = ssl_dir / DEFAULT_CERT_FILENAME
@@ -498,6 +595,7 @@ class SslCertificateManager:
                     pass
             except OSError as exc:
                 logger.warning("Could not write SSL certificate to %s: %s", ssl_dir, exc)
+        self._write_stored_mode(mode)
 
     def _sync_to_mirror_dirs(self, cert_path: Path, key_path: Path) -> None:
         try:
@@ -505,7 +603,7 @@ class SslCertificateManager:
             key_pem = key_path.read_text(encoding="utf-8")
         except OSError:
             return
-        for ssl_dir in (self.storage_ssl_dir, self.etc_ssl_dir):
+        for ssl_dir in self._persistent_dirs():
             c_dest = ssl_dir / DEFAULT_CERT_FILENAME
             k_dest = ssl_dir / DEFAULT_KEY_FILENAME
             if not c_dest.is_file() or not k_dest.is_file():
@@ -546,10 +644,11 @@ class SslCertificateManager:
         except OSError as exc:
             return False, f"Failed to read certificate files: {exc}"
 
-        self._write_pem_to_persistent_dirs(cert_pem, key_pem)
-        self.config_manager.settings.ssl_cert_path = ""
-        self.config_manager.settings.ssl_key_path = ""
-        self.config_manager.save(commit_lbu=commit_lbu)
+        self._write_pem_to_persistent_dirs(cert_pem, key_pem, mode="custom-imported")
+        if self.config_manager is not None:
+            self.config_manager.settings.ssl_cert_path = ""
+            self.config_manager.settings.ssl_key_path = ""
+            self.config_manager.save(commit_lbu=commit_lbu)
         return True, "Issued SSL certificate and private key installed successfully."
 
     def import_from_drop_dir(self, commit_lbu: bool = True) -> Tuple[bool, str]:
@@ -607,18 +706,45 @@ class SslCertificateManager:
 
         return self.install_custom_certificate(found_cert, found_key, commit_lbu=commit_lbu)
 
-    def create_ssl_context(self) -> ssl.SSLContext:
+    def create_ssl_context(
+        self,
+        custom_cert_path: Optional[Path | str] = None,
+        custom_key_path: Optional[Path | str] = None,
+    ) -> ssl.SSLContext:
         """Create a configured TLS server SSLContext using the active certificate and private key."""
-        cert_path, key_path = self.ensure_certificates()
+        self.ensure_certificates()
+        cert_path, key_path, _mode = self.resolve_cert_and_key_paths(
+            custom_cert_path=custom_cert_path,
+            custom_key_path=custom_key_path,
+        )
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
         return ctx
 
-    def get_certificate_info(self) -> CertificateInfo:
+    def get_certificate_info(
+        self,
+        custom_cert_path: Optional[Path | str] = None,
+        custom_key_path: Optional[Path | str] = None,
+    ) -> CertificateInfo:
         """Inspect the active SSL certificate for UI display."""
-        cert_path, key_path = self.resolve_cert_and_key_paths()
-        info = CertificateInfo(cert_path=cert_path, key_path=key_path)
+        cert_path, key_path, mode = self.resolve_cert_and_key_paths(
+            custom_cert_path=custom_cert_path,
+            custom_key_path=custom_key_path,
+        )
+        if not cert_path.is_file() or not key_path.is_file():
+            self.ensure_certificates()
+            cert_path, key_path, mode = self.resolve_cert_and_key_paths(
+                custom_cert_path=custom_cert_path,
+                custom_key_path=custom_key_path,
+            )
+
+        info = CertificateInfo(
+            cert_path=cert_path,
+            key_path=key_path,
+            mode=mode,
+            is_self_signed=(mode == "self-signed"),
+        )
         if not cert_path.is_file() or not key_path.is_file():
             info.error = "Certificate or key file does not exist"
             return info
@@ -662,7 +788,10 @@ class SslCertificateManager:
                             elif k == "organizationName":
                                 iss_parts.append(f"O={v}")
                     info.issuer = ", ".join(iss_parts) or info.subject
-                    info.is_self_signed = decoded.get("subject") == decoded.get("issuer")
+                    if mode == "self-signed":
+                        info.is_self_signed = decoded.get("subject") == decoded.get("issuer")
+                    else:
+                        info.is_self_signed = False
                     info.not_before = str(decoded.get("notBefore", ""))
                     info.not_after = str(decoded.get("notAfter", ""))
                     sans = []
