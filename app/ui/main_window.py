@@ -256,12 +256,22 @@ class HelpDialog(QDialog):
                 "<b>Paused</b> reopens the exact same WAV file and seamlessly continues appending audio."
             ),
             self._build_section_card(
-                "TALKBACK  [Hotkey: Hold T]",
-                "Available in <b>Studio Mode</b>. Hold down <b>Talkback</b> (or hold <code>[T]</code>) "
-                "for momentary push-to-talk slating and session notes:<br>"
+                "TALKBACK  [Hotkey: T]",
+                "Available in <b>Studio Mode</b> for slating, producer talkback, and session notes:<br>"
+                "• <b>When Idle (Not Recording):</b> Click <b>Talkback</b> (or press <code>[T]</code>) to "
+                "<b>latch</b> Talkback ON for hands-free conversation. Click or press <code>[T]</code> again "
+                "to unlatch. Starting a recording automatically unlatches Talkback and switches it to "
+                "momentary Push-to-Talk.<br>"
+                "• <b>While Recording (Push-to-Talk):</b> Hold down <b>Talkback</b> (or hold <code>[T]</code>) "
+                "for momentary push-to-talk slating and session notes; releasing immediately ends Talkback.<br>"
+                "• <b>Temporary Unmute During Talkback:</b> If the talent's microphone is muted via the "
+                "<b>Cough / Muted</b> button, activating <b>Talkback</b> temporarily unmutes the microphone "
+                "while Talkback is active and restores the mute when released.<br>"
+                "• <b>Shared Producer && Talent Talkback:</b> If both Producer and Talent press Talkback "
+                "simultaneously, Talkback stays open seamlessly without extra marker tones until both release.<br>"
                 "• Mutes the Left (Voiceover) channel so notes stay off the primary performance track.<br>"
                 "• Emits a configurable press marker tone into the headset and on the Right (Talkback) channel so talent knows Talkback is active.<br>"
-                "• Records spoken notes onto the Right channel while held (and sends them to the Remote Producer).<br>"
+                "• Records spoken notes onto the Right channel while active (and sends them to the Remote Producer).<br>"
                 "• Emits a configurable release marker tone into the headset and on the Right channel when released."
             ),
             self._build_section_card(
@@ -367,7 +377,7 @@ class HelpDialog(QDialog):
                 "KEYBOARD SHORTCUTS SUMMARY",
                 "• <code>R</code> or <code>Space</code> : Start / Stop Recording<br>"
                 "• <code>P</code> or <code>Pause</code> : Pause / Resume Recording (or Play / Pause selected take when idle)<br>"
-                "• <code>Hold T</code> : Momentary Studio Mode Talkback<br>"
+                "• <code>T</code> : Toggle Talkback Latch when idle; Hold for Push-to-Talk while recording<br>"
                 "• <code>Hold B</code> : Momentary Talent Cough Mute<br>"
                 "• <code>C</code> : Reset VU Peak Hold && Clip Indicator<br>"
                 "• <code>M</code> : Toggle Studio Mode / Normal Mode (when idle)<br>"
@@ -444,9 +454,11 @@ class MainWindow(QMainWindow):
         self._active_output_device: Optional[AudioDeviceCapabilities] = None
         self._project_recordings: List[RecordingEntry] = []
         self._talkback_key_held = False
+        self._talkback_btn_press_mono: float = 0.0
         self._cough_key_held = False
         self._cough_btn_press_mono: float = 0.0
         self._last_observed_tb_active = False
+        self._last_observed_tb_latched = False
         self._last_observed_remote_tb = False
         self._last_observed_producer_count = 0
         self._last_observed_mute_state = False
@@ -605,7 +617,7 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
         self.talkback_btn.setToolTip(
-            "Momentary Push-to-Talk in Studio Mode [Hotkey: Hold T]"
+            "Click or press [T] to latch Talkback when idle; hold for momentary Push-to-Talk during recording"
         )
         self.talkback_btn.pressed.connect(self._on_talkback_pressed)
         self.talkback_btn.released.connect(self._on_talkback_released)
@@ -848,15 +860,12 @@ class MainWindow(QMainWindow):
             self.remote_producer_btn.setText("◎ Remote Producer")
             self.remote_producer_btn.setStyleSheet("")
 
-        # Talent Mic Privacy & Cough Button state on Studio Deck (flashes red when muted)
+        # Talent Mic Privacy & Cough Button state on Studio Deck (flashes red when muted; temporarily unmutes while local Talkback is active)
         cough_font_px = max(14, int(round(20 * self._scale)))
         cough_radius = max(12, int(round(16 * self._scale)))
         cough_pad_v = max(6, int(round(8 * self._scale)))
         cough_pad_h = max(8, int(round(10 * self._scale)))
-        is_mute_active = bool(
-            self.audio_engine.talent_cough_muted
-            or not self.audio_engine.talent_mic_send_enabled
-        )
+        is_mute_active = bool(self.audio_engine.is_mic_muted)
         if is_mute_active:
             self.cough_privacy_btn.setText("✕  Muted")
             if blink_on:
@@ -997,8 +1006,15 @@ class MainWindow(QMainWindow):
         elif settings.studio_mode:
             self.talkback_banner.setVisible(True)
             if tb_active:
-                if self.audio_engine.remote_talkback_active:
-                    self.talkback_banner.setText("⚡ STUDIO MODE — REMOTE PRODUCER TALKBACK")
+                if self.audio_engine.remote_talkback_active and self.audio_engine.local_talkback_active:
+                    self.talkback_banner.setText("⚡ STUDIO MODE — PRODUCER & TALENT TALKBACK")
+                elif self.audio_engine.remote_talkback_active:
+                    if self.audio_engine.remote_talkback_latched:
+                        self.talkback_banner.setText("⚡ STUDIO MODE — REMOTE PRODUCER TALKBACK (LATCHED)")
+                    else:
+                        self.talkback_banner.setText("⚡ STUDIO MODE — REMOTE PRODUCER TALKBACK")
+                elif self.audio_engine.local_talkback_latched:
+                    self.talkback_banner.setText("⚡ STUDIO MODE — TALKBACK LATCHED")
                 else:
                     self.talkback_banner.setText("⚡ STUDIO MODE — TALKBACK ACTIVE")
                 self.talkback_banner.setStyleSheet(
@@ -1013,7 +1029,10 @@ class MainWindow(QMainWindow):
                 )
         elif self.audio_engine.remote_talkback_active:
             self.talkback_banner.setVisible(True)
-            self.talkback_banner.setText("⚡ NORMAL MODE — REMOTE PRODUCER TALKBACK")
+            if self.audio_engine.remote_talkback_latched:
+                self.talkback_banner.setText("⚡ NORMAL MODE — REMOTE PRODUCER TALKBACK (LATCHED)")
+            else:
+                self.talkback_banner.setText("⚡ NORMAL MODE — REMOTE PRODUCER TALKBACK")
             self.talkback_banner.setStyleSheet(
                 "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
                 "padding: 6px; border-radius: 6px; border: 2px solid #FFDF5D;"
@@ -1076,6 +1095,7 @@ class MainWindow(QMainWindow):
             self.timer_label.setText(f"❚❚ {hrs:02d}:{mins:02d}:{secs:04.1f}  [PAUSED]")
 
     def _start_recording(self) -> None:
+        self._talkback_key_held = False
         self._sync_hardware_state()
         dev = self._active_input_device
         if dev is None:
@@ -1131,11 +1151,28 @@ class MainWindow(QMainWindow):
             or self.audio_engine.is_record_paused
         ):
             return
-        self.audio_engine.set_talkback(True)
+        self._talkback_btn_press_mono = time.monotonic()
+        if not self.audio_engine.is_recording:
+            # When not recording, Talkback latches on tap and unlatches on a second tap (or releases after hold)
+            if self.audio_engine.local_talkback_active:
+                self.audio_engine.set_talkback(False, latched=False)
+            else:
+                self.audio_engine.set_talkback(True, latched=True)
+        else:
+            # During active recording, Talkback is momentary Push-to-Talk (PTT)
+            self.audio_engine.set_talkback(True, latched=False)
         self._refresh_transport_styles()
 
     def _on_talkback_released(self) -> None:
-        self.audio_engine.set_talkback(False)
+        held_sec = time.monotonic() - getattr(self, "_talkback_btn_press_mono", 0.0)
+        if (
+            not self.audio_engine.is_recording
+            and self.audio_engine.local_talkback_latched
+            and held_sec < 0.25
+        ):
+            self._refresh_transport_styles()
+            return
+        self.audio_engine.set_talkback(False, latched=False)
         self._refresh_transport_styles()
 
     def _on_cough_privacy_pressed(self) -> None:
@@ -1183,6 +1220,9 @@ class MainWindow(QMainWindow):
         s.studio_mode = not s.studio_mode
         if s.studio_mode:
             s.channels = 2
+        else:
+            self._talkback_key_held = False
+            self.audio_engine.set_talkback(False, latched=False)
         self.config_manager.save(commit_lbu=True)
         self._sync_hardware_state()
         self._refresh_transport_styles()
@@ -1372,24 +1412,24 @@ class MainWindow(QMainWindow):
 
         # Detect asynchronous changes from Remote Producer (talkback, client connection, or mute state)
         tb_now = self.audio_engine.talkback_active
+        tb_latched_now = self.audio_engine.talkback_latched
         rem_tb_now = self.audio_engine.remote_talkback_active
         prod_count_now = self.remote_producer_server.connected_client_count
-        mute_active_now = bool(
-            self.audio_engine.talent_cough_muted
-            or not self.audio_engine.talent_mic_send_enabled
-        )
+        mute_active_now = bool(self.audio_engine.is_mic_muted)
         now_mono = time.monotonic()
         blink_needed = bool(is_rec_paused or mute_active_now)
         blink_now = ((int(now_mono * 2.5) % 2) == 0) if blink_needed else True
 
         if (
             tb_now != self._last_observed_tb_active
+            or tb_latched_now != self._last_observed_tb_latched
             or rem_tb_now != self._last_observed_remote_tb
             or prod_count_now != self._last_observed_producer_count
             or mute_active_now != self._last_observed_mute_state
             or blink_now != self._pause_blink_phase
         ):
             self._last_observed_tb_active = tb_now
+            self._last_observed_tb_latched = tb_latched_now
             self._last_observed_remote_tb = rem_tb_now
             self._last_observed_producer_count = prod_count_now
             self._last_observed_mute_state = mute_active_now

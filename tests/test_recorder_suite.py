@@ -1035,10 +1035,25 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
         # 1. Remote producer presses Talkback -> queues 0.1s (2400 samples @ 24kHz) press tone into headset
         engine.set_remote_talkback(True)
         self.assertEqual(engine.talkback_headset_tone_samples_total, 2400)
+        # Streaming producer voice during the press tone mixes into the live playhead without building up lag
+        engine.push_remote_talkback_audio(np.full(480, 0.2, dtype=np.float32), sample_rate=24000)
+        with engine._tb_out_lock:
+            self.assertLessEqual(engine._tb_out_fifo.size, 2400)
 
         # 2. Remote producer releases Talkback -> queues 0.05s (1200 samples @ 24kHz) release tone into headset
         engine.set_remote_talkback(False)
         self.assertEqual(engine.talkback_headset_tone_samples_total, 2400 + 1200)
+        # Late in-flight producer audio packets after release are ignored and do not overwrite the release tone
+        engine.push_remote_talkback_audio(np.full(960, 0.5, dtype=np.float32), sample_rate=24000)
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            with engine._tb_out_lock:
+                if engine._tb_out_fifo.size == 0:
+                    break
+            time.sleep(0.01)
+        with engine._tb_out_lock:
+            self.assertEqual(engine._tb_out_fifo.size, 0)
+        self.assertGreaterEqual(engine.talkback_headset_tone_samples_emitted, 1200)
 
         # 3. Local Talkback button pressed & released -> also queues press and release tones into headset
         engine.set_talkback(True)
@@ -1245,6 +1260,139 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                 self.assertFalse(server.session.verify_auth_token(auth_token))
             finally:
                 server.stop()
+
+    def test_talkback_latch_when_idle_and_auto_unlatch_to_ptt_on_record_start(self) -> None:
+        import json
+        from app.remote_producer import RemoteProducerServer, WebSocketConnection
+
+        class _DummySock:
+            def __init__(self) -> None:
+                self.sent_payloads: list[bytes] = []
+
+            def sendall(self, data: bytes) -> None:
+                self.sent_payloads.append(data)
+
+            def shutdown(self, _how: int) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cm = ConfigManager(storage_dir=base / "storage", etc_config_dir=base / "etc")
+            engine = AudioEngine(simulate_if_empty=True)
+            devs = engine.get_capture_devices()
+            self.assertGreaterEqual(len(devs), 1)
+            play_devs = engine.get_playback_devices()
+            engine.set_talkback_output_device(play_devs[0])
+            engine.set_talkback_tone_params(
+                tone_hz=440.0,
+                tone_duration_sec=0.1,
+                release_tone_duration_sec=0.05,
+            )
+
+            server = RemoteProducerServer(
+                audio_engine=engine,
+                config_manager=cm,
+                host="127.0.0.1",
+                port=0,
+            )
+
+            # Register a simulated WebSocket producer client
+            dummy_sock = _DummySock()
+            ws_conn = WebSocketConnection(dummy_sock, ("127.0.0.1", 55000), server.session.session_id)  # type: ignore[arg-type]
+            with server._clients_lock:
+                server._clients[ws_conn.client_id] = ws_conn
+
+            # 1. Idle: Talent latches Talkback ON, then unlatches OFF on second toggle
+            engine.set_talkback(True, latched=True)
+            self.assertTrue(engine.local_talkback_active)
+            self.assertTrue(engine.local_talkback_latched)
+            self.assertTrue(engine.talkback_active)
+            self.assertTrue(engine.talkback_latched)
+
+            engine.set_talkback(False, latched=False)
+            self.assertFalse(engine.local_talkback_active)
+            self.assertFalse(engine.local_talkback_latched)
+            self.assertFalse(engine.talkback_latched)
+
+            # 2. Idle: Remote Producer latches Talkback ON via WebSocket JSON
+            server._handle_ws_json(
+                ws_conn,
+                json.dumps({"type": "talkback", "active": True, "latched": True}).encode("utf-8"),
+            )
+            self.assertTrue(ws_conn.talkback_active)
+            self.assertTrue(ws_conn.talkback_latched)
+            self.assertTrue(engine.remote_talkback_active)
+            self.assertTrue(engine.remote_talkback_latched)
+            self.assertTrue(engine.talkback_active)
+            self.assertTrue(engine.talkback_latched)
+
+            # Also latch Talent Talkback ON while idle so both are latched before recording starts
+            engine.set_talkback(True, latched=True)
+            self.assertTrue(engine.local_talkback_latched)
+            tones_before_rec = engine.talkback_headset_tone_samples_total
+
+            # 3. Start recording -> both Talent and Producer Talkback must automatically unlatch
+            wav_path = cm.storage_dir / "Unlatch_Test.wav"
+            engine.start_recording(
+                device=devs[0],
+                output_path=wav_path,
+                sample_rate=48000,
+                bit_depth=16,
+                studio_mode=True,
+                channels=2,
+                tone_hz=440.0,
+                tone_duration_sec=0.1,
+                release_tone_duration_sec=0.05,
+            )
+            try:
+                self.assertTrue(engine.is_recording)
+                self.assertFalse(engine.local_talkback_active)
+                self.assertFalse(engine.local_talkback_latched)
+                self.assertFalse(engine.remote_talkback_active)
+                self.assertFalse(engine.remote_talkback_latched)
+                self.assertFalse(engine.talkback_active)
+                self.assertFalse(engine.talkback_latched)
+                self.assertFalse(ws_conn.talkback_active)
+                self.assertFalse(ws_conn.talkback_latched)
+                # Headset release tone was emitted on unlatch
+                self.assertEqual(engine.talkback_headset_tone_samples_total, tones_before_rec + 1200)
+                # Connected WebSocket client was notified with talkback_unlatched message
+                joined_frames = b"".join(dummy_sock.sent_payloads).decode("utf-8", errors="ignore")
+                self.assertIn('"talkback_unlatched"', joined_frames)
+
+                # 4. While recording, Talkback cannot latch (strictly momentary PTT for both Talent & Producer)
+                engine.set_talkback(True, latched=True)
+                self.assertTrue(engine.local_talkback_active)
+                self.assertFalse(engine.local_talkback_latched)
+                engine.set_talkback(False)
+                self.assertFalse(engine.local_talkback_active)
+
+                server._handle_ws_json(
+                    ws_conn,
+                    json.dumps({"type": "talkback", "active": True, "latched": True}).encode("utf-8"),
+                )
+                self.assertTrue(ws_conn.talkback_active)
+                self.assertFalse(ws_conn.talkback_latched)
+                self.assertTrue(engine.remote_talkback_active)
+                self.assertFalse(engine.remote_talkback_latched)
+
+                server._handle_ws_json(
+                    ws_conn,
+                    json.dumps({"type": "talkback", "active": False, "latched": False}).encode("utf-8"),
+                )
+                self.assertFalse(ws_conn.talkback_active)
+                self.assertFalse(engine.remote_talkback_active)
+            finally:
+                engine.stop_recording()
+
+            # 5. Verify Producer HTML includes accessible toggle attributes and latch/PTT logic
+            html = server._render_producer_html(csp_nonce="testnonce", authenticated=True)
+            self.assertIn('aria-pressed="false"', html)
+            self.assertIn('aria-describedby="talkback-hint"', html)
+            self.assertIn("talkback_unlatched", html)
 
     def test_install_script_remote_producer_dependencies_files_and_lbu(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent

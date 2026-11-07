@@ -123,10 +123,11 @@ class WebSocketConnection:
         self.connected_at = time.time()
         self.send_lock = threading.Lock()
         self.closed = False
-        # Producer client talkback & monitor state (producer mic is push-to-talk via Talkback)
+        # Producer client talkback & monitor state (latched when idle, push-to-talk when recording)
         self.mic_send_enabled = True
         self.cough_muted = False
         self.talkback_active = False
+        self.talkback_latched = False
         self.listen_enabled = True
 
     def send_text(self, text: str) -> bool:
@@ -280,6 +281,8 @@ class RemoteProducerServer:
         self._clients: Dict[str, WebSocketConnection] = {}
         self._cert_info: Optional[CertificateInfo] = None
         self._tb_peak_hold_db: float = -60.0
+        self.audio_engine.register_talkback_unlatch_listener(self._on_engine_talkback_unlatched)
+        self.audio_engine.register_talkback_state_listener(self._on_engine_talkback_state_changed)
 
     @property
     def is_running(self) -> bool:
@@ -335,7 +338,7 @@ class RemoteProducerServer:
         """
         self.session.rotate()
         self._disconnect_all_clients()
-        self.audio_engine.set_remote_talkback(False)
+        self.audio_engine.set_remote_talkback(False, latched=False)
         logger.info("Rotated remote producer session -> %s", self.session.session_id)
         return self.session
 
@@ -382,6 +385,8 @@ class RemoteProducerServer:
             self._running.set()
 
             self.audio_engine.register_live_audio_listener(self._on_live_talent_audio)
+            self.audio_engine.register_talkback_unlatch_listener(self._on_engine_talkback_unlatched)
+            self.audio_engine.register_talkback_state_listener(self._on_engine_talkback_state_changed)
 
             self._server_thread = threading.Thread(
                 target=self._serve_forever, daemon=True, name="RemoteProducerHTTPS"
@@ -409,7 +414,7 @@ class RemoteProducerServer:
     def stop(self) -> None:
         self._running.clear()
         self.audio_engine.unregister_live_audio_listener(self._on_live_talent_audio)
-        self.audio_engine.set_remote_talkback(False)
+        self.audio_engine.set_remote_talkback(False, latched=False)
         self._disconnect_all_clients()
 
         httpd = self._httpd
@@ -602,8 +607,11 @@ class RemoteProducerServer:
             "talkback_tone_duration_sec": float(settings.talkback_tone_duration_sec),
             "talkback_release_tone_duration_sec": float(settings.talkback_release_tone_duration_sec),
             "talkback_active": tb_active,
+            "talkback_latched": bool(self.audio_engine.talkback_latched),
             "remote_talkback_active": bool(self.audio_engine.remote_talkback_active),
+            "remote_talkback_latched": bool(self.audio_engine.remote_talkback_latched),
             "local_talkback_active": local_tb,
+            "local_talkback_latched": bool(self.audio_engine.local_talkback_latched),
             "talent_mic_live": talent_live,
             "talent_mic_send_enabled": bool(self.audio_engine.talent_mic_send_enabled),
             "talent_cough_muted": bool(self.audio_engine.talent_cough_muted),
@@ -655,7 +663,55 @@ class RemoteProducerServer:
                 (not c.closed) and c.talkback_active and c.mic_send_enabled and (not c.cough_muted)
                 for c in self._clients.values()
             )
-        self.audio_engine.set_remote_talkback(any_active)
+            any_latched = any(
+                (not c.closed)
+                and c.talkback_active
+                and c.talkback_latched
+                and c.mic_send_enabled
+                and (not c.cough_muted)
+                for c in self._clients.values()
+            )
+        self.audio_engine.set_remote_talkback(any_active, latched=any_latched)
+
+    def _on_engine_talkback_unlatched(self) -> None:
+        """
+        Called by AudioEngine when recording starts so any latched/active
+        remote producer talkback is immediately unlatched and switched to PTT.
+        """
+        with self._clients_lock:
+            clients = [c for c in self._clients.values() if not c.closed]
+            for c in self._clients.values():
+                c.talkback_active = False
+                c.talkback_latched = False
+        if not clients:
+            return
+        try:
+            unlatch_msg = json.dumps({"type": "talkback_unlatched", "reason": "recording_started"})
+            snap_msg = json.dumps(self.build_status_snapshot())
+        except Exception:
+            return
+        for client in clients:
+            try:
+                client.send_text(unlatch_msg)
+                client.send_text(snap_msg)
+            except Exception:
+                pass
+
+    def _on_engine_talkback_state_changed(self) -> None:
+        """Immediately push updated status snapshot to connected producers when Talkback state changes."""
+        with self._clients_lock:
+            clients = [c for c in self._clients.values() if not c.closed]
+        if not clients:
+            return
+        try:
+            snap_msg = json.dumps(self.build_status_snapshot())
+        except Exception:
+            return
+        for client in clients:
+            try:
+                client.send_text(snap_msg)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # HTTP & Authentication Handlers
@@ -942,6 +998,7 @@ class RemoteProducerServer:
             ws_conn.cough_muted = bool(msg.get("cough_muted", False))
             if not ws_conn.mic_send_enabled or ws_conn.cough_muted:
                 ws_conn.talkback_active = False
+                ws_conn.talkback_latched = False
             self._recompute_remote_talkback_state()
             ws_conn.send_text(json.dumps(self.build_status_snapshot()))
 
@@ -950,8 +1007,13 @@ class RemoteProducerServer:
             # Only allow talkback when the producer's Mic Send switch is armed and not cough-muted
             if requested and ws_conn.mic_send_enabled and not ws_conn.cough_muted:
                 ws_conn.talkback_active = True
+                if self.audio_engine.is_recording:
+                    ws_conn.talkback_latched = False
+                else:
+                    ws_conn.talkback_latched = bool(msg.get("latched", True))
             else:
                 ws_conn.talkback_active = False
+                ws_conn.talkback_latched = False
             self._recompute_remote_talkback_state()
             ws_conn.send_text(json.dumps(self.build_status_snapshot()))
 
@@ -1556,17 +1618,23 @@ input[type="range"].brand-slider {{
         </div>
       </div>
 
-      <!-- Momentary Talkback Prompt Card -->
+      <!-- Studio Talkback Prompt Card (Latch when idle, PTT when recording) -->
       <div class="card">
         <div class="card-header">
           <span class="card-title">2. DIRECT TALENT — STUDIO TALKBACK</span>
-          <span class="badge badge-conn-ok" id="talkback-mode-badge">PUSH-TO-TALK</span>
+          <span class="badge badge-conn-ok" id="talkback-mode-badge">LATCH / TOGGLE (IDLE)</span>
         </div>
-        <button type="button" class="btn-talkback" id="btn-talkback">
-          ◉ TALKBACK — HOLD TO PROMPT TALENT [Hold T or Space]
+        <button
+          type="button"
+          class="btn-talkback"
+          id="btn-talkback"
+          aria-pressed="false"
+          aria-describedby="talkback-hint"
+        >
+          ◉ TALKBACK — CLICK OR PRESS [T / SPACE]
         </button>
         <div style="margin-top:8px; font-size:12px; color:#8B949E;" id="talkback-hint">
-          Hold Talkback button or [T] / [Space] to speak to the talent
+          Idle: Click or press [T] / [Space] to latch Talkback ON or OFF (auto-unlatches to PTT when recording starts)
         </div>
       </div>
     </div>
@@ -1597,11 +1665,18 @@ input[type="range"].brand-slider {{
   let listenEnabled = true;
   let monitorVolume = 1.0;
 
-  // Producer Mic capture (Producer -> Talent Talkback, push-to-talk only)
+  // Producer Mic capture (Producer -> Talent Talkback: latch when idle, push-to-talk when recording)
   let micStream = null;
   let micSourceNode = null;
   let micProcessorNode = null;
   let talkbackPressed = false;
+  let talkbackDesired = false;
+  let talkbackLatched = false;
+  let talkbackHoldActive = false;
+  let talkbackPressTs = 0;
+  let lastTalkbackActionTs = 0;
+  let latestIsRecording = false;
+  let latestIsRecordPaused = false;
 
   // Latest VU state
   let latestVu = {{
@@ -1618,7 +1693,7 @@ input[type="range"].brand-slider {{
   let latestToneHz = 1000.0;
   let latestPressToneSec = 1.0;
   let latestReleaseToneSec = 0.5;
-  let lastObservedTalkbackActive = null;
+  let lastObservedLocalTbActive = null;
   let activeToneOsc = null;
   let activeToneGain = null;
 
@@ -1649,6 +1724,7 @@ input[type="range"].brand-slider {{
   const lblVolume = document.getElementById("monitor-volume-val");
 
   const btnTalkback = document.getElementById("btn-talkback");
+  const talkbackModeBadge = document.getElementById("talkback-mode-badge");
   const talkbackHint = document.getElementById("talkback-hint");
   const rttReadout = document.getElementById("rtt-readout");
 
@@ -1819,6 +1895,8 @@ input[type="range"].brand-slider {{
 
   function stopMicCapture() {{
     talkbackPressed = false;
+    talkbackLatched = false;
+    talkbackHoldActive = false;
     if (micProcessorNode) {{
       try {{ micProcessorNode.disconnect(); }} catch (_e) {{}}
       micProcessorNode = null;
@@ -1835,20 +1913,41 @@ input[type="range"].brand-slider {{
   }}
 
   function refreshMicAndTalkbackUi() {{
-    if (talkbackPressed) {{
-      btnTalkback.className = "btn-talkback talkback-live";
-      btnTalkback.textContent = "⚡ TALKBACK ON AIR — PROMPTING TALENT (RELEASE TO END)";
-      talkbackHint.textContent = "⚡ Transmitting to Talent Headphones & Studio Talkback Track (R)";
+    btnTalkback.setAttribute("aria-pressed", talkbackPressed ? "true" : "false");
+    if (latestIsRecording) {{
+      if (talkbackModeBadge) {{
+        talkbackModeBadge.textContent = "PUSH-TO-TALK";
+        talkbackModeBadge.className = talkbackPressed ? "badge badge-conn-warn" : "badge badge-conn-ok";
+      }}
+      if (talkbackPressed) {{
+        btnTalkback.className = "btn-talkback talkback-live";
+        btnTalkback.textContent = "⚡ TALKBACK — HOLD TO PROMPT TALENT [Hold T or Space]";
+        talkbackHint.textContent = "⚡ Push-to-Talk active — release button or [T] / [Space] to end";
+      }} else {{
+        btnTalkback.className = "btn-talkback";
+        btnTalkback.textContent = "◉ TALKBACK — HOLD TO PROMPT TALENT [Hold T or Space]";
+        talkbackHint.textContent = "Recording active: Hold Talkback button or [T] / [Space] for momentary Push-to-Talk";
+      }}
     }} else {{
-      btnTalkback.className = "btn-talkback";
-      btnTalkback.textContent = "◉ TALKBACK — HOLD TO PROMPT TALENT [Hold T or Space]";
-      talkbackHint.textContent = "Hold Talkback button or [T] / [Space] to speak to the talent";
+      if (talkbackModeBadge) {{
+        talkbackModeBadge.textContent = talkbackLatched ? "LATCHED ON AIR" : "LATCH / TOGGLE (IDLE)";
+        talkbackModeBadge.className = talkbackLatched ? "badge badge-conn-warn" : "badge badge-conn-ok";
+      }}
+      if (talkbackPressed) {{
+        btnTalkback.className = "btn-talkback talkback-live";
+        btnTalkback.textContent = "⚡ TALKBACK — CLICK OR PRESS [T / SPACE]";
+        talkbackHint.textContent = "⚡ Talkback latched ON — click or press [T] / [Space] to unlatch (auto-unlatches when recording starts)";
+      }} else {{
+        btnTalkback.className = "btn-talkback";
+        btnTalkback.textContent = "◉ TALKBACK — CLICK OR PRESS [T / SPACE]";
+        talkbackHint.textContent = "Idle: Click or press [T] / [Space] to latch Talkback ON or OFF (auto-unlatches to PTT when recording starts)";
+      }}
     }}
   }}
 
   function playHeadsetTalkbackTone(isPress) {{
     ensureAudioContext();
-    if (!audioCtx || !monitorGainNode) {{
+    if (!audioCtx) {{
       return;
     }}
     if (activeToneOsc) {{
@@ -1867,18 +1966,19 @@ input[type="range"].brand-slider {{
     }}
     const now = audioCtx.currentTime;
     const fadeSec = Math.min(0.005, durSec * 0.25);
+    const peakGain = Math.max(0.25, monitorVolume) * 0.5;
     const osc = audioCtx.createOscillator();
     const toneGain = audioCtx.createGain();
     osc.type = "sine";
     osc.frequency.setValueAtTime(freqHz, now);
     toneGain.gain.setValueAtTime(0.0001, now);
-    toneGain.gain.linearRampToValueAtTime(0.5, now + fadeSec);
+    toneGain.gain.linearRampToValueAtTime(peakGain, now + fadeSec);
     if (durSec > fadeSec * 2) {{
-      toneGain.gain.setValueAtTime(0.5, now + durSec - fadeSec);
+      toneGain.gain.setValueAtTime(peakGain, now + durSec - fadeSec);
     }}
     toneGain.gain.linearRampToValueAtTime(0.0001, now + durSec);
     osc.connect(toneGain);
-    toneGain.connect(monitorGainNode);
+    toneGain.connect(audioCtx.destination);
     osc.start(now);
     osc.stop(now + durSec);
     activeToneOsc = osc;
@@ -1891,56 +1991,112 @@ input[type="range"].brand-slider {{
     }};
   }}
 
-  async function setTalkbackActive(active) {{
+  async function setTalkbackActive(active, latchedMode) {{
+    const wantLatched = Boolean(latchedMode) && !latestIsRecording;
+    talkbackDesired = Boolean(active);
+    lastTalkbackActionTs = performance.now();
     if (active) {{
       const ok = await ensureMicCapture();
-      if (!ok) {{
+      if (!ok || !talkbackDesired) {{
         talkbackPressed = false;
+        talkbackLatched = false;
+        talkbackHoldActive = false;
         refreshMicAndTalkbackUi();
         return;
       }}
-      if (talkbackPressed) {{
+      if (talkbackPressed && talkbackLatched === wantLatched) {{
         return;
       }}
+      const wasPressed = talkbackPressed;
       talkbackPressed = true;
-      if (!lastObservedTalkbackActive) {{
+      talkbackLatched = wantLatched;
+      lastTalkbackActionTs = performance.now();
+      if (!wasPressed && !lastObservedLocalTbActive) {{
         playHeadsetTalkbackTone(true);
       }}
-      lastObservedTalkbackActive = true;
-      sendJson({{ type: "talkback", active: true }});
+      sendJson({{ type: "talkback", active: true, latched: talkbackLatched }});
       refreshMicAndTalkbackUi();
     }} else {{
-      if (!talkbackPressed) {{
+      if (!talkbackPressed && !talkbackLatched) {{
         return;
       }}
+      const wasPressed = talkbackPressed;
       talkbackPressed = false;
-      if (lastObservedTalkbackActive) {{
+      talkbackLatched = false;
+      talkbackHoldActive = false;
+      lastTalkbackActionTs = performance.now();
+      if (wasPressed && !lastObservedLocalTbActive) {{
         playHeadsetTalkbackTone(false);
       }}
-      lastObservedTalkbackActive = false;
-      sendJson({{ type: "talkback", active: false }});
+      sendJson({{ type: "talkback", active: false, latched: false }});
       refreshMicAndTalkbackUi();
+    }}
+  }}
+
+  function handleTalkbackPress() {{
+    if (latestIsRecording && latestIsRecordPaused) {{
+      return;
+    }}
+    talkbackPressTs = performance.now();
+    if (!latestIsRecording) {{
+      // Idle / Not Recording: click toggles latch; holding acts as momentary PTT
+      if (talkbackPressed) {{
+        talkbackHoldActive = false;
+        setTalkbackActive(false, false);
+      }} else {{
+        talkbackHoldActive = true;
+        setTalkbackActive(true, true);
+      }}
+    }} else {{
+      // Recording: momentary Push-to-Talk (PTT)
+      talkbackHoldActive = true;
+      setTalkbackActive(true, false);
+    }}
+  }}
+
+  function handleTalkbackRelease() {{
+    const heldMs = performance.now() - talkbackPressTs;
+    talkbackHoldActive = false;
+    if (!latestIsRecording && talkbackLatched && heldMs < 250) {{
+      // Quick click/tap (< 250ms) when idle keeps Talkback latched ON until clicked again
+      refreshMicAndTalkbackUi();
+      return;
+    }}
+    if (talkbackPressed || talkbackDesired) {{
+      setTalkbackActive(false, false);
     }}
   }}
 
   btnTalkback.addEventListener("pointerdown", function(ev) {{
     ev.preventDefault();
-    setTalkbackActive(true);
+    try {{ btnTalkback.setPointerCapture(ev.pointerId); }} catch (_e) {{}}
+    handleTalkbackPress();
   }});
   btnTalkback.addEventListener("pointerup", function(ev) {{
     ev.preventDefault();
-    setTalkbackActive(false);
+    try {{ btnTalkback.releasePointerCapture(ev.pointerId); }} catch (_e) {{}}
+    handleTalkbackRelease();
   }});
   btnTalkback.addEventListener("pointercancel", function() {{
-    setTalkbackActive(false);
+    handleTalkbackRelease();
   }});
   btnTalkback.addEventListener("pointerleave", function() {{
-    if (talkbackPressed) {{
-      setTalkbackActive(false);
+    if (latestIsRecording && talkbackPressed) {{
+      handleTalkbackRelease();
+    }}
+  }});
+  window.addEventListener("pointerup", function() {{
+    if (talkbackHoldActive) {{
+      handleTalkbackRelease();
+    }}
+  }});
+  window.addEventListener("blur", function() {{
+    if (talkbackHoldActive) {{
+      handleTalkbackRelease();
     }}
   }});
 
-  // Keyboard shortcuts: [T] or [Space] for momentary Talkback
+  // Keyboard shortcuts: [T] or [Space] to toggle Talkback latch when idle, or hold for PTT when recording
   window.addEventListener("keydown", function(ev) {{
     if (!isAuthenticated) return;
     const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : "";
@@ -1948,14 +2104,14 @@ input[type="range"].brand-slider {{
 
     if ((ev.code === "KeyT" || ev.code === "Space") && !ev.repeat) {{
       ev.preventDefault();
-      setTalkbackActive(true);
+      handleTalkbackPress();
     }}
   }});
 
   window.addEventListener("keyup", function(ev) {{
     if (!isAuthenticated) return;
     if (ev.code === "KeyT" || ev.code === "Space") {{
-      setTalkbackActive(false);
+      handleTalkbackRelease();
     }}
   }});
 
@@ -2039,9 +2195,49 @@ input[type="range"].brand-slider {{
       rttReadout.textContent = "Link Latency: " + rtt + " ms";
       return;
     }}
+    if (msg.type === "talkback_unlatched") {{
+      const wasActive = talkbackPressed || Boolean(lastObservedLocalTbActive);
+      talkbackPressed = false;
+      talkbackDesired = false;
+      talkbackLatched = false;
+      talkbackHoldActive = false;
+      lastTalkbackActionTs = performance.now();
+      if (wasActive) {{
+        playHeadsetTalkbackTone(false);
+      }}
+      lastObservedLocalTbActive = false;
+      latestIsRecording = true;
+      refreshMicAndTalkbackUi();
+      return;
+    }}
     if (msg.type !== "state") {{
       return;
     }}
+
+    const wasRecording = latestIsRecording;
+    latestIsRecording = Boolean(msg.is_recording);
+    latestIsRecordPaused = Boolean(msg.is_record_paused);
+    if (!wasRecording && latestIsRecording) {{
+      // Recording just started: unlatch Talkback and switch to momentary PTT
+      if (talkbackLatched || (talkbackPressed && !talkbackHoldActive)) {{
+        talkbackPressed = false;
+        talkbackDesired = false;
+        talkbackLatched = false;
+        talkbackHoldActive = false;
+        lastTalkbackActionTs = performance.now();
+        sendJson({{ type: "talkback", active: false, latched: false }});
+      }}
+    }} else if (
+      talkbackPressed &&
+      !talkbackHoldActive &&
+      !msg.remote_talkback_active &&
+      (performance.now() - lastTalkbackActionTs) > 600
+    ) {{
+      talkbackPressed = false;
+      talkbackDesired = false;
+      talkbackLatched = false;
+    }}
+    refreshMicAndTalkbackUi();
 
     hdrSession.textContent = "Session: " + (msg.session_id || "--");
     hdrProject.textContent = "Project: " + (msg.project_name || "Default");
@@ -2058,11 +2254,15 @@ input[type="range"].brand-slider {{
       latestReleaseToneSec = Number(msg.talkback_release_tone_duration_sec);
     }}
 
-    const nowTbActive = Boolean(msg.talkback_active);
-    if (lastObservedTalkbackActive !== null && nowTbActive !== lastObservedTalkbackActive) {{
-      playHeadsetTalkbackTone(nowTbActive);
+    const nowLocalTbActive = Boolean(msg.local_talkback_active);
+    if (
+      lastObservedLocalTbActive !== null &&
+      nowLocalTbActive !== lastObservedLocalTbActive &&
+      !talkbackPressed
+    ) {{
+      playHeadsetTalkbackTone(nowLocalTbActive);
     }}
-    lastObservedTalkbackActive = nowTbActive;
+    lastObservedLocalTbActive = nowLocalTbActive;
 
     if (latestStudioMode) {{
       modeSummary.textContent =
@@ -2079,7 +2279,11 @@ input[type="range"].brand-slider {{
     if (msg.talkback_active) {{
       studioDeck.className = "studio-deck deck-talkback";
       stateBanner.className = "state-banner banner-talkback";
-      const who = msg.remote_talkback_active ? "PRODUCER TALKBACK ON AIR" : "TALENT TALKBACK ACTIVE";
+      const who = (msg.remote_talkback_active && msg.local_talkback_active)
+        ? "PRODUCER & TALENT TALKBACK ON AIR"
+        : (msg.remote_talkback_active
+          ? (msg.remote_talkback_latched ? "PRODUCER TALKBACK LATCHED" : "PRODUCER TALKBACK ON AIR")
+          : (msg.local_talkback_latched ? "TALENT TALKBACK LATCHED" : "TALENT TALKBACK ACTIVE"));
       stateBanner.textContent = "⚡ " + who + (msg.is_recording ? " — RECORDING TO TALKBACK TRACK (R)" : "");
       timerDisplay.className = msg.is_recording ? "timer-display timer-rec" : "timer-display";
     }} else if (msg.is_recording && msg.is_record_paused) {{

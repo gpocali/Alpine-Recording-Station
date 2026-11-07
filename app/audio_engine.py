@@ -853,11 +853,16 @@ class AudioEngine:
 
         # Remote Producer bidirectional audio & privacy/cough state
         self._live_listeners_lock = threading.Lock()
+        self._talkback_state_lock = threading.RLock()
         self._live_audio_listeners: List[Callable[[np.ndarray, int, bool], None]] = []
+        self._talkback_unlatch_listeners: List[Callable[[], None]] = []
+        self._talkback_state_listeners: List[Callable[[], None]] = []
         self._talent_mic_send_enabled: bool = True
         self._talent_cough_muted: bool = False
         self._local_talkback_active: bool = False
+        self._local_talkback_latched: bool = False
         self._remote_talkback_active: bool = False
+        self._remote_talkback_latched: bool = False
         self._last_remote_talkback_peak: float = 0.0
         self._last_remote_talkback_rms: float = 0.0
         self._last_remote_talkback_mono: float = 0.0
@@ -871,6 +876,7 @@ class AudioEngine:
         # Live Talkback headphone monitor output for prompting the talent
         self._tb_out_lock = threading.Lock()
         self._tb_out_fifo = np.zeros(0, dtype=np.float64)
+        self._tb_mix_cursor: int = 0
         self._tb_out_rate: int = 24000
         self._tb_out_device: Optional[AudioDeviceCapabilities] = None
         self._tb_out_thread: Optional[threading.Thread] = None
@@ -1485,7 +1491,7 @@ class AudioEngine:
     def set_talent_mic_send_enabled(self, enabled: bool) -> None:
         """Enable or disable sending the talent's live microphone feed (and unmuting/muting mic input)."""
         self._talent_mic_send_enabled = bool(enabled)
-        if not self._talent_mic_send_enabled:
+        if self.is_mic_muted:
             self._clear_live_meter_levels()
 
     @property
@@ -1495,12 +1501,18 @@ class AudioEngine:
     def set_talent_cough_muted(self, muted: bool) -> None:
         """Set momentary Cough / Privacy mute state on the talent's microphone."""
         self._talent_cough_muted = bool(muted)
-        if self._talent_cough_muted:
+        if self.is_mic_muted:
             self._clear_live_meter_levels()
 
     @property
     def is_mic_muted(self) -> bool:
-        """Return True when the local microphone is muted (momentary cough mute or toggled mute)."""
+        """Return True when the local microphone is muted (momentary cough mute or toggled mute).
+
+        Activating local Talkback on the talent side temporarily unmutes the microphone
+        for as long as local Talkback remains active.
+        """
+        if self.local_talkback_active:
+            return False
         return bool(self._talent_cough_muted or not self._talent_mic_send_enabled)
 
     @property
@@ -1522,6 +1534,45 @@ class AudioEngine:
         with self._live_listeners_lock:
             if callback in self._live_audio_listeners:
                 self._live_audio_listeners.remove(callback)
+
+    def register_talkback_unlatch_listener(
+        self, callback: Callable[[], None]
+    ) -> None:
+        """Register a listener invoked when latched Talkback is automatically unlatched (e.g. on recording start)."""
+        with self._live_listeners_lock:
+            if callback not in self._talkback_unlatch_listeners:
+                self._talkback_unlatch_listeners.append(callback)
+
+    def unregister_talkback_unlatch_listener(
+        self, callback: Callable[[], None]
+    ) -> None:
+        with self._live_listeners_lock:
+            if callback in self._talkback_unlatch_listeners:
+                self._talkback_unlatch_listeners.remove(callback)
+
+    def register_talkback_state_listener(
+        self, callback: Callable[[], None]
+    ) -> None:
+        """Register a listener invoked whenever local or remote Talkback state changes."""
+        with self._live_listeners_lock:
+            if callback not in self._talkback_state_listeners:
+                self._talkback_state_listeners.append(callback)
+
+    def unregister_talkback_state_listener(
+        self, callback: Callable[[], None]
+    ) -> None:
+        with self._live_listeners_lock:
+            if callback in self._talkback_state_listeners:
+                self._talkback_state_listeners.remove(callback)
+
+    def _notify_talkback_state_listeners(self) -> None:
+        with self._live_listeners_lock:
+            callbacks = list(self._talkback_state_listeners)
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception as exc:
+                logger.debug("Talkback state listener error: %s", exc)
 
     def _dispatch_live_input_block(
         self, metered_block: np.ndarray, sample_rate: int
@@ -1598,6 +1649,7 @@ class AudioEngine:
             if not is_press:
                 with self._tb_out_lock:
                     self._tb_out_fifo = np.zeros(0, dtype=np.float64)
+                    self._tb_mix_cursor = 0
             return
 
         fade_samples = min(
@@ -1613,11 +1665,21 @@ class AudioEngine:
             total_samples=total_samples,
             fade_samples=fade_samples,
         )
+        clipped_tone = np.clip(tone_samples, -1.0, 1.0)
         with self._tb_out_lock:
+            self._tb_out_rate = target_sr
             # Replace any stale queued samples so the press or release tone plays immediately into the headset
-            self._tb_out_fifo = np.zeros(0, dtype=np.float64)
+            self._tb_out_fifo = clipped_tone
+            # Allow incoming producer voice during a press tone to mix cleanly at the live playhead
+            self._tb_mix_cursor = 0 if is_press else clipped_tone.size
             self._tb_headset_tone_samples_total += total_samples
-        self._queue_talkback_headphone_audio(tone_samples, target_sr, is_tone=True)
+            if self._tb_out_thread is None or not self._tb_out_thread.is_alive():
+                self._tb_out_stop_event.clear()
+                self._tb_out_thread = threading.Thread(
+                    target=self._talkback_headphone_worker,
+                    daemon=True,
+                )
+                self._tb_out_thread.start()
 
     @property
     def remote_talkback_active(self) -> bool:
@@ -1627,11 +1689,31 @@ class AudioEngine:
         return self._remote_talkback_active
 
     @property
+    def remote_talkback_latched(self) -> bool:
+        return bool(
+            not self.is_recording
+            and self._remote_talkback_latched
+            and self._remote_talkback_active
+        )
+
+    @property
     def local_talkback_active(self) -> bool:
         proc = self._current_processor
         if proc is not None and self.is_recording and not self.is_record_paused:
             return proc.local_talkback_active
         return self._local_talkback_active
+
+    @property
+    def local_talkback_latched(self) -> bool:
+        return bool(
+            not self.is_recording
+            and self._local_talkback_latched
+            and self._local_talkback_active
+        )
+
+    @property
+    def talkback_latched(self) -> bool:
+        return bool(self.local_talkback_latched or self.remote_talkback_latched)
 
     @property
     def last_remote_talkback_peak(self) -> float:
@@ -1658,24 +1740,43 @@ class AudioEngine:
             self._last_remote_talkback_mono = now
         return (self._last_remote_talkback_peak, self._last_remote_talkback_rms)
 
-    def set_remote_talkback(self, active: bool) -> None:
-        """Set momentary Talkback state triggered by a connected Remote Producer."""
-        if active and self.is_record_paused:
-            self._remote_talkback_active = False
-            return
-        was_tb_active = self.talkback_active
-        self._remote_talkback_active = bool(active)
-        if not active:
-            self._last_remote_talkback_peak = 0.0
-            self._last_remote_talkback_rms = 0.0
-        proc = self._current_processor
-        if proc is not None:
-            proc.set_remote_talkback(bool(active))
-        now_tb_active = self.talkback_active
-        if now_tb_active and not was_tb_active:
-            self._emit_headset_talkback_tone(is_press=True)
-        elif not now_tb_active and was_tb_active:
-            self._emit_headset_talkback_tone(is_press=False)
+    def set_remote_talkback(
+        self, active: bool, latched: Optional[bool] = None
+    ) -> None:
+        """Set Talkback state triggered by a connected Remote Producer (latchable when idle, PTT when recording)."""
+        changed = False
+        with self._talkback_state_lock:
+            if active and self.is_record_paused:
+                self._remote_talkback_active = False
+                self._remote_talkback_latched = False
+                return
+            was_remote = self._remote_talkback_active
+            was_latched = self._remote_talkback_latched
+            was_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
+            self._remote_talkback_active = bool(active)
+            if not active or self.is_recording:
+                self._remote_talkback_latched = False
+            elif latched is None:
+                self._remote_talkback_latched = True
+            else:
+                self._remote_talkback_latched = bool(latched)
+            if not active:
+                self._last_remote_talkback_peak = 0.0
+                self._last_remote_talkback_rms = 0.0
+            proc = self._current_processor
+            if proc is not None:
+                proc.set_remote_talkback(bool(active))
+            now_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
+            if now_tb_active and not was_tb_active:
+                self._emit_headset_talkback_tone(is_press=True)
+            elif not now_tb_active and was_tb_active:
+                self._emit_headset_talkback_tone(is_press=False)
+            changed = (
+                self._remote_talkback_active != was_remote
+                or self._remote_talkback_latched != was_latched
+            )
+        if changed:
+            self._notify_talkback_state_listeners()
 
     def push_remote_talkback_audio(
         self,
@@ -1684,6 +1785,8 @@ class AudioEngine:
         input_sample_rate: Optional[int] = None,
     ) -> None:
         """Feed incoming Remote Producer microphone audio to both Studio Mode Right-Ch recording and Talent headphones."""
+        if not self.remote_talkback_active:
+            return
         if input_sample_rate is not None:
             sample_rate = int(input_sample_rate)
         flat = np.asarray(samples, dtype=np.float64).reshape(-1)
@@ -1712,16 +1815,35 @@ class AudioEngine:
         resampled = resample_mono_signal(samples, sample_rate, target_sr)
         if resampled.size == 0:
             return
+        clipped = np.clip(resampled, -1.0, 1.0)
 
         with self._tb_out_lock:
             self._tb_out_rate = target_sr
-            combined = np.concatenate((self._tb_out_fifo, np.clip(resampled, -1.0, 1.0)))
-            # Allow up to 4.0s buffer so full marker tones (up to 3.0s) + live voice never truncate the tone
-            max_samples = target_sr * 4 if is_tone else max(target_sr * 2, self._tb_out_fifo.size + resampled.size)
-            max_samples = min(max_samples, target_sr * 5)
-            if combined.size > max_samples:
-                combined = combined[-max_samples:]
-            self._tb_out_fifo = combined
+            if is_tone:
+                self._tb_out_fifo = clipped
+                self._tb_mix_cursor = 0
+            else:
+                # Mix live producer voice onto any unplayed press tone at the live playhead
+                # so incoming mic packets never build up a 1-second delay behind the press tone.
+                cursor = min(max(0, self._tb_mix_cursor), self._tb_out_fifo.size)
+                overlap = self._tb_out_fifo.size - cursor
+                if overlap > 0:
+                    mix_n = min(overlap, clipped.size)
+                    updated = self._tb_out_fifo.copy()
+                    updated[cursor : cursor + mix_n] = np.clip(
+                        updated[cursor : cursor + mix_n] + clipped[:mix_n], -1.0, 1.0
+                    )
+                    if clipped.size > mix_n:
+                        updated = np.concatenate((updated, clipped[mix_n:]))
+                    self._tb_out_fifo = updated
+                    self._tb_mix_cursor = cursor + clipped.size
+                else:
+                    combined = np.concatenate((self._tb_out_fifo, clipped))
+                    max_samples = target_sr // 2  # Cap live voice queue at 500ms for low latency
+                    if combined.size > max_samples:
+                        combined = combined[-max_samples:]
+                    self._tb_out_fifo = combined
+                    self._tb_mix_cursor = self._tb_out_fifo.size
 
             if self._tb_out_thread is None or not self._tb_out_thread.is_alive():
                 self._tb_out_stop_event.clear()
@@ -1749,6 +1871,7 @@ class AudioEngine:
                         return
                     take = min(480, self._tb_out_fifo.size)
                     self._tb_out_fifo = self._tb_out_fifo[take:]
+                    self._tb_mix_cursor = max(0, self._tb_mix_cursor - take)
                     self._tb_headset_tone_samples_emitted += take
                 time.sleep(take / float(max(8000, sr)))
             return
@@ -1769,6 +1892,7 @@ class AudioEngine:
         if err < 0 or not pcm:
             with self._tb_out_lock:
                 self._tb_out_fifo = np.zeros(0, dtype=np.float64)
+                self._tb_mix_cursor = 0
             return
 
         hw_params = ctypes.c_void_p()
@@ -1789,6 +1913,11 @@ class AudioEngine:
 
         lib.snd_pcm_prepare(pcm)
         idle_ticks = 0
+        silence_frames = 480  # 20ms @ 24kHz
+        silence_pcm16 = np.zeros((silence_frames, out_ch) if out_ch == 2 else silence_frames, dtype="<i2")
+        silence_raw = silence_pcm16.tobytes()
+        # Allow a small 80ms hardware prebuffer lead, then pace at real-time so ALSA never swallows 1-2s of audio ahead
+        next_write_mono = time.monotonic() - 0.08
         try:
             while not self._tb_out_stop_event.is_set() and not self.is_playing:
                 with self._tb_out_lock:
@@ -1797,15 +1926,30 @@ class AudioEngine:
                         take = min(960, avail)
                         mono_chunk = self._tb_out_fifo[:take]
                         self._tb_out_fifo = self._tb_out_fifo[take:]
+                        self._tb_mix_cursor = max(0, self._tb_mix_cursor - take)
                         self._tb_headset_tone_samples_emitted += take
                     else:
                         mono_chunk = None
 
                 if mono_chunk is None:
-                    idle_ticks += 1
-                    if idle_ticks > 25:  # Close idle playback stream after ~500ms of silence
-                        break
-                    time.sleep(0.02)
+                    if self.talkback_active:
+                        idle_ticks = 0
+                    else:
+                        idle_ticks += 1
+                        if idle_ticks > 35:  # Close after ~700ms of trailing silence pushes release tone out
+                            break
+                    written = lib.snd_pcm_writei(pcm, silence_raw, silence_frames)
+                    if written < 0:
+                        lib.snd_pcm_recover(pcm, int(written), 1)
+                        lib.snd_pcm_writei(pcm, silence_raw, silence_frames)
+                    chunk_sec = silence_frames / float(max(8000, sr))
+                    now_m = time.monotonic()
+                    if next_write_mono < now_m - 0.08:
+                        next_write_mono = now_m - 0.08
+                    next_write_mono += chunk_sec
+                    sleep_sec = next_write_mono - time.monotonic()
+                    if sleep_sec > 0.001:
+                        time.sleep(min(chunk_sec, sleep_sec))
                     continue
 
                 idle_ticks = 0
@@ -1819,7 +1963,18 @@ class AudioEngine:
                 written = lib.snd_pcm_writei(pcm, raw, mono_chunk.size)
                 if written < 0:
                     lib.snd_pcm_recover(pcm, int(written), 1)
+                    lib.snd_pcm_writei(pcm, raw, mono_chunk.size)
+                chunk_sec = mono_chunk.size / float(max(8000, sr))
+                now_m = time.monotonic()
+                if next_write_mono < now_m - 0.08:
+                    next_write_mono = now_m - 0.08
+                next_write_mono += chunk_sec
+                sleep_sec = next_write_mono - time.monotonic()
+                if sleep_sec > 0.001:
+                    time.sleep(min(chunk_sec, sleep_sec))
         finally:
+            if not self._tb_out_stop_event.is_set() and not self.is_playing:
+                lib.snd_pcm_drain(pcm)
             lib.snd_pcm_drop(pcm)
             lib.snd_pcm_close(pcm)
 
@@ -1871,21 +2026,71 @@ class AudioEngine:
             return proc.talkback_active
         return bool(self._local_talkback_active or self._remote_talkback_active)
 
-    def set_talkback(self, active: bool) -> None:
-        """Set momentary Talkback state (during recording or standby monitoring)."""
-        if active and self.is_record_paused:
+    def set_talkback(
+        self, active: bool, latched: Optional[bool] = None
+    ) -> None:
+        """Set local Talkback state (latchable during standby monitoring, PTT during recording)."""
+        changed = False
+        with self._talkback_state_lock:
+            if active and self.is_record_paused:
+                self._local_talkback_active = False
+                self._local_talkback_latched = False
+                if self.is_mic_muted:
+                    self._clear_live_meter_levels()
+                return
+            was_local = self._local_talkback_active
+            was_latched = self._local_talkback_latched
+            was_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
+            self._local_talkback_active = bool(active)
+            if not active or self.is_recording:
+                self._local_talkback_latched = False
+            elif latched is None:
+                self._local_talkback_latched = True
+            else:
+                self._local_talkback_latched = bool(latched)
+            proc = self._current_processor
+            if proc is not None:
+                proc.set_talkback(bool(active))
+            if not active and self.is_mic_muted:
+                self._clear_live_meter_levels()
+            now_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
+            if now_tb_active and not was_tb_active:
+                self._emit_headset_talkback_tone(is_press=True)
+            elif not now_tb_active and was_tb_active:
+                self._emit_headset_talkback_tone(is_press=False)
+            changed = (
+                self._local_talkback_active != was_local
+                or self._local_talkback_latched != was_latched
+            )
+        if changed:
+            self._notify_talkback_state_listeners()
+
+    def unlatch_all_talkback(self) -> None:
+        """Unlatch any active local or remote Talkback and switch Talkback to PTT mode."""
+        with self._talkback_state_lock:
+            was_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
+            self._local_talkback_latched = False
             self._local_talkback_active = False
-            return
-        was_tb_active = self.talkback_active
-        self._local_talkback_active = bool(active)
-        proc = self._current_processor
-        if proc is not None:
-            proc.set_talkback(active)
-        now_tb_active = self.talkback_active
-        if now_tb_active and not was_tb_active:
-            self._emit_headset_talkback_tone(is_press=True)
-        elif not now_tb_active and was_tb_active:
-            self._emit_headset_talkback_tone(is_press=False)
+            self._remote_talkback_latched = False
+            self._remote_talkback_active = False
+            self._last_remote_talkback_peak = 0.0
+            self._last_remote_talkback_rms = 0.0
+            proc = self._current_processor
+            if proc is not None:
+                proc.set_talkback(False)
+                proc.set_remote_talkback(False)
+            if self.is_mic_muted:
+                self._clear_live_meter_levels()
+            if was_tb_active:
+                self._emit_headset_talkback_tone(is_press=False)
+        with self._live_listeners_lock:
+            callbacks = list(self._talkback_unlatch_listeners)
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception as exc:
+                logger.debug("Talkback unlatch listener error: %s", exc)
+        self._notify_talkback_state_listeners()
 
     def pause_recording(self) -> bool:
         """Pause active recording, flushing and closing the WAV file on disk to prevent corruption."""
@@ -1902,11 +2107,20 @@ class AudioEngine:
             self._is_record_paused = True
             proc = self._current_processor
 
+        was_tb_active = bool(
+            self._local_talkback_active
+            or self._remote_talkback_active
+            or (proc is not None and proc.talkback_active)
+        )
         self._local_talkback_active = False
+        self._local_talkback_latched = False
         self._remote_talkback_active = False
+        self._remote_talkback_latched = False
         if proc is not None:
             proc.set_talkback(False)
             proc.set_remote_talkback(False)
+        if was_tb_active:
+            self._emit_headset_talkback_tone(is_press=False)
 
         with self._writer_lock:
             if self._active_writer is not None and self._active_writer.is_open:
@@ -1967,6 +2181,15 @@ class AudioEngine:
             release_tone_duration_sec=release_tone_duration_sec,
         )
 
+        # If Talkback is latched (or active) when recording starts, unlatch it and switch to PTT
+        if (
+            self._local_talkback_active
+            or self._local_talkback_latched
+            or self._remote_talkback_active
+            or self._remote_talkback_latched
+        ):
+            self.unlatch_all_talkback()
+
         with self._record_lock:
             if self._is_recording:
                 return
@@ -1981,10 +2204,6 @@ class AudioEngine:
                 tone_duration_sec=tone_duration_sec,
                 release_tone_duration_sec=release_tone_duration_sec,
             )
-            if self._local_talkback_active:
-                processor.set_talkback(True)
-            if self._remote_talkback_active:
-                processor.set_remote_talkback(True)
             self._current_processor = processor
             self._current_recording_path = output_path
             self._stop_record_event.clear()
@@ -2030,6 +2249,8 @@ class AudioEngine:
             self._record_accumulated_sec = 0.0
             self._current_processor = None
             self._current_recording_path = None
+            self._local_talkback_latched = False
+            self._remote_talkback_latched = False
 
         # Resume live input monitoring so VU meter & Peak Hold remain active
         self._resume_monitoring_if_configured()
