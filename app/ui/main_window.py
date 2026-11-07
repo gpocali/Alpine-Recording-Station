@@ -21,7 +21,9 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -164,6 +166,237 @@ class ProjectPrefixDialog(QDialog):
         self.preview_label.setText(f"Next: {sample}")
 
 
+class HelpDialog(QDialog):
+    """Comprehensive Help & Reference Guide explaining UI controls, modes, and settings."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Help & Studio Reference Guide")
+        self.setModal(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        if parent is not None and parent.width() >= 480:
+            pw, ph = parent.width(), parent.height()
+            self._scale = compute_scale_factor(pw, ph)
+            self.resize(max(760, int(pw * 0.82)), max(520, int(ph * 0.84)))
+        else:
+            self._scale = 1.0
+            self.resize(840, 580)
+
+        self._build_ui()
+        self.setStyleSheet(build_main_stylesheet(self._scale))
+
+    def _build_section_card(self, title: str, body_html: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("CardFrame")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+
+        hdr = QLabel(title)
+        hdr.setObjectName("SectionHeader")
+        layout.addWidget(hdr)
+
+        lbl = QLabel(body_html)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color: #E6EDF3; line-height: 1.4;")
+        layout.addWidget(lbl)
+        return card
+
+    def _wrap_scrollable(self, cards: List[QFrame]) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background-color: #161B22; border: none; }")
+
+        container = QWidget()
+        container.setStyleSheet("background-color: #161B22;")
+        v_layout = QVBoxLayout(container)
+        v_layout.setContentsMargins(14, 14, 14, 14)
+        v_layout.setSpacing(12)
+        for card in cards:
+            v_layout.addWidget(card)
+        v_layout.addStretch(1)
+        scroll.setWidget(container)
+        return scroll
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(12)
+
+        hdr_row = QHBoxLayout()
+        title = QLabel("?  Alpine Recording Station — User Guide && Reference")
+        title.setObjectName("HeaderTitle")
+        hdr_row.addWidget(title)
+        hdr_row.addStretch(1)
+        sub = QLabel("Hotkey: [F1]")
+        sub.setStyleSheet("color: #8B949E; font-family: monospace; font-weight: bold;")
+        hdr_row.addWidget(sub)
+        root.addLayout(hdr_row)
+
+        tabs = QTabWidget()
+
+        # Tab 1: Studio Deck & Transport Controls
+        tab_controls = self._wrap_scrollable([
+            self._build_section_card(
+                "RECORD / RECORDING  [Hotkey: R or Space]",
+                "<b>Record</b> (Green) starts capturing audio to a new timestamped WAV file in "
+                "<code>/storage</code> named <code>&lt;ProjectPrefix&gt;_yyyy-mm-dd_HH.MM.SS_TZ.wav</code>.<br>"
+                "While recording is active, the button displays <b>Recording</b> (Red). Clicking "
+                "<b>Recording</b> stops capture and finalizes the WAV header on disk."
+            ),
+            self._build_section_card(
+                "PAUSE / PAUSED  [Hotkey: P or Pause]",
+                "<b>Pause</b> suspends an active recording. While active, the button displays "
+                "<b>Paused</b> and flashes amber along with the Studio Deck border.<br>"
+                "<b>Safe Disk Closure:</b> When paused, the WAV file header is immediately updated, "
+                "flushed, and closed on disk so the take is safe even if power is lost. Clicking "
+                "<b>Paused</b> reopens the exact same WAV file and seamlessly continues appending audio."
+            ),
+            self._build_section_card(
+                "TALKBACK  [Hotkey: Hold T]",
+                "Available in <b>Studio Mode</b>. Hold down <b>Talkback</b> (or hold <code>[T]</code>) "
+                "for momentary push-to-talk slating and session notes:<br>"
+                "• Mutes the Left (Voiceover) channel so notes stay off the primary performance track.<br>"
+                "• Emits a configurable press marker tone on the Right (Talkback) channel.<br>"
+                "• Records spoken notes onto the Right channel while held (and sends them to the Remote Producer).<br>"
+                "• Emits a configurable release marker tone on the Right channel when released."
+            ),
+            self._build_section_card(
+                "COUGH / MUTED  [Hotkey: Hold B or Click]",
+                "Dual-function talent mute and privacy control:<br>"
+                "• <b>Hold Down (or Hold [B] — Momentary Cough Mute):</b> Mutes the local microphone "
+                "completely (both to the local recording and to the Remote Producer) for as long as the "
+                "button is held. Releasing immediately unmutes.<br>"
+                "• <b>Quick Click — Privacy Mute Toggle:</b> Toggles whether your live microphone is "
+                "streamed to connected Remote Producers while between takes.<br>"
+                "• <b>Flashing Red Alert:</b> Whenever either momentary Cough Mute or Privacy Mute is "
+                "active, the button displays <b>Muted</b> and flashes bright red to draw immediate attention."
+            ),
+        ])
+        tabs.addTab(tab_controls, "Studio Controls")
+
+        # Tab 2: Meters, Storage & Playback
+        tab_meters = self._wrap_scrollable([
+            self._build_section_card(
+                "INPUT VU && PEAK HOLD METER  [Hotkey: C to Reset]",
+                "Displays real-time input levels from <code>-60 dBFS</code> to <code>0 dBFS</code> "
+                "during both standby monitoring and active recording:<br>"
+                "• <b>Green (-60 to -18 dBFS):</b> Normal signal floor and low-level speech.<br>"
+                "• <b>Amber (-18 to -6 dBFS):</b> Optimal nominal voiceover peak target zone.<br>"
+                "• <b>Red (-6 to 0 dBFS):</b> Hot signal approaching digital full scale.<br>"
+                "• <b>PEAK HOLD && CLIP:</b> The bright vertical marker and readout retain your maximum "
+                "peak level for setting preamp gain. <b>CLIP!</b> lights red at <code>-0.1 dBFS</code>. "
+                "Click the meter or press <code>[C]</code> to reset."
+            ),
+            self._build_section_card(
+                "STORAGE CAPACITY && RECORDING TIME REMAINING",
+                "Continuously monitors the <code>/storage</code> partition and calculates remaining "
+                "recording time based on your active Sample Rate, Bit Depth, and Channel count:<br>"
+                "• <b>Blue (0%–80% used):</b> Normal available capacity.<br>"
+                "• <b>Amber (80%–90% used):</b> Warning threshold — offload takes via Samba soon.<br>"
+                "• <b>Red (90%–100% used):</b> Critical threshold — flashes during recording."
+            ),
+            self._build_section_card(
+                "PROJECT PREFIX && REFERENCE PLAYBACK  [Hotkeys: P, S, F5]",
+                "• <b>Project Prefix:</b> Sets the filename prefix for new WAV recordings and filters the "
+                "Project Recordings list to show only takes belonging to the current project.<br>"
+                "• <b>Play / Pause [P] && Stop [S]:</b> Auditions the selected WAV take in the list through "
+                "the configured Playback Output Device.<br>"
+                "• <b>Refresh [F5]:</b> Rescans <code>/storage</code> and connected USB audio hardware."
+            ),
+        ])
+        tabs.addTab(tab_meters, "Meters && Playback")
+
+        # Tab 3: Remote Producer (Guided VO) & SSL
+        tab_remote = self._wrap_scrollable([
+            self._build_section_card(
+                "REMOTE PRODUCER (GUIDED VO)  [Hotkey: F3]",
+                "Provides a low-latency, bidirectional HTTPS/WSS web console for a remote producer or "
+                "director to listen to the session live and prompt the talent using Talkback."
+            ),
+            self._build_section_card(
+                "MIX-MINUS && STUDIO MODE RIGHT-CHANNEL ROUTING",
+                "• <b>Mix-Minus Monitoring:</b> The remote producer hears only the local talent microphone "
+                "(when not muted), and the local talent headphones hear only the remote producer during "
+                "talkback — preventing echo or feedback loops.<br>"
+                "• <b>Studio Mode Right Channel:</b> When either the remote producer or local talent engages "
+                "Talkback in Studio Mode, the Left (VO) channel is muted, marker tones are inserted on the "
+                "Right channel, and both the remote producer and local talent mic are mixed onto the Right "
+                "(Talkback) channel so the full conversation is preserved."
+            ),
+            self._build_section_card(
+                "QR CODE, SESSION LINK && SSL CERTIFICATES",
+                "• <b>Session Authentication:</b> Each session has a unique Session ID, 6-digit PIN, and "
+                "one-step invite token embedded in the QR code and HTTPS link. Clicking <b>New Session && "
+                "Rotate Passcode</b> immediately revokes prior tokens and disconnects previous browsers.<br>"
+                "• <b>SSL / TLS Certificates:</b> Uses an auto-generated X.509 v3 self-signed certificate "
+                "by default. To replace it with an issued certificate, drop <code>server.crt</code> and "
+                "<code>server.key</code> (or <code>fullchain.pem</code> / <code>privkey.pem</code>) into "
+                "<code>/storage/ssl</code> (the <code>ssl/</code> folder on the Samba share) and click "
+                "<b>Import Issued Cert</b>."
+            ),
+        ])
+        tabs.addTab(tab_remote, "Remote Producer")
+
+        # Tab 4: Settings, Samba Share & Keyboard Shortcuts
+        tab_settings = self._wrap_scrollable([
+            self._build_section_card(
+                "AUDIO && RECORDING SETTINGS  [Hotkey: F2]",
+                "• <b>Input / Output Audio Interface:</b> Select the ALSA hardware capture and playback devices.<br>"
+                "• <b>Bit Depth && Sample Rate:</b> Defaults automatically to the highest bit depth (e.g. 24/32-bit) "
+                "and sample rate supported by your USB audio interface.<br>"
+                "• <b>Recording Mode:</b> Choose <b>Normal Mode</b> (standard 1ch Mono or 2ch Stereo) or "
+                "<b>Studio Mode</b> (2ch Stereo with Left = Voiceover Mic and Right = Marker Tone + Talkback).<br>"
+                "• <b>Mic Input Channel:</b> Selects which hardware input channel (e.g. Input 1 / Ch 0) feeds the "
+                "Mono track or Studio Mode Left/Right tracks.<br>"
+                "• <b>Talkback Tone Frequency && Durations:</b> Customize the marker tone pitch (330 Hz to 1000 Hz) "
+                "and independent Press (default 1.0s) and Release (default 0.5s) durations.<br>"
+                "• <b>On-Screen Keyboard:</b> Enables or disables the pop-up touch keyboard for text fields."
+            ),
+            self._build_section_card(
+                "SAMBA NETWORK SHARE ADMINISTRATION",
+                "Manage authenticated usernames and passwords for accessing <code>\\\\&lt;Device-IP&gt;\\storage</code> "
+                "over the network. All recorded files are created with read/write/delete permissions so any "
+                "authorized Samba user can retrieve takes or clean up disk space."
+            ),
+            self._build_section_card(
+                "KEYBOARD SHORTCUTS SUMMARY",
+                "• <code>R</code> or <code>Space</code> : Start / Stop Recording<br>"
+                "• <code>P</code> or <code>Pause</code> : Pause / Resume Recording (or Play / Pause selected take when idle)<br>"
+                "• <code>Hold T</code> : Momentary Studio Mode Talkback<br>"
+                "• <code>Hold B</code> : Momentary Talent Cough Mute<br>"
+                "• <code>C</code> : Reset VU Peak Hold && Clip Indicator<br>"
+                "• <code>M</code> : Toggle Studio Mode / Normal Mode (when idle)<br>"
+                "• <code>S</code> : Stop Reference Playback<br>"
+                "• <code>F1</code> : Open Help && Reference Guide<br>"
+                "• <code>F2</code> or <code>Ctrl+,</code> : Open Settings && Samba Administration<br>"
+                "• <code>F3</code> : Open Remote Producer && SSL Setup<br>"
+                "• <code>F5</code> : Refresh Storage && Audio Hardware<br>"
+                "• <code>F11</code> : Toggle Fullscreen / Windowed Mode<br>"
+                "• <code>Ctrl+Q</code> : Exit to Linux Console (when idle)"
+            ),
+        ])
+        tabs.addTab(tab_settings, "Settings && Hotkeys")
+
+        root.addWidget(tabs, stretch=1)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addStretch(1)
+        close_btn = QPushButton("Close Help")
+        close_btn.setDefault(True)
+        close_btn.setMinimumHeight(38)
+        close_btn.setMinimumWidth(140)
+        close_btn.setStyleSheet(
+            "background-color: #1F6FEB; color: #FFFFFF; font-weight: bold;"
+        )
+        close_btn.clicked.connect(self.accept)
+        bottom_row.addWidget(close_btn)
+        root.addLayout(bottom_row)
+
+
 class MainWindow(QMainWindow):
     """Primary responsive fullscreen UI for the Alpine Recording Station."""
 
@@ -286,6 +519,13 @@ class MainWindow(QMainWindow):
         self.settings_btn.clicked.connect(self._open_settings_dialog)
         top_layout.addWidget(self.settings_btn)
 
+        self.help_btn = QPushButton("? Help")
+        self.help_btn.setToolTip(
+            "Open Help & Reference Guide explaining UI controls, modes, and settings [Hotkey: F1]"
+        )
+        self.help_btn.clicked.connect(self._open_help_dialog)
+        top_layout.addWidget(self.help_btn)
+
         self.main_layout.addWidget(top_frame)
 
         # 2. Hardware & Format Status Strip
@@ -316,7 +556,7 @@ class MainWindow(QMainWindow):
         deck_layout.setSpacing(10)
 
         # Studio Mode / Paused Recording visual indicator banner
-        self.talkback_banner = QLabel("STUDIO MODE READY — RECORDING MIC TO LEFT CHANNEL")
+        self.talkback_banner = QLabel("STUDIO MODE")
         self.talkback_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.talkback_banner.setWordWrap(True)
         deck_layout.addWidget(self.talkback_banner)
@@ -339,7 +579,7 @@ class MainWindow(QMainWindow):
         controls_row = QHBoxLayout()
         controls_row.setSpacing(16)
 
-        self.record_btn = QPushButton("●  RECORD")
+        self.record_btn = QPushButton("Record")
         self.record_btn.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
@@ -349,37 +589,33 @@ class MainWindow(QMainWindow):
         self.record_btn.clicked.connect(self._on_record_button_clicked)
         controls_row.addWidget(self.record_btn, stretch=3)
 
-        self.pause_record_btn = QPushButton("❚❚  PAUSE\nRECORDING")
+        self.pause_record_btn = QPushButton("Pause")
         self.pause_record_btn.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
         self.pause_record_btn.setToolTip(
-            "Pause or resume the current recording (safely closes the WAV file on disk while paused "
-            "and reopens the same file when resumed) [Hotkey: P or Pause while recording]"
+            "Pause or resume the current recording [Hotkey: P or Pause]"
         )
         self.pause_record_btn.clicked.connect(self._on_pause_record_button_clicked)
         controls_row.addWidget(self.pause_record_btn, stretch=2)
 
-        self.talkback_btn = QPushButton("◉  TALKBACK\n(HOLD FOR NOTES)")
+        self.talkback_btn = QPushButton("Talkback")
         self.talkback_btn.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
         self.talkback_btn.setToolTip(
-            "Momentary Push-to-Talk (Studio Mode): Hold down to mute Left channel, "
-            "emit a press marker tone on Right channel, record spoken notes on Right channel "
-            "while held, and emit a release marker tone when concluded [Hotkey: Hold T]"
+            "Momentary Push-to-Talk in Studio Mode [Hotkey: Hold T]"
         )
         self.talkback_btn.pressed.connect(self._on_talkback_pressed)
         self.talkback_btn.released.connect(self._on_talkback_released)
         controls_row.addWidget(self.talkback_btn, stretch=2)
 
-        self.cough_privacy_btn = QPushButton("◉  COUGH / MIC SEND: ON\n(HOLD [B] COUGH • CLICK PRIVACY)")
+        self.cough_privacy_btn = QPushButton("Cough")
         self.cough_privacy_btn.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
         )
         self.cough_privacy_btn.setToolTip(
-            "Talent Cough & Mic Privacy Control: Hold down (or hold [B]) for momentary Cough Mute, "
-            "or click to toggle sending your microphone live to the Remote Producer"
+            "Hold (or hold [B]) for momentary Cough Mute, or click to toggle sending microphone to Remote Producer"
         )
         self.cough_privacy_btn.pressed.connect(self._on_cough_privacy_pressed)
         self.cough_privacy_btn.released.connect(self._on_cough_privacy_released)
@@ -416,7 +652,7 @@ class MainWindow(QMainWindow):
 
         takes_header_row.addStretch(1)
 
-        self.playback_status_label = QLabel("Select a take below for reference playback")
+        self.playback_status_label = QLabel("")
         self.playback_status_label.setStyleSheet("color: #8B949E; font-family: monospace;")
         takes_header_row.addWidget(self.playback_status_label)
 
@@ -500,6 +736,7 @@ class MainWindow(QMainWindow):
         # Static relative widths for header and playback bar buttons so they never resize on click
         self.remote_producer_btn.setFixedWidth(max(195, int(round(250 * self._scale))))
         self.settings_btn.setFixedWidth(max(150, int(round(190 * self._scale))))
+        self.help_btn.setFixedWidth(max(90, int(round(115 * self._scale))))
         self.project_prefix_btn.setFixedWidth(max(135, int(round(170 * self._scale))))
         self.play_btn.setFixedWidth(max(130, int(round(165 * self._scale))))
         self.stop_play_btn.setFixedWidth(max(90, int(round(115 * self._scale))))
@@ -606,7 +843,7 @@ class MainWindow(QMainWindow):
             self.remote_producer_btn.setStyleSheet("")
 
         # Talent Mic Privacy & Cough Button state on Studio Deck (flashes red when muted)
-        cough_font_px = max(13, int(round(18 * self._scale)))
+        cough_font_px = max(14, int(round(20 * self._scale)))
         cough_radius = max(12, int(round(16 * self._scale)))
         cough_pad_v = max(6, int(round(8 * self._scale)))
         cough_pad_h = max(8, int(round(10 * self._scale)))
@@ -615,14 +852,7 @@ class MainWindow(QMainWindow):
             or not self.audio_engine.talent_mic_send_enabled
         )
         if is_mute_active:
-            if self.audio_engine.talent_cough_muted:
-                self.cough_privacy_btn.setText(
-                    "✕  COUGH MUTE ACTIVE\n(MIC MUTED — RELEASE TO UNMUTE)"
-                )
-            else:
-                self.cough_privacy_btn.setText(
-                    "○  MIC TO PRODUCER: OFF\n(PRIVACY MUTE — CLICK FOR ON)"
-                )
+            self.cough_privacy_btn.setText("Muted")
             if blink_on:
                 bg_col = "#D72638"
                 fg_col = "#FFFFFF"
@@ -637,9 +867,7 @@ class MainWindow(QMainWindow):
                 f"font-size: {cough_font_px}px; font-weight: bold; }}"
             )
         else:
-            self.cough_privacy_btn.setText(
-                "◉  COUGH / MIC SEND: ON\n(HOLD [B] COUGH • CLICK PRIVACY)"
-            )
+            self.cough_privacy_btn.setText("Cough")
             self.cough_privacy_btn.setStyleSheet(
                 f"QPushButton {{ background-color: #12261A; color: #7EE787; border: 3px solid #2EA043; "
                 f"border-radius: {cough_radius}px; padding: {cough_pad_v}px {cough_pad_h}px; "
@@ -664,21 +892,17 @@ class MainWindow(QMainWindow):
 
         # Hardware & Format labels + Filename Preview
         if dev is None:
-            self.hw_status_label.setText(
-                "⚠ No Valid Audio Interface Connected — Connect USB Audio Interface or Check Settings [F2]"
-            )
+            self.hw_status_label.setText("⚠ No Audio Interface Connected")
             self.hw_status_label.setStyleSheet("color: #F85149; font-weight: bold;")
             self.format_badge_label.setText("OFFLINE")
         else:
             ch_desc = (
-                "STUDIO STEREO (L:Mic / R:Talkback)"
+                "STUDIO STEREO"
                 if settings.studio_mode
                 else ("STEREO (2ch)" if settings.channels >= 2 else "MONO (1ch)")
             )
             if is_rec_paused:
-                self.hw_status_label.setText(
-                    f"❚❚ RECORDING PAUSED (FILE SAVED & CLOSED: {rec_name}) — WAITING TO RESUME"
-                )
+                self.hw_status_label.setText(f"❚❚ Paused: {rec_name}")
                 status_col = "#FFDF5D" if blink_on else "#F0B72F"
                 self.hw_status_label.setStyleSheet(f"color: {status_col}; font-weight: bold;")
             else:
@@ -690,16 +914,16 @@ class MainWindow(QMainWindow):
 
         self._update_filename_preview()
 
-        # Record / Stop Button & Pause / Resume Button States
+        # Record / Recording & Pause / Paused Button States
         if is_rec:
             self.record_btn.setEnabled(True)
+            self.record_btn.setText("Recording")
             self.record_btn.setStyleSheet(
                 build_record_button_style("recording", self._scale)
             )
             self.pause_record_btn.setEnabled(True)
             if is_rec_paused:
-                self.record_btn.setText("■  STOP && SAVE")
-                self.pause_record_btn.setText("▶   RESUME\nRECORDING")
+                self.pause_record_btn.setText("Paused")
                 self.pause_record_btn.setStyleSheet(
                     build_pause_record_button_style(
                         "paused", self._scale, blink_on=blink_on
@@ -708,57 +932,52 @@ class MainWindow(QMainWindow):
                 timer_col = "#FFDF5D" if blink_on else "#D29922"
                 self.timer_label.setStyleSheet(f"color: {timer_col}; font-weight: bold;")
             else:
-                self.record_btn.setText("■  STOP\nRECORDING")
-                self.pause_record_btn.setText("❚❚   PAUSE\nRECORDING")
+                self.pause_record_btn.setText("Pause")
                 self.pause_record_btn.setStyleSheet(
                     build_pause_record_button_style("active", self._scale)
                 )
                 self.timer_label.setStyleSheet("color: #FF6B7A; font-weight: bold;")
         elif dev is not None:
             self.record_btn.setEnabled(True)
-            self.record_btn.setText("●   RECORD")
+            self.record_btn.setText("Record")
             self.record_btn.setStyleSheet(
                 build_record_button_style("ready", self._scale)
             )
             self.pause_record_btn.setEnabled(False)
-            self.pause_record_btn.setText("❚❚   PAUSE\nRECORDING")
+            self.pause_record_btn.setText("Pause")
             self.pause_record_btn.setStyleSheet(
                 build_pause_record_button_style("disabled", self._scale)
             )
             self.timer_label.setStyleSheet("color: #F0F6FC; font-weight: bold;")
         else:
             self.record_btn.setEnabled(False)
-            self.record_btn.setText("NO AUDIO\nINTERFACE")
+            self.record_btn.setText("Record")
             self.record_btn.setStyleSheet(
                 build_record_button_style("disabled", self._scale)
             )
             self.pause_record_btn.setEnabled(False)
-            self.pause_record_btn.setText("❚❚   PAUSE\nRECORDING")
+            self.pause_record_btn.setText("Pause")
             self.pause_record_btn.setStyleSheet(
                 build_pause_record_button_style("disabled", self._scale)
             )
             self.timer_label.setStyleSheet("color: #6E7681; font-weight: bold;")
 
-        # Talkback button & visual banner state (also shows unmistakable Paused Warning Banner!)
+        # Talkback button & visual banner state
         tb_active = self.audio_engine.talkback_active
         tb_enabled = bool(
             settings.studio_mode and dev is not None and not is_rec_paused
         )
         self.talkback_btn.setVisible(bool(settings.studio_mode))
         self.talkback_btn.setEnabled(tb_enabled)
+        self.talkback_btn.setText("Talkback")
         self.talkback_btn.setStyleSheet(
             build_talkback_button_style(tb_active, tb_enabled, self._scale)
         )
 
         if is_rec_paused:
             self.talkback_banner.setVisible(True)
-            if settings.studio_mode:
-                self.talkback_btn.setText("◉  TALKBACK\n(PAUSED)")
             file_info = f" ({rec_name})" if rec_name else ""
-            self.talkback_banner.setText(
-                f"⚠  RECORDING PAUSED{file_info} — WAV FILE SAVED & CLOSED ON DISK  •  "
-                f"PRESS [RESUME RECORDING] OR [P] TO CONTINUE  ⚠"
-            )
+            self.talkback_banner.setText(f"❚❚ RECORDING PAUSED{file_info}")
             if blink_on:
                 self.talkback_banner.setStyleSheet(
                     "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
@@ -770,45 +989,33 @@ class MainWindow(QMainWindow):
                     "padding: 8px; border-radius: 6px; border: 2px solid #F0B72F;"
                 )
         elif settings.studio_mode:
-            press_dur = f"{settings.talkback_tone_duration_sec:g}s"
-            rel_dur = f"{settings.talkback_release_tone_duration_sec:g}s"
-            freq_hz = f"{settings.talkback_tone_hz:g} Hz"
             self.talkback_banner.setVisible(True)
             if tb_active:
                 if self.audio_engine.remote_talkback_active:
-                    self.talkback_btn.setText("⚡  REMOTE TALKBACK\n(PRODUCER + MIC ON R)")
-                    self.talkback_banner.setText(
-                        f"⚡ REMOTE PRODUCER TALKBACK ACTIVE — LEFT CH MUTED • {press_dur} TONE ({freq_hz}) + PRODUCER && LOCAL MIC ON RIGHT CH (MIX-MINUS) ⚡"
-                    )
+                    self.talkback_banner.setText("⚡ STUDIO MODE — REMOTE PRODUCER TALKBACK")
                 else:
-                    self.talkback_btn.setText("◉  TALKBACK ACTIVE\n(RECORDING RIGHT CH)")
-                    self.talkback_banner.setText(
-                        f"⚡ TALKBACK ACTIVE — LEFT CH MUTED • {press_dur} TONE ({freq_hz}) + MIC ON RIGHT CH (RELEASE: {rel_dur}) ⚡"
-                    )
+                    self.talkback_banner.setText("⚡ STUDIO MODE — TALKBACK ACTIVE")
                 self.talkback_banner.setStyleSheet(
                     "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
                     "padding: 6px; border-radius: 6px; border: 2px solid #FFDF5D;"
                 )
             else:
-                self.talkback_btn.setText("◉  TALKBACK\n(HOLD FOR NOTES)")
-                self.talkback_banner.setText(
-                    f"STUDIO MODE: MIC ON LEFT CH  •  HOLD TALKBACK [T] FOR RIGHT CH NOTES ({freq_hz}: {press_dur} PRESS / {rel_dur} RELEASE)"
-                )
+                self.talkback_banner.setText("STUDIO MODE")
                 self.talkback_banner.setStyleSheet(
                     "background-color: #161B22; color: #58A6FF; font-weight: 600; "
                     "padding: 6px; border-radius: 6px; border: 1px solid #1F6FEB;"
                 )
         elif self.audio_engine.remote_talkback_active:
             self.talkback_banner.setVisible(True)
-            self.talkback_banner.setText("⚡ REMOTE PRODUCER TALKBACK ACTIVE — PROMPTING TALENT ⚡")
+            self.talkback_banner.setText("⚡ NORMAL MODE — REMOTE PRODUCER TALKBACK")
             self.talkback_banner.setStyleSheet(
                 "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
                 "padding: 6px; border-radius: 6px; border: 2px solid #FFDF5D;"
             )
         else:
-            ch_mode_txt = "STEREO (2CH)" if settings.channels >= 2 else "MONO (1CH)"
+            ch_mode_txt = "STEREO" if settings.channels >= 2 else "MONO"
             self.talkback_banner.setVisible(True)
-            self.talkback_banner.setText(f"NORMAL MODE: STANDARD {ch_mode_txt} RECORDING")
+            self.talkback_banner.setText(f"NORMAL MODE ({ch_mode_txt})")
             self.talkback_banner.setStyleSheet(
                 "background-color: #161B22; color: #8B949E; font-weight: 600; "
                 "padding: 6px; border-radius: 6px; border: 1px solid #30363D;"
@@ -1114,7 +1321,7 @@ class MainWindow(QMainWindow):
             self.play_btn.setText("▶ Play / Pause")
             if not is_rec:
                 self.playback_status_label.setText(
-                    f"{len(self._project_recordings)} matching take(s) in /storage"
+                    f"{len(self._project_recordings)} take(s)"
                 )
 
     def _on_manual_refresh(self) -> None:
@@ -1122,6 +1329,11 @@ class MainWindow(QMainWindow):
         self._sync_hardware_state(force_probe=True)
         self._refresh_recordings_list()
         self.ip_bar_label.setText(get_primary_ip_display())
+
+    def _open_help_dialog(self) -> None:
+        dlg = HelpDialog(parent=self)
+        dlg.exec()
+        self.setFocus()
 
     def _open_settings_dialog(self) -> None:
         if self.audio_engine.is_recording:
@@ -1257,6 +1469,9 @@ class MainWindow(QMainWindow):
             return
         if key == Qt.Key.Key_S:
             self._on_stop_playback_clicked()
+            return
+        if key == Qt.Key.Key_F1:
+            self._open_help_dialog()
             return
         if key == Qt.Key.Key_F2 or (
             key == Qt.Key.Key_Comma
