@@ -1394,6 +1394,111 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
             self.assertIn('aria-describedby="talkback-hint"', html)
             self.assertIn("talkback_unlatched", html)
 
+    def test_talent_talkback_temporarily_unmutes_and_shared_talkback_keeps_open_without_extra_beep(self) -> None:
+        engine = AudioEngine(simulate_if_empty=True)
+        devs = engine.get_playback_devices()
+        self.assertGreaterEqual(len(devs), 1)
+        engine.set_talkback_output_device(devs[0])
+        engine.set_talkback_tone_params(
+            tone_hz=440.0,
+            tone_duration_sec=0.1,
+            release_tone_duration_sec=0.05,
+        )
+
+        received = []
+
+        def listener(mono: np.ndarray, sr: int, is_muted: bool) -> None:
+            received.append((mono.copy(), sr, is_muted))
+
+        engine.register_live_audio_listener(listener)
+        try:
+            sample_block = np.full(480, 0.25, dtype=np.float32)
+
+            # 1. Talent activates Mute (toggled mute: talent_mic_send_enabled=False)
+            engine.set_talent_mic_send_enabled(False)
+            self.assertTrue(engine.is_mic_muted)
+            self.assertFalse(engine.is_talent_mic_live_to_producer)
+            engine._update_meter_from_block(sample_block)
+            engine._dispatch_live_input_block(sample_block, 48000)
+            self.assertEqual(engine.get_vu_readings().peak_level, 0.0)
+            self.assertTrue(received[-1][2])  # is_muted=True
+            self.assertAlmostEqual(float(np.max(np.abs(received[-1][0]))), 0.0, places=6)
+
+            # 2. Producer presses Talkback first -> 1 press beep (2400 samples @ 24kHz)
+            engine.set_remote_talkback(True)
+            self.assertTrue(engine.talkback_active)
+            self.assertEqual(engine.talkback_headset_tone_samples_total, 2400)
+            # Talent mic is still muted because Talent has not pressed Talkback yet
+            self.assertTrue(engine.is_mic_muted)
+
+            # 3. Talent ALSO presses Talkback while Producer is holding Talkback:
+            #    - Talent mic temporarily unmutes (is_mic_muted=False, is_talent_mic_live_to_producer=True)
+            #    - NO additional press beep is emitted (still 2400 samples)
+            engine.set_talkback(True)
+            self.assertTrue(engine.local_talkback_active)
+            self.assertTrue(engine.remote_talkback_active)
+            self.assertTrue(engine.talkback_active)
+            self.assertFalse(engine.is_mic_muted)
+            self.assertTrue(engine.is_talent_mic_live_to_producer)
+            self.assertEqual(engine.talkback_headset_tone_samples_total, 2400)
+
+            engine._update_meter_from_block(sample_block)
+            engine._dispatch_live_input_block(sample_block, 48000)
+            self.assertAlmostEqual(engine.get_vu_readings().peak_level, 0.25, places=3)
+            self.assertFalse(received[-1][2])  # is_muted=False
+            self.assertAlmostEqual(float(np.mean(received[-1][0])), 0.25, places=3)
+
+            # 4. Producer stops talking and releases Talkback while Talent is STILL holding Talkback:
+            #    - Talkback remains open (talkback_active=True)
+            #    - NO release or press beep is emitted (still 2400 samples)
+            #    - Talent mic remains unmuted so Talent response is not cut off
+            engine.set_remote_talkback(False)
+            self.assertFalse(engine.remote_talkback_active)
+            self.assertTrue(engine.local_talkback_active)
+            self.assertTrue(engine.talkback_active)
+            self.assertFalse(engine.is_mic_muted)
+            self.assertTrue(engine.is_talent_mic_live_to_producer)
+            self.assertEqual(engine.talkback_headset_tone_samples_total, 2400)
+
+            # Verify StudioTalkbackProcessor also keeps Right channel open without extra beep or cutoff
+            sr = 8000
+            proc = StudioTalkbackProcessor(
+                sample_rate=sr,
+                studio_mode=True,
+                output_channels=2,
+                tone_hz=440.0,
+                tone_duration_sec=0.1,
+                release_tone_duration_sec=0.05,
+            )
+            talent_mic = np.full(800, 0.25, dtype=np.float64)
+            proc.set_remote_talkback(True)
+            # Drain initial 0.1s (800-sample) press tone
+            _ = proc.process_block(talent_mic, local_mic_muted=True)
+            # Talent presses Talkback while Producer is holding -> no new tone, both mixed
+            proc.set_talkback(True)
+            st_both = proc.process_block(talent_mic, local_mic_muted=False)
+            self.assertAlmostEqual(float(np.max(np.abs(st_both[:, 0]))), 0.0, places=5)
+            self.assertAlmostEqual(float(np.mean(st_both[:, 1])), 0.25, places=3)
+            # Producer releases while Talent still holds -> stays open, no release tone, Talent not cut off
+            proc.set_remote_talkback(False)
+            st_talent_still_talking = proc.process_block(talent_mic, local_mic_muted=False)
+            self.assertAlmostEqual(float(np.max(np.abs(st_talent_still_talking[:, 0]))), 0.0, places=5)
+            self.assertAlmostEqual(float(np.mean(st_talent_still_talking[:, 1])), 0.25, places=3)
+
+            # 5. Talent finishes responding and releases Talkback:
+            #    - Single release beep is emitted (2400 + 1200 = 3600 samples)
+            #    - Talent Mute is automatically restored (is_mic_muted=True, VU meter cleared to 0.0)
+            engine.set_talkback(False)
+            self.assertFalse(engine.local_talkback_active)
+            self.assertFalse(engine.talkback_active)
+            self.assertEqual(engine.talkback_headset_tone_samples_total, 2400 + 1200)
+            self.assertTrue(engine.is_mic_muted)
+            self.assertFalse(engine.is_talent_mic_live_to_producer)
+            self.assertFalse(engine.talent_mic_send_enabled)
+            self.assertEqual(engine.get_vu_readings().peak_level, 0.0)
+        finally:
+            engine.unregister_live_audio_listener(listener)
+
     def test_install_script_remote_producer_dependencies_files_and_lbu(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
         install_sh = (repo_root / "install.sh").read_text(encoding="utf-8")
