@@ -35,7 +35,11 @@ from app.config_manager import (
     generate_recording_filename,
     sanitize_project_name,
 )
-from app.network_info import get_primary_ip_display
+from app.network_info import (
+    SystemResourceMonitor,
+    SystemResourceStatus,
+    get_primary_ip_display,
+)
 from app.remote_producer import RemoteProducerServer
 from app.samba_manager import SambaManager
 from app.ui.on_screen_keyboard import OnScreenKeyboardController
@@ -45,6 +49,7 @@ from app.ui.styles import (
     build_main_stylesheet,
     build_pause_record_button_style,
     build_record_button_style,
+    build_system_resource_badge_style,
     build_talkback_button_style,
     compute_scale_factor,
 )
@@ -311,6 +316,13 @@ class HelpDialog(QDialog):
                 "• <b>Red (90%–100% used):</b> Critical threshold — flashes during recording."
             ),
             self._build_section_card(
+                "SYSTEM CPU && RAM OVERLOAD INDICATOR",
+                "Displayed on the right side of the bottom status bar alongside the IP address and Samba share path:<br>"
+                "• <b>Normal (CPU &lt; 75%, RAM &lt; 80%):</b> Subtle telemetry badge showing live CPU % and RAM usage.<br>"
+                "• <b>High Load Warning (Amber — CPU ≥ 75% or RAM ≥ 80%):</b> Elevated system load.<br>"
+                "• <b>Overload Alert (Red — CPU ≥ 90% or RAM ≥ 90%):</b> System is heavily loaded and at risk of audio dropouts or instability."
+            ),
+            self._build_section_card(
                 "PROJECT PREFIX && REFERENCE PLAYBACK  [Hotkeys: P, S, F5]",
                 "• <b>Project Prefix:</b> Sets the filename prefix for new WAV recordings and filters the "
                 "Project Recordings list to show only takes belonging to the current project.<br>"
@@ -464,6 +476,9 @@ class MainWindow(QMainWindow):
         self._last_observed_mute_state = False
         self._pause_blink_phase = True
         self._last_storage_refresh_monotonic: float = 0.0
+        self._last_resource_refresh_monotonic: float = 0.0
+        self.resource_monitor = SystemResourceMonitor()
+        self._last_resource_status = SystemResourceStatus()
 
         self.osk_controller = OnScreenKeyboardController(
             is_enabled=lambda: bool(self.config_manager.settings.on_screen_keyboard),
@@ -707,13 +722,37 @@ class MainWindow(QMainWindow):
 
         self.main_layout.addWidget(takes_frame, stretch=2)
 
-        # 5. Subtle Bottom Status Bar showing Device IP & Samba Share Path
+        # 5. Subtle Bottom Status Bar showing Device IP, Samba Share Path & System CPU/RAM Load
+        self.bottom_bar_frame = QFrame()
+        self.bottom_bar_frame.setObjectName("SubtleIpBarFrame")
+        bottom_bar_layout = QHBoxLayout(self.bottom_bar_frame)
+        bottom_bar_layout.setContentsMargins(10, 3, 10, 3)
+        bottom_bar_layout.setSpacing(12)
+
         self.ip_bar_label = QLabel(get_primary_ip_display())
         self.ip_bar_label.setObjectName("SubtleIpBar")
-        self.ip_bar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.main_layout.addWidget(self.ip_bar_label)
+        self.ip_bar_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        bottom_bar_layout.addWidget(self.ip_bar_label, stretch=1)
+
+        self.sys_resource_label = QLabel()
+        self.sys_resource_label.setObjectName("SystemResourceBadge")
+        self.sys_resource_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.sys_resource_label.setToolTip(
+            "Live System CPU & RAM Utilization Monitor.\n"
+            "• Normal: CPU < 75% and RAM < 80%\n"
+            "• High Load (Amber): CPU >= 75% or RAM >= 80%\n"
+            "• Overload Alert (Red): CPU >= 90% or RAM >= 90% (risk of audio instability)"
+        )
+        bottom_bar_layout.addWidget(self.sys_resource_label)
+
+        self.main_layout.addWidget(self.bottom_bar_frame)
 
         self._update_filename_preview()
+        self._refresh_system_resources()
 
     # -------------------------------------------------------------------------
     # Responsive Scaling & Fullscreen Management
@@ -757,6 +796,9 @@ class MainWindow(QMainWindow):
 
         self.vu_meter.apply_scale(self._scale)
         self.storage_monitor.apply_scale(self._scale)
+        self.sys_resource_label.setStyleSheet(
+            build_system_resource_badge_style(self._last_resource_status.level, self._scale)
+        )
 
         self._refresh_transport_styles()
 
@@ -1074,6 +1116,16 @@ class MainWindow(QMainWindow):
         )
         self._last_storage_refresh_monotonic = time.monotonic()
 
+    def _refresh_system_resources(self) -> None:
+        """Sample live system CPU and RAM usage and update the bottom bar indicator."""
+        res_status = self.resource_monitor.sample()
+        self._last_resource_status = res_status
+        self.sys_resource_label.setText(res_status.format_bar_text())
+        self.sys_resource_label.setStyleSheet(
+            build_system_resource_badge_style(res_status.level, self._scale)
+        )
+        self._last_resource_refresh_monotonic = time.monotonic()
+
     # -------------------------------------------------------------------------
     # Recording, Pause/Resume & Talkback Actions
     # -------------------------------------------------------------------------
@@ -1384,6 +1436,7 @@ class MainWindow(QMainWindow):
         self._sync_hardware_state(force_probe=True)
         self._refresh_recordings_list()
         self.ip_bar_label.setText(get_primary_ip_display())
+        self._refresh_system_resources()
 
     def _open_help_dialog(self) -> None:
         dlg = HelpDialog(parent=self)
@@ -1443,6 +1496,9 @@ class MainWindow(QMainWindow):
             self._pause_blink_phase = blink_now
             self._refresh_transport_styles()
 
+        if now_mono - self._last_resource_refresh_monotonic >= 1.5:
+            self._refresh_system_resources()
+
         if is_rec:
             elapsed = self.audio_engine.elapsed_seconds
             hrs = int(elapsed // 3600)
@@ -1473,6 +1529,7 @@ class MainWindow(QMainWindow):
 
     def _on_background_tick(self) -> None:
         self.ip_bar_label.setText(get_primary_ip_display())
+        self._refresh_system_resources()
         self._update_filename_preview()
         self.config_manager.enforce_storage_permissions()
         self._refresh_storage_status()

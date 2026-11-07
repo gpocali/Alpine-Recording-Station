@@ -918,12 +918,88 @@ class TestUiGlyphsAndButtonMnemonics(unittest.TestCase):
             try:
                 self.assertFalse(hasattr(win, "mode_toggle_btn"))
                 self.assertTrue(hasattr(win, "project_prefix_btn"))
+                self.assertTrue(hasattr(win, "sys_resource_label"))
+                self.assertIn("CPU:", win.sys_resource_label.text())
+                self.assertIn("RAM:", win.sys_resource_label.text())
                 win._on_project_name_changed("Episode 42")
                 self.assertIn("Episode_42_", win.filename_preview_label.text())
                 self.assertIn("Episode_42_*.wav", win.takes_title_label.text())
             finally:
                 win.close()
         _ = app
+
+    def test_system_resource_cpu_and_ram_telemetry(self) -> None:
+        from app.network_info import (
+            SystemResourceMonitor,
+            parse_proc_meminfo,
+            parse_proc_stat_cpu,
+        )
+
+        stat_t1 = "cpu  1000 0 500 8500 0 0 0 0 0 0\ncpu0 1000 0 500 8500 0 0 0 0 0 0\n"
+        stat_t2 = "cpu  1250 0 600 9050 100 0 0 0 0 0\ncpu0 1250 0 600 9050 100 0 0 0 0 0\n"
+        # t1: total = 10000, idle = 8500
+        # t2: total = 11000, idle = 9050 + 100 = 9150 -> delta total = 1000, delta idle = 650 -> busy = 350 -> 35.0%
+        self.assertEqual(parse_proc_stat_cpu(stat_t1), (10000, 8500))
+        self.assertEqual(parse_proc_stat_cpu(stat_t2), (11000, 9150))
+
+        meminfo_sample = (
+            "MemTotal:        4194304 kB\n"
+            "MemFree:         1048576 kB\n"
+            "MemAvailable:    2097152 kB\n"
+            "Buffers:          262144 kB\n"
+            "Cached:           786432 kB\n"
+        )
+        parsed_mem = parse_proc_meminfo(meminfo_sample)
+        self.assertIsNotNone(parsed_mem)
+        if parsed_mem is not None:
+            total_b, used_b = parsed_mem
+            self.assertEqual(total_b, 4 * 1024 ** 3)
+            self.assertEqual(used_b, 2 * 1024 ** 3)
+
+        cpu_samples = [(10000, 8500), (11000, 9150), (12000, 9350), (13000, 9400)]
+        mem_samples = [
+            (4 * 1024 ** 3, 2 * 1024 ** 3),       # 50% RAM
+            (4 * 1024 ** 3, 2 * 1024 ** 3),       # 50% RAM
+            (4 * 1024 ** 3, int(3.4 * 1024 ** 3)),  # 85% RAM (warning)
+            (4 * 1024 ** 3, int(3.8 * 1024 ** 3)),  # 95% RAM (critical)
+        ]
+        cpu_idx = 0
+        mem_idx = 0
+
+        def fake_cpu():
+            nonlocal cpu_idx
+            val = cpu_samples[min(cpu_idx, len(cpu_samples) - 1)]
+            cpu_idx += 1
+            return val
+
+        def fake_mem():
+            nonlocal mem_idx
+            val = mem_samples[min(mem_idx, len(mem_samples) - 1)]
+            mem_idx += 1
+            return val
+
+        mon = SystemResourceMonitor(cpu_times_fn=fake_cpu, mem_info_fn=fake_mem)
+        # Sample 1: CPU 35%, RAM 50% -> ok
+        st1 = mon.sample()
+        self.assertAlmostEqual(st1.cpu_percent, 35.0, places=1)
+        self.assertAlmostEqual(st1.ram_percent, 50.0, places=1)
+        self.assertEqual(st1.level, "ok")
+        self.assertIn("CPU:  35%", st1.format_bar_text())
+        self.assertIn("RAM:  50% (2.0 GB/4.0 GB)", st1.format_bar_text())
+
+        # Sample 2: CPU 80%, RAM 85% -> warning
+        st2 = mon.sample()
+        self.assertAlmostEqual(st2.cpu_percent, 80.0, places=1)
+        self.assertEqual(st2.level, "warning")
+        self.assertTrue(st2.is_warning)
+        self.assertIn("HIGH LOAD", st2.format_bar_text())
+
+        # Sample 3: CPU 95%, RAM 95% -> critical
+        st3 = mon.sample()
+        self.assertAlmostEqual(st3.cpu_percent, 95.0, places=1)
+        self.assertEqual(st3.level, "critical")
+        self.assertTrue(st3.is_critical)
+        self.assertIn("OVERLOAD", st3.format_bar_text())
 
 
 class TestRemoteProducerAndSslSuite(unittest.TestCase):

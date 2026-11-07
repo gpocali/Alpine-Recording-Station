@@ -128,12 +128,18 @@ def build_main_stylesheet(scale: float = 1.0) -> str:
         color: #F0F6FC;
     }}
 
+    QFrame#SubtleIpBarFrame {{
+        background-color: #0D1014;
+        border-top: 1px solid #21262D;
+        border-radius: 6px;
+    }}
+
     QLabel#SubtleIpBar {{
         color: #8B949E;
         font-size: {small_font}px;
-        background-color: #0D1014;
-        padding: 4px 10px;
-        border-top: 1px solid #21262D;
+        background-color: transparent;
+        padding: 3px 8px;
+        border: none;
     }}
 
     QFrame#CardFrame {{
@@ -467,3 +473,29 @@ def build_pause_record_button_style(
         font-weight: bold;
     }}
     """
+
+
+def build_system_resource_badge_style(level: str, scale: float = 1.0) -> str:
+    """Return stylesheet for the bottom-bar CPU & RAM usage indicator badge."""
+    font_px = max(9, int(round(11 * scale)))
+    pad_v = max(2, int(round(2 * scale)))
+    pad_h = max(6, int(round(8 * scale)))
+    radius = max(4, int(round(5 * scale)))
+
+    if level == "critical":
+        return (
+            f"background-color: #6E111A; color: #FFFFFF; border: 1px solid #FF6B7A; "
+            f"border-radius: {radius}px; padding: {pad_v}px {pad_h}px; "
+            f"font-family: monospace; font-weight: bold; font-size: {font_px}px;"
+        )
+    if level == "warning":
+        return (
+            f"background-color: #3B2300; color: #FFDF5D; border: 1px solid #D29922; "
+            f"border-radius: {radius}px; padding: {pad_v}px {pad_h}px; "
+            f"font-family: monospace; font-weight: bold; font-size: {font_px}px;"
+        )
+    return (
+        f"background-color: #161B22; color: #8B949E; border: 1px solid #21262D; "
+        f"border-radius: {radius}px; padding: {pad_v}px {pad_h}px; "
+        f"font-family: monospace; font-weight: 600; font-size: {font_px}px;"
+    )
