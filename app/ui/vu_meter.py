@@ -48,6 +48,7 @@ class _VuMeterCanvas(QWidget):
         self._scale: float = 1.0
         self._readings = VuMeterReadings()
         self._has_device: bool = False
+        self._is_muted: bool = False
 
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding
@@ -63,9 +64,15 @@ class _VuMeterCanvas(QWidget):
             "Click anywhere on the meter or press [C] to reset Peak Hold."
         )
 
-    def set_state(self, readings: VuMeterReadings, has_device: bool) -> None:
+    def set_state(
+        self,
+        readings: VuMeterReadings,
+        has_device: bool,
+        is_muted: bool = False,
+    ) -> None:
         self._readings = readings
         self._has_device = has_device
+        self._is_muted = bool(is_muted)
         self.update()
 
     def apply_scale(self, scale: float) -> None:
@@ -170,12 +177,21 @@ class _VuMeterCanvas(QWidget):
             painter.setBrush(QBrush(QColor("#090C10")))
             painter.drawRoundedRect(track_rect, 4.0, 4.0)
 
-            peak_lin = ch_peaks[ch_idx] if ch_idx < len(ch_peaks) else self._readings.peak_level
-            rms_lin = ch_rms[ch_idx] if ch_idx < len(ch_rms) else self._readings.rms_level
+            peak_lin = (
+                0.0
+                if self._is_muted
+                else (ch_peaks[ch_idx] if ch_idx < len(ch_peaks) else self._readings.peak_level)
+            )
+            rms_lin = (
+                0.0
+                if self._is_muted
+                else (ch_rms[ch_idx] if ch_idx < len(ch_rms) else self._readings.rms_level)
+            )
             hold_lin = ch_holds[ch_idx] if ch_idx < len(ch_holds) else self._readings.peak_hold_level
 
-            peak_ratio = dbfs_to_ratio(linear_to_dbfs(peak_lin)) if self._has_device else 0.0
-            rms_ratio = dbfs_to_ratio(linear_to_dbfs(rms_lin)) if self._has_device else 0.0
+            active_signal = self._has_device and not self._is_muted
+            peak_ratio = dbfs_to_ratio(linear_to_dbfs(peak_lin)) if active_signal else 0.0
+            rms_ratio = dbfs_to_ratio(linear_to_dbfs(rms_lin)) if active_signal else 0.0
             hold_db = linear_to_dbfs(hold_lin)
             hold_ratio = dbfs_to_ratio(hold_db)
 
@@ -190,7 +206,7 @@ class _VuMeterCanvas(QWidget):
                 seg_db = METER_FLOOR_DB + seg_ratio_end * abs(METER_FLOOR_DB)
                 rms_col, peak_col, dim_col = self._segment_colors(seg_db)
 
-                if self._has_device and peak_ratio > seg_ratio_start:
+                if active_signal and peak_ratio > seg_ratio_start:
                     if rms_ratio >= seg_ratio_end:
                         fill_col = rms_col
                     else:
@@ -286,6 +302,10 @@ class VuMeterWidget(QFrame):
         self._on_reset_peak = on_reset_peak
         self._scale = 1.0
         self._readings = VuMeterReadings()
+        self._is_recording: bool = False
+        self._has_device: bool = False
+        self._is_paused: bool = False
+        self._is_muted: bool = False
 
         self.setObjectName("VuMeterFrame")
         self.setStyleSheet(
@@ -356,15 +376,21 @@ class VuMeterWidget(QFrame):
         is_recording: bool = False,
         has_device: bool = True,
         is_paused: bool = False,
+        is_muted: bool = False,
     ) -> None:
         """Update graphical VU meter bars, Peak Hold marker, and digital dBFS readouts."""
         self._readings = readings
-        self.canvas.set_state(readings, has_device=has_device)
+        self._is_recording = bool(is_recording)
+        self._has_device = bool(has_device)
+        self._is_paused = bool(is_paused)
+        self._is_muted = bool(is_muted)
+        self.canvas.set_state(readings, has_device=has_device, is_muted=is_muted)
         self._refresh_readouts(
             readings,
             is_recording=is_recording,
             has_device=has_device,
             is_paused=is_paused,
+            is_muted=is_muted,
         )
 
     def _refresh_readouts(
@@ -373,6 +399,7 @@ class VuMeterWidget(QFrame):
         is_recording: bool,
         has_device: bool,
         is_paused: bool = False,
+        is_muted: bool = False,
     ) -> None:
         small_px = max(10, int(round(12 * self._scale)))
         btn_pad_v = max(2, int(round(3 * self._scale)))
@@ -383,6 +410,11 @@ class VuMeterWidget(QFrame):
             self.title_label.setText("○ INPUT VU METER (OFFLINE)")
             self.title_label.setStyleSheet(
                 f"border: none; color: #6E7681; font-weight: bold; font-size: {small_px}px;"
+            )
+        elif is_muted:
+            self.title_label.setText("✕ INPUT VU METER (MIC MUTED)")
+            self.title_label.setStyleSheet(
+                f"border: none; color: #FF6B7A; font-weight: bold; font-size: {small_px}px;"
             )
         elif is_recording and is_paused:
             self.title_label.setText(
@@ -403,7 +435,7 @@ class VuMeterWidget(QFrame):
             )
 
         # Live input dBFS readout
-        if not has_device or readings.peak_level <= 1e-4:
+        if not has_device or is_muted or readings.peak_level <= 1e-4:
             self.live_db_label.setText("LIVE: -∞ dBFS")
         else:
             self.live_db_label.setText(f"LIVE: {readings.peak_db:+5.1f} dBFS")
@@ -467,8 +499,14 @@ class VuMeterWidget(QFrame):
         self.canvas.apply_scale(self._scale)
         self._refresh_readouts(
             self._readings,
-            is_recording=False,
-            has_device=(self._readings.active or self._readings.peak_hold_level > 0.0),
+            is_recording=self._is_recording,
+            has_device=(
+                self._has_device
+                or self._readings.active
+                or self._readings.peak_hold_level > 0.0
+            ),
+            is_paused=self._is_paused,
+            is_muted=self._is_muted,
         )
 
     def value(self) -> int:

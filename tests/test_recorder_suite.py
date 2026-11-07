@@ -1032,23 +1032,40 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
         sample_block = np.full(480, 0.25, dtype=np.float32)
 
         # Default: talent mic send enabled, not cough muted
+        engine._update_meter_from_block(sample_block)
         engine._dispatch_live_input_block(sample_block, 48000)
         self.assertEqual(len(received), 1)
         self.assertFalse(received[-1][2])
         self.assertAlmostEqual(float(np.mean(received[-1][0])), 0.25, places=3)
+        self.assertAlmostEqual(engine.get_vu_readings().peak_level, 0.25, places=3)
 
-        # Momentary cough mute -> listener receives zeroed samples & is_muted=True
+        # Momentary cough mute -> listener receives zeroed samples, is_muted=True, and VU meter goes silent
         engine.set_talent_cough_muted(True)
+        self.assertTrue(engine.is_mic_muted)
+        self.assertEqual(engine.get_vu_readings().peak_level, 0.0)
+        self.assertEqual(engine.get_vu_readings().rms_level, 0.0)
+        engine._update_meter_from_block(sample_block)
+        self.assertEqual(engine.get_vu_readings().peak_level, 0.0)
         engine._dispatch_live_input_block(sample_block, 48000)
         self.assertTrue(received[-1][2])
         self.assertAlmostEqual(float(np.max(np.abs(received[-1][0]))), 0.0, places=6)
 
-        # Release cough mute, disable mic send for privacy -> still muted
+        # Release cough mute, disable mic send (toggled Mute) -> still muted and VU meter remains silent
         engine.set_talent_cough_muted(False)
         engine.set_talent_mic_send_enabled(False)
+        self.assertTrue(engine.is_mic_muted)
+        engine._update_meter_from_block(sample_block)
+        self.assertEqual(engine.get_vu_readings().peak_level, 0.0)
+        self.assertEqual(engine.get_vu_readings().rms_level, 0.0)
         engine._dispatch_live_input_block(sample_block, 48000)
         self.assertTrue(received[-1][2])
         self.assertAlmostEqual(float(np.max(np.abs(received[-1][0]))), 0.0, places=6)
+
+        # Re-enabling mic restores live VU meter response
+        engine.set_talent_mic_send_enabled(True)
+        self.assertFalse(engine.is_mic_muted)
+        engine._update_meter_from_block(sample_block)
+        self.assertAlmostEqual(engine.get_vu_readings().peak_level, 0.25, places=3)
 
         engine.unregister_live_audio_listener(listener)
 

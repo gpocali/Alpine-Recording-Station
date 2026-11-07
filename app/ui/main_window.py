@@ -270,10 +270,11 @@ class HelpDialog(QDialog):
                 "• <b>Hold Down (or Hold [B] — Momentary Cough Mute):</b> Mutes the local microphone "
                 "completely (both to the local recording and to the Remote Producer) for as long as the "
                 "button is held. Releasing immediately unmutes.<br>"
-                "• <b>Quick Click — Privacy Mute Toggle:</b> Toggles whether your live microphone is "
-                "streamed to connected Remote Producers while between takes.<br>"
-                "• <b>Flashing Red Alert:</b> Whenever either momentary Cough Mute or Privacy Mute is "
-                "active, the button displays <b>Muted</b> and flashes bright red to draw immediate attention."
+                "• <b>Quick Click — Mute Toggle:</b> Toggles microphone mute on or off, "
+                "silencing the microphone input, the VU meter, and the Remote Producer feed.<br>"
+                "• <b>Flashing Red Alert && Silent VU Meter:</b> Whenever either momentary Cough Mute or "
+                "Mute Toggle is active, the button displays <b>Muted</b>, flashes bright red, and the "
+                "VU meter goes silent to confirm no microphone input is being taken."
             ),
         ])
         tabs.addTab(tab_controls, "Studio Controls")
@@ -1021,8 +1022,19 @@ class MainWindow(QMainWindow):
                 "padding: 6px; border-radius: 6px; border: 1px solid #30363D;"
             )
 
+        self._refresh_vu_meter()
         self._refresh_storage_status()
         self._update_playback_buttons_state()
+
+    def _refresh_vu_meter(self) -> None:
+        readings = self.audio_engine.get_vu_readings()
+        self.vu_meter.set_readings(
+            readings,
+            is_recording=self.audio_engine.is_recording,
+            has_device=(self._active_input_device is not None),
+            is_paused=self.audio_engine.is_record_paused,
+            is_muted=self.audio_engine.is_mic_muted,
+        )
 
     def _refresh_storage_status(self) -> None:
         """Query /storage drive utilization and update the StorageMonitorWidget."""
@@ -1093,13 +1105,7 @@ class MainWindow(QMainWindow):
 
     def _on_reset_peak_hold(self) -> None:
         self.audio_engine.reset_peak_hold()
-        readings = self.audio_engine.get_vu_readings()
-        self.vu_meter.set_readings(
-            readings,
-            is_recording=self.audio_engine.is_recording,
-            has_device=(self._active_input_device is not None),
-            is_paused=self.audio_engine.is_record_paused,
-        )
+        self._refresh_vu_meter()
         self.setFocus()
 
     def _on_recording_error_threadsafe(self, err_msg: str) -> None:
@@ -1357,13 +1363,7 @@ class MainWindow(QMainWindow):
     def _on_ui_tick(self) -> None:
         is_rec = self.audio_engine.is_recording
         is_rec_paused = self.audio_engine.is_record_paused
-        readings = self.audio_engine.get_vu_readings()
-        self.vu_meter.set_readings(
-            readings,
-            is_recording=is_rec,
-            has_device=(self._active_input_device is not None),
-            is_paused=is_rec_paused,
-        )
+        self._refresh_vu_meter()
 
         # Detect asynchronous changes from Remote Producer (talkback, client connection, or mute state)
         tb_now = self.audio_engine.talkback_active

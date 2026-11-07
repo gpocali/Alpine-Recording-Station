@@ -307,12 +307,17 @@ class StudioTalkbackProcessor:
             return np.zeros((0, self.output_channels), dtype=np.float64)
 
         mic_ch_idx = min(self.input_channel, hw_channels - 1)
-        mic_signal = input_frames[:, mic_ch_idx]
+        if local_mic_muted and not self.local_talkback_active:
+            mic_signal = np.zeros(num_frames, dtype=np.float64)
+        else:
+            mic_signal = input_frames[:, mic_ch_idx]
 
         if not self.studio_mode:
             if self.output_channels == 1:
                 return mic_signal[:, np.newaxis].copy()
             # Stereo Normal Mode
+            if local_mic_muted:
+                return np.zeros((num_frames, 2), dtype=np.float64)
             if hw_channels >= 2:
                 return input_frames[:, :2].copy()
             return np.column_stack((mic_signal, mic_signal))
@@ -1059,13 +1064,28 @@ class AudioEngine:
             self._channel_peak_holds = [0.0] * max(1, self._meter_channels)
             self._clipped = False
 
+    def _clear_live_meter_levels(self) -> None:
+        """Immediately zero live RMS and Peak VU meter levels (e.g. when the mic is muted)."""
+        with self._meter_lock:
+            self._peak_level = 0.0
+            self._rms_level = 0.0
+            self._channel_peaks = [0.0] * max(1, self._meter_channels)
+            self._channel_rms = [0.0] * max(1, self._meter_channels)
+            self._last_meter_update_monotonic = time.monotonic()
+
     def get_vu_readings(self) -> VuMeterReadings:
         """Return a snapshot of current VU meter levels (linear & dBFS) and maintained Peak Hold."""
         active = self.is_recording or self.is_monitoring
+        muted = self.is_mic_muted
         now = time.monotonic()
 
         with self._meter_lock:
-            if not active and (self._peak_level > 0.0 or self._rms_level > 0.0):
+            if muted:
+                self._peak_level = 0.0
+                self._rms_level = 0.0
+                self._channel_peaks = [0.0] * max(1, self._meter_channels)
+                self._channel_rms = [0.0] * max(1, self._meter_channels)
+            elif not active and (self._peak_level > 0.0 or self._rms_level > 0.0):
                 dt = max(0.0, now - self._last_meter_update_monotonic)
                 if dt > 0.08:
                     decay = 0.65 ** min(20.0, dt / 0.05)
@@ -1137,6 +1157,18 @@ class AudioEngine:
 
         num_frames, num_ch = metered_block.shape
         if num_frames == 0 or num_ch == 0:
+            return
+
+        if self.is_mic_muted:
+            with self._meter_lock:
+                if self._meter_channels != num_ch or len(self._channel_peaks) != num_ch:
+                    self._meter_channels = num_ch
+                    self._channel_peak_holds = [0.0] * num_ch
+                self._peak_level = 0.0
+                self._rms_level = 0.0
+                self._channel_peaks = [0.0] * num_ch
+                self._channel_rms = [0.0] * num_ch
+                self._last_meter_update_monotonic = time.monotonic()
             return
 
         abs_block = np.abs(metered_block)
@@ -1312,7 +1344,7 @@ class AudioEngine:
             t0 = time.monotonic()
             in_block = self._generate_simulated_input_block(chunk_frames, sample_rate, phase)
             phase += chunk_frames
-            if self._talent_cough_muted:
+            if self.is_mic_muted:
                 in_block = np.zeros_like(in_block)
 
             metered = self._extract_metered_input(
@@ -1400,7 +1432,7 @@ class AudioEngine:
                 in_float = self._decode_alsa_bytes(
                     raw_slice, int(frames_read), hw_channels, alsa_fmt
                 )
-                if self._talent_cough_muted:
+                if self.is_mic_muted:
                     in_float = np.zeros_like(in_float)
                 metered = self._extract_metered_input(
                     in_float, studio_mode, channels, input_channel
@@ -1419,21 +1451,30 @@ class AudioEngine:
         return self._talent_mic_send_enabled
 
     def set_talent_mic_send_enabled(self, enabled: bool) -> None:
-        """Enable or disable sending the talent's live microphone feed to the remote producer."""
+        """Enable or disable sending the talent's live microphone feed (and unmuting/muting mic input)."""
         self._talent_mic_send_enabled = bool(enabled)
+        if not self._talent_mic_send_enabled:
+            self._clear_live_meter_levels()
 
     @property
     def talent_cough_muted(self) -> bool:
         return self._talent_cough_muted
 
     def set_talent_cough_muted(self, muted: bool) -> None:
-        """Set momentary Cough / Privacy mute state on the talent's producer feed."""
+        """Set momentary Cough / Privacy mute state on the talent's microphone."""
         self._talent_cough_muted = bool(muted)
+        if self._talent_cough_muted:
+            self._clear_live_meter_levels()
+
+    @property
+    def is_mic_muted(self) -> bool:
+        """Return True when the local microphone is muted (momentary cough mute or toggled mute)."""
+        return bool(self._talent_cough_muted or not self._talent_mic_send_enabled)
 
     @property
     def is_talent_mic_live_to_producer(self) -> bool:
         """Return True when the talent's microphone is permitted to stream to the remote producer."""
-        return bool(self._talent_mic_send_enabled and not self._talent_cough_muted)
+        return not self.is_mic_muted
 
     def register_live_audio_listener(
         self, callback: Callable[[np.ndarray, int, bool], None]
@@ -1923,7 +1964,7 @@ class AudioEngine:
             t0 = time.monotonic()
             in_block = self._generate_simulated_input_block(chunk_frames, sample_rate, phase)
             phase += chunk_frames
-            if self._talent_cough_muted:
+            if self.is_mic_muted:
                 in_block = np.zeros_like(in_block)
 
             metered = self._extract_metered_input(
@@ -2036,7 +2077,7 @@ class AudioEngine:
                 in_float = self._decode_alsa_bytes(
                     raw_slice, int(frames_read), hw_channels, alsa_fmt
                 )
-                if self._talent_cough_muted:
+                if self.is_mic_muted:
                     in_float = np.zeros_like(in_float)
                 metered = self._extract_metered_input(
                     in_float,
