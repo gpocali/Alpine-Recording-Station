@@ -1,4 +1,4 @@
-"""Storage Capacity & Recording Time Remaining Monitor widget (Circular Ring Gauge + Smooth Capacity Pill + Digital Readout)."""
+"""Storage Capacity & Recording Time Remaining Monitor widget (Smooth Capacity Pill + Digital Readout)."""
 
 from __future__ import annotations
 
@@ -29,93 +29,6 @@ from app.config_manager import (
     STORAGE_WARN_USED_PERCENT,
     StorageStatus,
 )
-
-
-class _StorageRingGauge(QWidget):
-    """Compact circular donut/arc gauge showing 0..100% drive utilization (visually distinct from horizontal VU bars)."""
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self._scale: float = 1.0
-        self._status = StorageStatus(storage_path=Path("/storage"))
-        self.setFixedSize(44, 44)
-
-    def set_status(self, status: StorageStatus) -> None:
-        self._status = status
-        self.update()
-
-    def apply_scale(self, scale: float) -> None:
-        self._scale = max(0.55, float(scale))
-        sz = max(34, int(round(44 * self._scale)))
-        self.setFixedSize(sz, sz)
-        self.update()
-
-    def paintEvent(self, _event: QPaintEvent) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        w = float(self.width())
-        h = float(self.height())
-        side = min(w, h)
-        if side <= 12:
-            painter.end()
-            return
-
-        stroke = max(3.5, round(4.8 * self._scale))
-        pad = stroke / 2.0 + 2.0
-        rect = QRectF(
-            (w - side) / 2.0 + pad,
-            (h - side) / 2.0 + pad,
-            side - 2.0 * pad,
-            side - 2.0 * pad,
-        )
-
-        # Background circular ring track (270-degree sweep starting at 225 deg)
-        start_angle_16 = 225 * 16
-        total_span_16 = -270 * 16
-
-        track_pen = QPen(QColor("#21262D"), stroke)
-        track_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(track_pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawArc(rect, start_angle_16, total_span_16)
-
-        st = self._status
-        pct = min(100.0, max(0.0, float(st.used_percent))) if st.available else 0.0
-
-        if not st.available:
-            arc_color = QColor("#484F58")
-            text_color = QColor("#6E7681")
-        elif st.is_critical:
-            arc_color = QColor("#F85149")
-            text_color = QColor("#FF6B7A")
-        elif st.is_warning:
-            arc_color = QColor("#F0B72F")
-            text_color = QColor("#FFDF5D")
-        else:
-            arc_color = QColor("#388BFD")
-            text_color = QColor("#E6EDF3")
-
-        if st.available and pct > 0.2:
-            fill_span_16 = int(round(total_span_16 * (pct / 100.0)))
-            fill_pen = QPen(arc_color, stroke)
-            fill_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            painter.setPen(fill_pen)
-            painter.drawArc(rect, start_angle_16, fill_span_16)
-
-        # Percentage readout centered inside the circular ring
-        font_px = max(8, int(round(10 * self._scale)))
-        font = QFont("DejaVu Sans Mono", font_px, QFont.Weight.Bold)
-        font.setStyleHint(QFont.StyleHint.Monospace)
-        painter.setFont(font)
-        painter.setPen(text_color)
-        pct_text = f"{int(round(pct))}%" if st.available else "--"
-        painter.drawText(
-            QRectF(0.0, 0.0, w, h),
-            int(Qt.AlignmentFlag.AlignCenter),
-            pct_text,
-        )
-        painter.end()
 
 
 class _StorageCapacityPill(QWidget):
@@ -224,8 +137,8 @@ class _StorageCapacityPill(QWidget):
 class StorageMonitorWidget(QFrame):
     """Horizontal Storage Capacity & Recording Time Remaining Telemetry Strip.
 
-    Designed with a circular donut ring gauge, a smooth continuous capacity pill bar,
-    and a digital remaining-time counter box so it is visually distinct from the audio VU meter.
+    Designed with a smooth continuous capacity pill bar and a digital remaining-time
+    counter box so it is visually distinct from the audio VU meter.
     """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -241,10 +154,7 @@ class StorageMonitorWidget(QFrame):
         root_layout.setContentsMargins(12, 6, 12, 6)
         root_layout.setSpacing(12)
 
-        # 1. Left Zone: Circular Donut Ring Gauge + Drive Title & Status Badge
-        self.ring_gauge = _StorageRingGauge(parent=self)
-        root_layout.addWidget(self.ring_gauge)
-
+        # 1. Left Zone: Drive Title & Status Badge
         drive_info_col = QVBoxLayout()
         drive_info_col.setContentsMargins(0, 0, 0, 0)
         drive_info_col.setSpacing(2)
@@ -317,17 +227,15 @@ class StorageMonitorWidget(QFrame):
         is_recording: bool = False,
         blink_on: bool = True,
     ) -> None:
-        """Update circular ring gauge, smooth capacity pill, and remaining recording time readout."""
+        """Update smooth capacity pill and remaining recording time readout."""
         self._status = status
         self._is_recording = bool(is_recording)
         self._blink_on = bool(blink_on)
-        self.ring_gauge.set_status(status)
         self.canvas.set_status(status)
         self._refresh_readouts()
 
     def apply_scale(self, scale: float) -> None:
         self._scale = max(0.55, float(scale))
-        self.ring_gauge.apply_scale(self._scale)
         self.canvas.apply_scale(self._scale)
         self._refresh_readouts()
 

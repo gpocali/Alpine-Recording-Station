@@ -10,7 +10,8 @@ from typing import List, Optional
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QKeyEvent, QResizeEvent
 from PyQt6.QtWidgets import (
-     QFrame,
+    QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -49,6 +50,118 @@ from app.ui.storage_monitor import StorageMonitorWidget
 from app.ui.vu_meter import VuMeterWidget
 
 logger = logging.getLogger(__name__)
+
+
+class ProjectPrefixDialog(QDialog):
+    """Modal dialog for viewing and editing the Project Prefix."""
+
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.config_manager = config_manager
+        self.setWindowTitle("Set Project Prefix")
+        self.setModal(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        if parent is not None and parent.width() >= 480:
+            pw, ph = parent.width(), parent.height()
+            self._scale = compute_scale_factor(pw, ph)
+            self.resize(max(480, int(pw * 0.52)), max(240, int(ph * 0.36)))
+        else:
+            self._scale = 1.0
+            self.resize(520, 260)
+
+        self.osk_controller = OnScreenKeyboardController(
+            is_enabled=lambda: bool(self.config_manager.settings.on_screen_keyboard),
+            parent=self,
+        )
+
+        self._build_ui()
+        self.setStyleSheet(build_main_stylesheet(self._scale))
+        self.osk_controller.register_line_edit(
+            self.prefix_edit,
+            title="Project Prefix",
+            hint="Output WAV format: <ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav",
+        )
+        self.osk_controller.attach_to_container(self)
+        self._update_preview(self.prefix_edit.text())
+
+    @property
+    def project_name(self) -> str:
+        return self.prefix_edit.text().strip()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        title_label = QLabel("Project Prefix")
+        title_label.setObjectName("HeaderTitle")
+        layout.addWidget(title_label)
+
+        desc_label = QLabel(
+            "Enter the project name prefix for output WAV files.\n"
+            "Only takes matching this project prefix are shown in the Project Recordings list."
+        )
+        desc_label.setWordWrap(True)
+        desc_label.setStyleSheet("color: #8B949E;")
+        layout.addWidget(desc_label)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+
+        self.prefix_edit = QLineEdit(self.config_manager.settings.project_name)
+        self.prefix_edit.setPlaceholderText("Enter Project Name...")
+        self.prefix_edit.textChanged.connect(self._update_preview)
+        self.prefix_edit.returnPressed.connect(self.accept)
+        input_row.addWidget(self.prefix_edit, stretch=1)
+
+        self.osk_btn = QPushButton("⌨ Touch Keyboard")
+        self.osk_btn.setToolTip(
+            "Open On-Screen Touch Keyboard to edit Project Prefix"
+        )
+        self.osk_btn.setVisible(bool(self.config_manager.settings.on_screen_keyboard))
+        self.osk_btn.clicked.connect(
+            lambda: self.osk_controller.open_for_line_edit(self.prefix_edit)
+        )
+        input_row.addWidget(self.osk_btn)
+        layout.addLayout(input_row)
+
+        self.preview_label = QLabel()
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet(
+            "background-color: #0D1014; color: #58A6FF; font-family: monospace; "
+            "padding: 8px 10px; border-radius: 6px; border: 1px solid #21262D;"
+        )
+        layout.addWidget(self.preview_label)
+
+        layout.addStretch(1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip("Discard changes and close [Hotkey: Esc]")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.cancel_btn)
+
+        self.save_btn = QPushButton("Save && Apply")
+        self.save_btn.setToolTip("Save the Project Prefix and update the recordings list [Hotkey: Enter]")
+        self.save_btn.setDefault(True)
+        self.save_btn.setStyleSheet(
+            "background-color: #1F6FEB; color: #FFFFFF; font-weight: bold;"
+        )
+        self.save_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self.save_btn)
+
+        layout.addLayout(btn_row)
+
+    def _update_preview(self, text: str) -> None:
+        sample = generate_recording_filename(text)
+        self.preview_label.setText(f"Next: {sample}")
 
 
 class MainWindow(QMainWindow):
@@ -112,11 +225,6 @@ class MainWindow(QMainWindow):
         )
 
         self._build_ui()
-        self.osk_controller.register_line_edit(
-            self.project_edit,
-            title="Project Prefix",
-            hint="Output WAV format: <ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav",
-        )
         self.osk_controller.attach_to_container(self)
         self._sync_hardware_state()
         self._refresh_recordings_list()
@@ -145,7 +253,7 @@ class MainWindow(QMainWindow):
         self.main_layout.setContentsMargins(18, 14, 18, 8)
         self.main_layout.setSpacing(12)
 
-        # 1. Top Bar: Project Name Prefix, Active Hardware Summary, Mode Toggle, Settings
+        # 1. Top Bar: Next Filename Preview, Remote Producer, Settings
         top_frame = QFrame()
         top_frame.setStyleSheet(
             "QFrame { background-color: #161B22; border: 1px solid #30363D; border-radius: 8px; }"
@@ -154,41 +262,14 @@ class MainWindow(QMainWindow):
         top_layout.setContentsMargins(12, 8, 12, 8)
         top_layout.setSpacing(12)
 
-        proj_label = QLabel("Project Prefix:")
-        proj_label.setStyleSheet("border: none; font-weight: bold;")
-        top_layout.addWidget(proj_label)
-
-        self.project_edit = QLineEdit(self.config_manager.settings.project_name)
-        self.project_edit.setPlaceholderText("Enter Project Name...")
-        self.project_edit.setToolTip(
-            "Project name prefix for output WAV files (<Project>_yyyy-mm-dd_HH.MM.SS_TZ.wav).\n"
-            "Only takes matching this project prefix are shown in the list below."
-        )
-        self.project_edit.textChanged.connect(self._on_project_name_changed)
-        self.project_edit.returnPressed.connect(self.setFocus)
-        top_layout.addWidget(self.project_edit, stretch=2)
-
-        self.project_osk_btn = QPushButton("⌨")
-        self.project_osk_btn.setToolTip(
-            "Open On-Screen Touch Keyboard to edit Project Prefix"
-        )
-        self.project_osk_btn.clicked.connect(
-            lambda: self.osk_controller.open_for_line_edit(self.project_edit)
-        )
-        top_layout.addWidget(self.project_osk_btn)
-
         self.filename_preview_label = QLabel()
+        self.filename_preview_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         self.filename_preview_label.setStyleSheet(
             "border: none; color: #8B949E; font-family: monospace;"
         )
-        top_layout.addWidget(self.filename_preview_label, stretch=2)
-
-        self.mode_toggle_btn = QPushButton()
-        self.mode_toggle_btn.setToolTip(
-            "Toggle between Normal Mode and Studio Mode (L=Mic, R=Tone + Talkback) [Hotkey: M]"
-        )
-        self.mode_toggle_btn.clicked.connect(self._on_toggle_studio_mode)
-        top_layout.addWidget(self.mode_toggle_btn)
+        top_layout.addWidget(self.filename_preview_label, stretch=1)
 
         self.remote_producer_btn = QPushButton("◎ Remote Producer")
         self.remote_producer_btn.setToolTip(
@@ -324,6 +405,14 @@ class MainWindow(QMainWindow):
         self.takes_title_label = QLabel("Project Recordings")
         self.takes_title_label.setObjectName("HeaderTitle")
         takes_header_row.addWidget(self.takes_title_label)
+
+        self.project_prefix_btn = QPushButton("✎ Project Prefix")
+        self.project_prefix_btn.setToolTip(
+            "Open dialog to view or change the Project Prefix for output WAV files and take filtering"
+        )
+        self.project_prefix_btn.clicked.connect(self._open_project_prefix_dialog)
+        takes_header_row.addWidget(self.project_prefix_btn)
+
         takes_header_row.addStretch(1)
 
         self.playback_status_label = QLabel("Select a take below for reference playback")
@@ -481,21 +570,8 @@ class MainWindow(QMainWindow):
         rec_path = self.audio_engine.current_recording_path
         rec_name = rec_path.name if rec_path is not None else ""
 
-        # Mode toggle button text
-        if settings.studio_mode:
-            self.mode_toggle_btn.setText("Mode: STUDIO (L=Mic / R=Talkback)")
-            self.mode_toggle_btn.setStyleSheet(
-                "background-color: #1F3A5F; color: #58A6FF; border: 1px solid #388BFD; font-weight: bold;"
-            )
-        else:
-            ch_txt = "Stereo" if settings.channels >= 2 else "Mono"
-            self.mode_toggle_btn.setText(f"Mode: NORMAL ({ch_txt})")
-            self.mode_toggle_btn.setStyleSheet("")
-        self.mode_toggle_btn.setEnabled(not is_rec)
         self.settings_btn.setEnabled(not is_rec)
-        self.project_edit.setEnabled(not is_rec)
-        self.project_osk_btn.setVisible(bool(settings.on_screen_keyboard))
-        self.project_osk_btn.setEnabled(not is_rec)
+        self.project_prefix_btn.setEnabled(not is_rec)
 
         # Remote Producer Top Bar Button state
         if self.remote_producer_server.is_running:
@@ -593,7 +669,7 @@ class MainWindow(QMainWindow):
             )
             self.pause_record_btn.setEnabled(True)
             if is_rec_paused:
-                self.record_btn.setText("■   STOP && SAVE")
+                self.record_btn.setText("■  STOP && SAVE")
                 self.pause_record_btn.setText("▶   RESUME\nRECORDING")
                 self.pause_record_btn.setStyleSheet(
                     build_pause_record_button_style(
@@ -603,7 +679,7 @@ class MainWindow(QMainWindow):
                 timer_col = "#FFDF5D" if blink_on else "#D29922"
                 self.timer_label.setStyleSheet(f"color: {timer_col}; font-weight: bold;")
             else:
-                self.record_btn.setText("■   STOP RECORDING")
+                self.record_btn.setText("■  STOP\nRECORDING")
                 self.pause_record_btn.setText("❚❚   PAUSE\nRECORDING")
                 self.pause_record_btn.setStyleSheet(
                     build_pause_record_button_style("active", self._scale)
@@ -623,7 +699,7 @@ class MainWindow(QMainWindow):
             self.timer_label.setStyleSheet("color: #F0F6FC; font-weight: bold;")
         else:
             self.record_btn.setEnabled(False)
-            self.record_btn.setText("NO AUDIO INTERFACE")
+            self.record_btn.setText("NO AUDIO\nINTERFACE")
             self.record_btn.setStyleSheet(
                 build_record_button_style("disabled", self._scale)
             )
@@ -701,7 +777,13 @@ class MainWindow(QMainWindow):
                 "padding: 6px; border-radius: 6px; border: 2px solid #FFDF5D;"
             )
         else:
-            self.talkback_banner.setVisible(False)
+            ch_mode_txt = "STEREO (2CH)" if settings.channels >= 2 else "MONO (1CH)"
+            self.talkback_banner.setVisible(True)
+            self.talkback_banner.setText(f"NORMAL MODE: STANDARD {ch_mode_txt} RECORDING")
+            self.talkback_banner.setStyleSheet(
+                "background-color: #161B22; color: #8B949E; font-weight: 600; "
+                "padding: 6px; border-radius: 6px; border: 1px solid #30363D;"
+            )
 
         self._refresh_storage_status()
         self._update_playback_buttons_state()
@@ -861,9 +943,20 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     # Project Prefix & Recordings List + Reference Playback
     # -------------------------------------------------------------------------
+    def _open_project_prefix_dialog(self) -> None:
+        if self.audio_engine.is_recording:
+            return
+        dlg = ProjectPrefixDialog(
+            config_manager=self.config_manager,
+            parent=self,
+        )
+        if dlg.exec():
+            self._on_project_name_changed(dlg.project_name)
+        self.setFocus()
+
     def _on_project_name_changed(self, new_text: str) -> None:
         self.config_manager.settings.project_name = new_text
-        self.config_manager.save()
+        self.config_manager.save(commit_lbu=True)
         self._update_filename_preview()
         self._refresh_recordings_list()
 
@@ -1087,14 +1180,6 @@ class MainWindow(QMainWindow):
             self._sync_hardware_state()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        # Ignore single-key hotkeys while user is typing in the Project Name input
-        if self.project_edit.hasFocus():
-            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
-                self.setFocus()
-                return
-            super().keyPressEvent(event)
-            return
-
         key = event.key()
 
         # Momentary Push-to-Talk Hotkey [T] (ignoring X11 auto-repeat!)

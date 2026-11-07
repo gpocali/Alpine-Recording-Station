@@ -263,8 +263,10 @@ def build_main_stylesheet(scale: float = 1.0) -> str:
 
 def build_record_button_style(state: str, scale: float = 1.0) -> str:
     """Return stylesheet for the primary Record/Stop button ('ready', 'recording', 'disabled')."""
-    font_px = max(18, int(round(30 * scale)))
+    font_px = max(15, int(round(22 * scale)))
     radius = max(12, int(round(18 * scale)))
+    pad_v = max(6, int(round(8 * scale)))
+    pad_h = max(8, int(round(12 * scale)))
 
     if state == "recording":
         # Red when actively recording
@@ -274,9 +276,9 @@ def build_record_button_style(state: str, scale: float = 1.0) -> str:
             color: #FFFFFF;
             border: 3px solid #FF6B7A;
             border-radius: {radius}px;
+            padding: {pad_v}px {pad_h}px;
             font-size: {font_px}px;
             font-weight: bold;
-            letter-spacing: 1px;
         }}
         QPushButton:hover {{
             background-color: #E5384B;
@@ -293,9 +295,9 @@ def build_record_button_style(state: str, scale: float = 1.0) -> str:
             color: #FFFFFF;
             border: 3px solid #3FB950;
             border-radius: {radius}px;
+            padding: {pad_v}px {pad_h}px;
             font-size: {font_px}px;
             font-weight: bold;
-            letter-spacing: 1px;
         }}
         QPushButton:hover {{
             background-color: #269F48;
@@ -311,17 +313,19 @@ def build_record_button_style(state: str, scale: float = 1.0) -> str:
         color: #768390;
         border: 3px solid #444C56;
         border-radius: {radius}px;
+        padding: {pad_v}px {pad_h}px;
         font-size: {font_px}px;
         font-weight: bold;
-        letter-spacing: 1px;
     }}
     """
 
 
 def build_talkback_button_style(active: bool, enabled: bool, scale: float = 1.0) -> str:
     """Return stylesheet for the Studio Mode Talkback momentary push-to-talk button."""
-    font_px = max(16, int(round(24 * scale)))
+    font_px = max(14, int(round(20 * scale)))
     radius = max(12, int(round(16 * scale)))
+    pad_v = max(6, int(round(8 * scale)))
+    pad_h = max(8, int(round(10 * scale)))
 
     if not enabled:
         return f"""
@@ -330,6 +334,7 @@ def build_talkback_button_style(active: bool, enabled: bool, scale: float = 1.0)
             color: #545D68;
             border: 2px dashed #30363D;
             border-radius: {radius}px;
+            padding: {pad_v}px {pad_h}px;
             font-size: {font_px}px;
             font-weight: bold;
         }}
@@ -341,6 +346,7 @@ def build_talkback_button_style(active: bool, enabled: bool, scale: float = 1.0)
             color: #FFFFFF;
             border: 4px solid #FFDF5D;
             border-radius: {radius}px;
+            padding: {pad_v}px {pad_h}px;
             font-size: {font_px}px;
             font-weight: bold;
         }}
@@ -351,6 +357,7 @@ def build_talkback_button_style(active: bool, enabled: bool, scale: float = 1.0)
         color: #E6EDF3;
         border: 3px solid #388BFD;
         border-radius: {radius}px;
+        padding: {pad_v}px {pad_h}px;
         font-size: {font_px}px;
         font-weight: bold;
     }}
@@ -364,8 +371,10 @@ def build_pause_record_button_style(
     state: str, scale: float = 1.0, blink_on: bool = True
 ) -> str:
     """Return stylesheet for the Pause/Resume Recording button ('active', 'paused', 'disabled')."""
-    font_px = max(16, int(round(24 * scale)))
+    font_px = max(14, int(round(20 * scale)))
     radius = max(12, int(round(16 * scale)))
+    pad_v = max(6, int(round(8 * scale)))
+    pad_h = max(8, int(round(10 * scale)))
 
     if state == "paused":
         if blink_on:
@@ -375,9 +384,9 @@ def build_pause_record_button_style(
                 color: #FFFFFF;
                 border: 4px solid #FFDF5D;
                 border-radius: {radius}px;
+                padding: {pad_v}px {pad_h}px;
                 font-size: {font_px}px;
                 font-weight: bold;
-                letter-spacing: 1px;
             }}
             QPushButton:hover {{
                 background-color: #F0883E;
@@ -392,9 +401,9 @@ def build_pause_record_button_style(
             color: #FFDF5D;
             border: 4px solid #F0B72F;
             border-radius: {radius}px;
+            padding: {pad_v}px {pad_h}px;
             font-size: {font_px}px;
             font-weight: bold;
-            letter-spacing: 1px;
         }}
         QPushButton:hover {{
             background-color: #7A4300;
@@ -411,9 +420,9 @@ def build_pause_record_button_style(
             color: #FFFFFF;
             border: 3px solid #F0B72F;
             border-radius: {radius}px;
+            padding: {pad_v}px {pad_h}px;
             font-size: {font_px}px;
             font-weight: bold;
-            letter-spacing: 1px;
         }}
         QPushButton:hover {{
             background-color: #BB8009;
@@ -429,6 +438,7 @@ def build_pause_record_button_style(
         color: #545D68;
         border: 2px solid #30363D;
         border-radius: {radius}px;
+        padding: {pad_v}px {pad_h}px;
         font-size: {font_px}px;
         font-weight: bold;
     }}

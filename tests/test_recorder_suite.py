@@ -800,6 +800,7 @@ tmpfs / tmpfs rw,relatime,size=1982464k,mode=755 0 0
                 storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc")
             )
             widget = StorageMonitorWidget()
+            self.assertFalse(hasattr(widget, "ring_gauge"))
 
             st_ok = cm.get_storage_status(
                 sample_rate=48000,
@@ -873,12 +874,56 @@ class TestUiGlyphsAndButtonMnemonics(unittest.TestCase):
         self.assertIn("❚❚", main_win_text)
         self.assertIn("◉  TALKBACK", main_win_text)
         self.assertIn("STOP && SAVE", main_win_text)
+        self.assertIn("■  STOP\\nRECORDING", main_win_text)
         self.assertNotIn('"■   STOP & SAVE"', main_win_text)
+        self.assertNotIn("mode_toggle_btn", main_win_text)
 
         settings_text = (ui_dir / "settings_dialog.py").read_text(encoding="utf-8")
         self.assertIn('"Save && Apply Settings"', settings_text)
         self.assertNotIn('"Save & Apply Settings"', settings_text)
         self.assertIn('"Audio && Recording Settings"', settings_text)
+
+    def test_project_prefix_dialog_and_main_window_layout(self) -> None:
+        try:
+            import os
+
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PyQt6.QtWidgets import QApplication
+            from app.ui.main_window import MainWindow, ProjectPrefixDialog
+        except Exception:
+            return
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(
+                storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc")
+            )
+            engine = AudioEngine(simulate_if_empty=True)
+            sm = SambaManager(cm)
+            sm.pdbedit_bin = None
+            sm.smbpasswd_bin = None
+
+            dlg = ProjectPrefixDialog(config_manager=cm)
+            dlg.prefix_edit.setText("Episode 42")
+            self.assertEqual(dlg.project_name, "Episode 42")
+            self.assertIn("Episode_42_", dlg.preview_label.text())
+
+            win = MainWindow(
+                config_manager=cm,
+                audio_engine=engine,
+                samba_manager=sm,
+                fullscreen=False,
+            )
+            try:
+                self.assertFalse(hasattr(win, "mode_toggle_btn"))
+                self.assertTrue(hasattr(win, "project_prefix_btn"))
+                win._on_project_name_changed("Episode 42")
+                self.assertIn("Episode_42_", win.filename_preview_label.text())
+                self.assertIn("Episode_42_*.wav", win.takes_title_label.text())
+            finally:
+                win.close()
+        _ = app
 
 
 class TestRemoteProducerAndSslSuite(unittest.TestCase):
