@@ -16,6 +16,7 @@ STORAGE_DIR="/storage"
 APK_CACHE_DIR="${STORAGE_DIR}/.alpine-recorder/apk-cache"
 FORCE_CONFIG=0
 OSK_MODE=""
+REMOTE_PRODUCER_MODE=""
 ENABLE_SERVICE=1
 
 for arg in "$@"; do
@@ -29,6 +30,12 @@ for arg in "$@"; do
         --disable-osk)
             OSK_MODE="false"
             ;;
+        --enable-remote-producer)
+            REMOTE_PRODUCER_MODE="true"
+            ;;
+        --disable-remote-producer)
+            REMOTE_PRODUCER_MODE="false"
+            ;;
         --enable-service)
             ENABLE_SERVICE=1
             ;;
@@ -36,12 +43,14 @@ for arg in "$@"; do
             ENABLE_SERVICE=0
             ;;
         --help|-h)
-            echo "Usage: $0 [--force-config] [--enable-osk | --disable-osk] [--enable-service | --disable-service]"
-            echo "  --force-config      Overwrite existing smb.conf, xinitrc, and openbox configs."
-            echo "  --enable-osk        Enable the touch On-Screen Keyboard in saved settings."
-            echo "  --disable-osk       Disable the touch On-Screen Keyboard in saved settings."
-            echo "  --enable-service    Enable post-boot OpenRC kiosk service on VT7 (default)."
-            echo "  --disable-service   Do not auto-start kiosk at boot; start manually via 'alpine-recorder'."
+            echo "Usage: $0 [--force-config] [--enable-osk | --disable-osk] [--enable-remote-producer | --disable-remote-producer] [--enable-service | --disable-service]"
+            echo "  --force-config              Overwrite existing smb.conf, xinitrc, and openbox configs."
+            echo "  --enable-osk                Enable the touch On-Screen Keyboard in saved settings."
+            echo "  --disable-osk               Disable the touch On-Screen Keyboard in saved settings."
+            echo "  --enable-remote-producer    Enable the Remote Producer (Guided VO) HTTPS server by default."
+            echo "  --disable-remote-producer   Disable the Remote Producer (Guided VO) HTTPS server by default."
+            echo "  --enable-service            Enable post-boot OpenRC kiosk service on VT7 (default)."
+            echo "  --disable-service           Do not auto-start kiosk at boot; start manually via 'alpine-recorder'."
             exit 0
             ;;
     esac
@@ -115,6 +124,7 @@ BASE_PKGS="
     util-linux
     iproute2
     openssl
+    ca-certificates
 "
 
 ARCH_PKGS=""
@@ -211,19 +221,21 @@ find "${STORAGE_DIR}" \( -path "${STORAGE_DIR}/.alpine-recorder" -o -path "${STO
 find "${STORAGE_DIR}" \( -path "${STORAGE_DIR}/.alpine-recorder" -o -path "${STORAGE_DIR}/lost+found" \) -prune -o -type f -exec chown root:sambashare {} + -exec chmod 0666 {} + 2>/dev/null || true
 
 mkdir -p "${ETC_CONFIG_DIR}"
+mkdir -p "${ETC_CONFIG_DIR}/ssl"
+chmod 0750 "${ETC_CONFIG_DIR}/ssl" 2>/dev/null || true
 
 # Create OpenRC local.d script so /storage is mounted and permissions are masked on every boot
 # (even when /storage directory was excluded from the LBU overlay when localmount ran)
 mkdir -p /etc/local.d
 LOCAL_STORAGE_SCRIPT="/etc/local.d/alpine-recorder-storage.start"
-if [ ! -f "${LOCAL_STORAGE_SCRIPT}" ] || ! grep -q "mountpoint -q /storage" "${LOCAL_STORAGE_SCRIPT}" || [ "${FORCE_CONFIG}" -eq 1 ]; then
+if [ ! -f "${LOCAL_STORAGE_SCRIPT}" ] || ! grep -q "mountpoint -q /storage" "${LOCAL_STORAGE_SCRIPT}" || ! grep -q "/storage/ssl" "${LOCAL_STORAGE_SCRIPT}" || [ "${FORCE_CONFIG}" -eq 1 ]; then
     cat << 'EOF' > "${LOCAL_STORAGE_SCRIPT}"
 #!/bin/sh
 mkdir -p /storage
 if ! mountpoint -q /storage 2>/dev/null; then
     mount /storage 2>/dev/null || mount -a 2>/dev/null || true
 fi
-mkdir -p /storage/.alpine-recorder /storage/.alpine-recorder/apk-cache
+mkdir -p /storage/.alpine-recorder /storage/.alpine-recorder/apk-cache /storage/ssl
 chown root:sambashare /storage 2>/dev/null || chgrp sambashare /storage 2>/dev/null || true
 chmod 2777 /storage 2>/dev/null || chmod 0777 /storage 2>/dev/null || true
 find /storage \( -path /storage/.alpine-recorder -o -path /storage/lost+found \) -prune -o -type d -exec chown root:sambashare {} + -exec chmod 2777 {} + 2>/dev/null || true
@@ -236,7 +248,7 @@ fi
 # 5. Deploy Application Files to /opt/alpine-recorder (Safe on Re-runs/Updates)
 # -----------------------------------------------------------------------------
 log_info "Deploying application code to ${APP_DEST}..."
-mkdir -p "${APP_DEST}"
+mkdir -p "${APP_DEST}" "${APP_DEST}/app" "${APP_DEST}/app/ui"
 rm -rf "${APP_DEST}/app"
 cp -r "${SCRIPT_DIR}/app" "${APP_DEST}/app"
 if [ -d "${SCRIPT_DIR}/tests" ]; then
@@ -263,6 +275,21 @@ if command -v python3 >/dev/null 2>&1; then
         "${APP_DEST}/app/ui/on_screen_keyboard.py" \
         "${APP_DEST}/app/ui/styles.py" 2>/dev/null || true
 
+    # Ensure SSL certificates exist in /etc/alpine-recorder/ssl (or import from /storage/ssl if present)
+    # so they are included when LBU commits below.
+    PYTHONPATH="${APP_DEST}" python3 -c "
+from pathlib import Path
+from app.ssl_manager import SslCertificateManager
+mgr = SslCertificateManager(
+    cert_dir=Path('${ETC_CONFIG_DIR}') / 'ssl',
+    drop_dir=Path('${STORAGE_DIR}') / 'ssl',
+)
+imported, _ = mgr.import_from_drop_dir()
+if not imported:
+    mgr.ensure_certificates()
+" 2>/dev/null || true
+    log_ok "Verified SSL certificate pair in ${ETC_CONFIG_DIR}/ssl."
+
     if [ -n "${OSK_MODE}" ]; then
         PYTHONPATH="${APP_DEST}" python3 -c "
 from app.config_manager import ConfigManager
@@ -271,6 +298,16 @@ cm.settings.on_screen_keyboard = ('${OSK_MODE}' == 'true')
 cm.save()
 " 2>/dev/null || true
         log_ok "On-Screen Keyboard setting updated to: ${OSK_MODE}"
+    fi
+
+    if [ -n "${REMOTE_PRODUCER_MODE}" ]; then
+        PYTHONPATH="${APP_DEST}" python3 -c "
+from app.config_manager import ConfigManager
+cm = ConfigManager(storage_dir='${STORAGE_DIR}', etc_config_dir='${ETC_CONFIG_DIR}')
+cm.settings.remote_producer_enabled = ('${REMOTE_PRODUCER_MODE}' == 'true')
+cm.save()
+" 2>/dev/null || true
+        log_ok "Remote Producer HTTPS server default updated to: ${REMOTE_PRODUCER_MODE}"
     fi
 fi
 
@@ -367,9 +404,15 @@ fi
 # 9. Register Paths in Alpine LBU (Local Backup Utility) & Commit
 # -----------------------------------------------------------------------------
 if command -v lbu >/dev/null 2>&1; then
-    log_info "Registering application and configuration files with Alpine LBU..."
+    log_info "Registering application, SSL certificates, and configuration files with Alpine LBU..."
     lbu include "${APP_DEST}" 2>/dev/null || true
+    lbu include "${APP_DEST}/app" 2>/dev/null || true
+    lbu include "${APP_DEST}/app/qr_code.py" 2>/dev/null || true
+    lbu include "${APP_DEST}/app/ssl_manager.py" 2>/dev/null || true
+    lbu include "${APP_DEST}/app/remote_producer.py" 2>/dev/null || true
+    lbu include "${APP_DEST}/app/ui/remote_producer_dialog.py" 2>/dev/null || true
     lbu include "${ETC_CONFIG_DIR}" 2>/dev/null || true
+    lbu include "${ETC_CONFIG_DIR}/ssl" 2>/dev/null || true
     lbu include /etc/modules-load.d 2>/dev/null || true
     lbu include /etc/X11/Xwrapper.config 2>/dev/null || true
     lbu include /var/lib/alsa 2>/dev/null || true
@@ -390,13 +433,18 @@ if command -v lbu >/dev/null 2>&1; then
 
     if grep -Eq '^[^#]*LBU_MEDIA=' /etc/lbu/lbu.conf 2>/dev/null || [ -n "${LBU_MEDIA:-}" ]; then
         log_info "Committing changes to LBU persistent overlay..."
-        if lbu commit -d; then
+        if lbu commit -d || lbu commit; then
             log_ok "LBU commit completed successfully."
         else
             log_warn "lbu commit returned non-zero status; verify LBU_MEDIA in /etc/lbu/lbu.conf."
         fi
     else
-        log_warn "LBU_MEDIA is not configured in /etc/lbu/lbu.conf yet. Run 'lbu commit -d' once LBU media is configured."
+        log_info "Attempting LBU commit with default LBU configuration..."
+        if lbu commit -d 2>/dev/null || lbu commit 2>/dev/null; then
+            log_ok "LBU commit completed successfully."
+        else
+            log_warn "LBU_MEDIA is not configured in /etc/lbu/lbu.conf yet. Run 'lbu commit -d' once LBU media is configured."
+        fi
     fi
 else
     log_info "lbu utility not found on this machine; skipping LBU commit."

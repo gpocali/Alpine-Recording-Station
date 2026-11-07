@@ -104,7 +104,7 @@ ensure_runtime_packages() {
             xf86-input-libinput xf86-input-evdev xf86-video-fbdev mesa-dri-gallium
             ttf-dejavu fontconfig libxkbcommon-x11 xcb-util-wm xcb-util-image
             xcb-util-keysyms xcb-util-renderutil xcb-util-cursor dbus kbd eudev
-            util-linux iproute2
+            util-linux iproute2 openssl ca-certificates
         "
         case "$(uname -m)" in
             x86_64|i*86) REQ_PKGS="${REQ_PKGS} xf86-video-vesa" ;;

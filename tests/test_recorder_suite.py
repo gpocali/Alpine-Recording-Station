@@ -1154,6 +1154,39 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
             finally:
                 server.stop()
 
+    def test_install_script_remote_producer_dependencies_files_and_lbu(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        install_sh = (repo_root / "install.sh").read_text(encoding="utf-8")
+        recovery_sh = (repo_root / "config" / "alpine-recorder").read_text(encoding="utf-8")
+
+        # Dependencies
+        self.assertIn("openssl", install_sh)
+        self.assertIn("ca-certificates", install_sh)
+        self.assertIn("openssl", recovery_sh)
+        self.assertIn("ca-certificates", recovery_sh)
+
+        # Placed files & SSL directories
+        for rel_file in (
+            "app/qr_code.py",
+            "app/ssl_manager.py",
+            "app/remote_producer.py",
+            "app/ui/remote_producer_dialog.py",
+        ):
+            self.assertIn(rel_file, install_sh)
+            self.assertTrue((repo_root / rel_file).is_file(), f"Missing {rel_file}")
+
+        self.assertIn("${ETC_CONFIG_DIR}/ssl", install_sh)
+        self.assertIn("${STORAGE_DIR}/ssl", install_sh)
+        self.assertIn("SslCertificateManager", install_sh)
+
+        # LBU inclusion and commit
+        self.assertIn('lbu include "${APP_DEST}/app/qr_code.py"', install_sh)
+        self.assertIn('lbu include "${APP_DEST}/app/ssl_manager.py"', install_sh)
+        self.assertIn('lbu include "${APP_DEST}/app/remote_producer.py"', install_sh)
+        self.assertIn('lbu include "${APP_DEST}/app/ui/remote_producer_dialog.py"', install_sh)
+        self.assertIn('lbu include "${ETC_CONFIG_DIR}/ssl"', install_sh)
+        self.assertIn("lbu commit", install_sh)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -643,6 +643,15 @@ class ConfigManager:
 
         def _worker() -> None:
             try:
+                for inc_path in ("/etc/alpine-recorder", "/etc/alpine-recorder/ssl"):
+                    if Path(inc_path).exists():
+                        subprocess.run(
+                            [lbu_bin, "include", inc_path],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=10,
+                            check=False,
+                        )
                 subprocess.run(
                     [lbu_bin, "exclude", "/var/lib/samba/private/msg.sock"],
                     stdout=subprocess.DEVNULL,
