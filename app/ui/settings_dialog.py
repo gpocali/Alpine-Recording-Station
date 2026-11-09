@@ -196,10 +196,10 @@ class SettingsDialog(QDialog):
             "Normal Mode (Standard Mono / Stereo Recording)", False
         )
         self.mode_combo.addItem(
-            "Studio Mode (Stereo: Left = Mic, Right = Tone + Talkback)", True
+            "Studio Split Mode (Stereo: Left = Mic, Right = Tone + Talkback)", True
         )
         self.mode_combo.setToolTip(
-            "Choose between standard recording or Studio Mode with Right-channel Talkback notes"
+            "Choose between Normal Mode (Talkback on main channels) or Studio Split Mode (Talkback on Right channel)"
         )
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Recording Mode:", self.mode_combo)
@@ -208,14 +208,14 @@ class SettingsDialog(QDialog):
         self.channels_combo.addItem("Mono (1 Channel)", 1)
         self.channels_combo.addItem("Stereo (2 Channels)", 2)
         self.channels_combo.setToolTip(
-            "Select Mono or Stereo output file (Studio Mode automatically uses Stereo)"
+            "Select Mono or Stereo output file (Studio Split Mode automatically uses Stereo)"
         )
         self.channels_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Recording Channels:", self.channels_combo)
 
         self.input_channel_combo = QComboBox()
         self.input_channel_combo.setToolTip(
-            "Which hardware microphone input channel to capture for Mono / Studio Left track"
+            "Which hardware microphone input channel to capture for Mono / Studio Split Mode Left track"
         )
         form.addRow("Mic Input Channel:", self.input_channel_combo)
 
@@ -223,7 +223,7 @@ class SettingsDialog(QDialog):
         for freq_hz, freq_label in TALKBACK_TONE_FREQ_OPTIONS:
             self.tone_freq_combo.addItem(freq_label, float(freq_hz))
         self.tone_freq_combo.setToolTip(
-            "Select frequency for Studio Mode talkback press and release marker tones "
+            "Select frequency for Talkback press and release marker tones "
             "(lower tones like 330 Hz or 440 Hz are warmer and easier on the ear)"
         )
         self.tone_freq_combo.currentIndexChanged.connect(self._on_mode_changed)
@@ -683,13 +683,13 @@ class SettingsDialog(QDialog):
         )
 
         if studio:
-            # Studio mode defaults to and enforces Stereo (Left=Mic, Right=Talkback+Tone)
+            # Studio Split Mode defaults to and enforces Stereo (Left=Mic, Right=Talkback+Tone)
             stereo_idx = self.channels_combo.findData(2)
             if stereo_idx >= 0:
                 self.channels_combo.setCurrentIndex(stereo_idx)
             self.channels_combo.setEnabled(False)
             self.mode_hint_label.setText(
-                "Studio Mode Active: Output WAV is Stereo (2-channel). "
+                "Studio Split Mode Active: Output WAV is Stereo (2-channel). "
                 "Microphone is recorded to the Left channel while the Right channel remains silent. "
                 f"Holding the Talkback button mutes the Left channel, plays a {press_str} marker tone ({freq_str}) "
                 f"into the headset and on the Right channel, records spoken notes on the Right channel while held, and {rel_str} (and into the headset)."
@@ -698,7 +698,8 @@ class SettingsDialog(QDialog):
             self.channels_combo.setEnabled(True)
             self.mode_hint_label.setText(
                 "Normal Mode Active: Records microphone directly in either Mono (1-channel) "
-                "or Stereo (2-channel) at the selected bit depth and sample rate."
+                "or Stereo (2-channel) at the selected bit depth and sample rate. "
+                "Holding Talkback mixes the marker tones and spoken notes directly onto the main recording channel(s)."
             )
 
         self._update_storage_preview()
@@ -717,7 +718,7 @@ class SettingsDialog(QDialog):
             channels=ch,
             studio_mode=studio,
         )
-        ch_str = "Studio Stereo (2ch)" if studio else ("Stereo (2ch)" if ch >= 2 else "Mono (1ch)")
+        ch_str = "Studio Split Stereo (2ch)" if studio else ("Stereo (2ch)" if ch >= 2 else "Mono (1ch)")
         if not st.available:
             self.storage_info_label.setText(
                 f"Storage ({st.storage_path}): Unavailable"

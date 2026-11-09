@@ -2233,6 +2233,145 @@ class TestStorageFileManagerAndRecursiveDeletion(unittest.TestCase):
                 dlg.close()
                 app.processEvents()
 
+    def test_normal_mode_talkback_on_main_channels_and_studio_split_labels(self):
+        """Verify Talkback works in Normal Mode (1ch Mono & 2ch Stereo) on main channels and Studio Split Mode labels."""
+        sr = 1000
+        # 1. Test Mono Normal Mode (1ch) Talkback DSP (press tone, mixed voice, release tone on Ch 0)
+        dsp_mono = StudioTalkbackProcessor(
+            sample_rate=sr,
+            studio_mode=False,
+            output_channels=1,
+            input_channel=0,
+            tone_hz=100.0,
+            tone_duration_sec=0.1,          # 100 samples
+            release_tone_duration_sec=0.05,  # 50 samples
+        )
+        in_mono = np.full((200, 1), 0.25, dtype=np.float64)
+        out_idle = dsp_mono.process_block(in_mono)
+        self.assertEqual(out_idle.shape, (200, 1))
+        self.assertTrue(np.allclose(out_idle[:, 0], 0.25))
+
+        # Activate local talkback and queue remote producer talkback audio
+        dsp_mono.set_talkback(True)
+        dsp_mono.push_remote_audio(np.full(100, 0.30, dtype=np.float64), input_sample_rate=sr)
+        out_tb_mono = dsp_mono.process_block(in_mono)
+        self.assertEqual(out_tb_mono.shape, (200, 1))
+        # First 100 samples on Ch 0 are the press marker tone (peak ~0.5)
+        self.assertGreater(float(np.max(np.abs(out_tb_mono[:100, 0]))), 0.45)
+        # Next 100 samples on Ch 0 are local mic (0.25) + remote producer (0.30) = 0.55
+        self.assertTrue(np.allclose(out_tb_mono[100:, 0], 0.55))
+
+        # Release talkback: first 50 samples on Ch 0 are release marker tone, rest is normal mic (0.25)
+        dsp_mono.set_talkback(False)
+        out_rel_mono = dsp_mono.process_block(in_mono)
+        self.assertGreater(float(np.max(np.abs(out_rel_mono[:50, 0]))), 0.45)
+        self.assertTrue(np.allclose(out_rel_mono[50:, 0], 0.25))
+
+        # 2. Test Stereo Normal Mode (2ch) Talkback DSP & Mute Override
+        dsp_stereo = StudioTalkbackProcessor(
+            sample_rate=sr,
+            studio_mode=False,
+            output_channels=2,
+            input_channel=0,
+            tone_hz=100.0,
+            tone_duration_sec=0.1,          # 100 samples
+            release_tone_duration_sec=0.05,  # 50 samples
+        )
+        in_stereo = np.column_stack((
+            np.full(200, 0.20, dtype=np.float64),
+            np.full(200, 0.40, dtype=np.float64),
+        ))
+        # Remote talkback while local mic is muted: press tone on L & R, then only remote audio on L & R
+        dsp_stereo.set_remote_talkback(True)
+        dsp_stereo.push_remote_audio(np.full(100, 0.35, dtype=np.float64), input_sample_rate=sr)
+        out_tb_stereo_muted = dsp_stereo.process_block(in_stereo, local_mic_muted=True)
+        self.assertEqual(out_tb_stereo_muted.shape, (200, 2))
+        self.assertGreater(float(np.max(np.abs(out_tb_stereo_muted[:100, 0]))), 0.45)
+        self.assertGreater(float(np.max(np.abs(out_tb_stereo_muted[:100, 1]))), 0.45)
+        self.assertTrue(np.allclose(out_tb_stereo_muted[100:, 0], 0.35))
+        self.assertTrue(np.allclose(out_tb_stereo_muted[100:, 1], 0.35))
+
+        # Local talkback while local mic is muted: temporarily unmutes local stereo channels and mixes remote
+        dsp_stereo.set_talkback(True)
+        dsp_stereo.push_remote_audio(np.full(200, 0.10, dtype=np.float64), input_sample_rate=sr)
+        out_tb_stereo_override = dsp_stereo.process_block(in_stereo, local_mic_muted=True)
+        self.assertTrue(np.allclose(out_tb_stereo_override[:, 0], 0.30))
+        self.assertTrue(np.allclose(out_tb_stereo_override[:, 1], 0.50))
+
+        # Release both: release tone on both L & R for 50 samples, then normal stereo (0.20, 0.40)
+        dsp_stereo.set_talkback(False)
+        dsp_stereo.set_remote_talkback(False)
+        out_rel_stereo = dsp_stereo.process_block(in_stereo, local_mic_muted=False)
+        self.assertGreater(float(np.max(np.abs(out_rel_stereo[:50, 0]))), 0.45)
+        self.assertGreater(float(np.max(np.abs(out_rel_stereo[:50, 1]))), 0.45)
+        self.assertTrue(np.allclose(out_rel_stereo[50:, 0], 0.20))
+        self.assertTrue(np.allclose(out_rel_stereo[50:, 1], 0.40))
+
+        # 3. Verify MainWindow UI labels ("STUDIO SPLIT MODE") and Normal Mode Talkback button activation
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        from app.ui.main_window import MainWindow
+        from app.ui.settings_dialog import SettingsDialog
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cm = ConfigManager(
+                storage_dir=Path(tmpdir) / "storage",
+                etc_config_dir=Path(tmpdir) / "etc",
+                commit_fn=lambda: True,
+            )
+            cm.load()
+            ae = AudioEngine(simulate_audio=True)
+            sm = SambaManager(commit_fn=lambda: True)
+            win = MainWindow(
+                config_manager=cm,
+                audio_engine=ae,
+                samba_manager=sm,
+                fullscreen=False,
+            )
+            try:
+                # Default Studio Split Mode labels
+                self.assertTrue(cm.settings.studio_mode)
+                self.assertEqual(win.talkback_banner.text(), "STUDIO SPLIT MODE")
+                self.assertIn("STUDIO SPLIT STEREO", win.format_badge_label.text())
+                self.assertFalse(win.talkback_btn.isHidden())
+                self.assertTrue(win.talkback_btn.isEnabled())
+
+                # Switch to Normal Mode (Mono): Talkback button remains visible and functional
+                win._on_toggle_studio_mode()
+                self.assertFalse(cm.settings.studio_mode)
+                self.assertFalse(win.talkback_btn.isHidden())
+                self.assertTrue(win.talkback_btn.isEnabled())
+                self.assertIn("NORMAL MODE", win.talkback_banner.text())
+
+                # Pressing Talkback in Normal Mode while idle latches Talkback and updates banner
+                win._on_talkback_pressed()
+                win._on_talkback_released()
+                self.assertTrue(ae.local_talkback_active)
+                self.assertTrue(ae.local_talkback_latched)
+                self.assertEqual(win.talkback_banner.text(), "⚡ NORMAL MODE — TALKBACK LATCHED")
+
+                # Second tap unlatches Talkback in Normal Mode
+                win._on_talkback_pressed()
+                win._on_talkback_released()
+                self.assertFalse(ae.local_talkback_active)
+
+                # Verify SettingsDialog uses "Studio Split Mode" label
+                sdlg = SettingsDialog(
+                    config_manager=cm,
+                    audio_engine=ae,
+                    samba_manager=sm,
+                    parent=win,
+                )
+                try:
+                    mode_texts = [sdlg.mode_combo.itemText(i) for i in range(sdlg.mode_combo.count())]
+                    self.assertTrue(any("Studio Split Mode" in t for t in mode_texts))
+                finally:
+                    sdlg.close()
+            finally:
+                win.close()
+                app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()

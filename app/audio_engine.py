@@ -170,9 +170,9 @@ def synthesize_tone_segment(
 
 
 class StudioTalkbackProcessor:
-    """Sample-accurate DSP router for Normal Mode and Studio Mode with Talkback.
+    """Sample-accurate DSP router for Normal Mode and Studio Split Mode with Talkback.
 
-    In Studio Mode:
+    In Studio Split Mode (`studio_mode=True`):
       - Always outputs 2 channels (Stereo: Left = Ch 0, Right = Ch 1).
       - When Talkback is OFF:
           Left  = Microphone audio (from selected input_channel)
@@ -185,6 +185,17 @@ class StudioTalkbackProcessor:
                   by the mix of the Local Talent Microphone and the Remote
                   Producer's Talkback audio on the Right channel until
                   Talkback is released.
+
+    In Normal Mode (`studio_mode=False`):
+      - Outputs 1 channel (Mono) or 2 channels (Stereo).
+      - When Talkback is OFF:
+          Main channel(s) = Microphone audio (or concluding release marker tone
+          immediately after Talkback is released).
+      - When Talkback is ON (local or remote producer):
+          Main channel(s) = First `tone_duration_sec` seconds is the press
+          marker tone, followed immediately by the mix of the Local Talent
+          Microphone and the Remote Producer's Talkback audio directly on
+          the main recording channel(s).
     """
 
     def __init__(
@@ -330,23 +341,6 @@ class StudioTalkbackProcessor:
             return np.zeros((0, self.output_channels), dtype=np.float64)
 
         mic_ch_idx = min(self.input_channel, hw_channels - 1)
-        if local_mic_muted and not self.local_talkback_active:
-            mic_signal = np.zeros(num_frames, dtype=np.float64)
-        else:
-            mic_signal = input_frames[:, mic_ch_idx]
-
-        if not self.studio_mode:
-            if self.output_channels == 1:
-                return mic_signal[:, np.newaxis].copy()
-            # Stereo Normal Mode
-            if local_mic_muted:
-                return np.zeros((num_frames, 2), dtype=np.float64)
-            if hw_channels >= 2:
-                return input_frames[:, :2].copy()
-            return np.column_stack((mic_signal, mic_signal))
-
-        # Studio Mode: always Stereo (Left = Take audio, Right = Talkback tone + mixed Producer & Local Mic)
-        out = np.zeros((num_frames, 2), dtype=np.float64)
 
         with self._lock:
             local_tb = self._local_talkback_active
@@ -355,8 +349,72 @@ class StudioTalkbackProcessor:
             tone_pos = self._tone_samples_emitted
             tone_total = self._tone_samples_total
 
+            if local_mic_muted and not local_tb:
+                mic_signal = np.zeros(num_frames, dtype=np.float64)
+            else:
+                mic_signal = input_frames[:, mic_ch_idx]
+
+            if not self.studio_mode:
+                if self.output_channels == 1:
+                    out = mic_signal[:, np.newaxis].copy()
+                else:
+                    if local_mic_muted and not local_tb:
+                        out = np.zeros((num_frames, 2), dtype=np.float64)
+                    elif hw_channels >= 2:
+                        out = input_frames[:, :2].copy()
+                    else:
+                        out = np.column_stack((mic_signal, mic_signal))
+
+                if not tb_active:
+                    rel_pos = self._release_tone_samples_emitted
+                    rel_total = self._release_tone_samples_total
+                    rel_remaining = max(0, rel_total - rel_pos)
+                    rel_count = min(num_frames, rel_remaining)
+                    if rel_count > 0:
+                        rel_tone = self._synthesize_tone_segment(
+                            rel_pos,
+                            rel_count,
+                            rel_total,
+                            self._release_fade_samples,
+                        )
+                        out[:rel_count, :] = rel_tone[:, np.newaxis]
+                        self._release_tone_samples_emitted += rel_count
+                    return out
+
+                # Talkback active in Normal Mode: place press tone and mixed
+                # Local Talent Mic + Remote Producer Talkback onto main channel(s).
+                tone_remaining = max(0, tone_total - tone_pos)
+                tone_count = min(num_frames, tone_remaining)
+
+                if tone_count > 0:
+                    press_tone = self._synthesize_tone_segment(
+                        tone_pos,
+                        tone_count,
+                        tone_total,
+                        self._fade_samples,
+                    )
+                    out[:tone_count, :] = press_tone[:, np.newaxis]
+                    self._tone_samples_emitted += tone_count
+
+                if tone_count < num_frames:
+                    voice_count = num_frames - tone_count
+                    rem_seg = np.zeros(voice_count, dtype=np.float64)
+                    if self._remote_audio_fifo.size > 0:
+                        avail = min(voice_count, self._remote_audio_fifo.size)
+                        rem_seg[:avail] = self._remote_audio_fifo[:avail]
+                        self._remote_audio_fifo = self._remote_audio_fifo[avail:]
+
+                    out[tone_count:, :] = np.clip(
+                        out[tone_count:, :] + rem_seg[:, np.newaxis], -1.0, 1.0
+                    )
+
+                return out
+
+            # Studio Split Mode: always Stereo (Left = Take audio, Right = Talkback tone + mixed Producer & Local Mic)
+            out = np.zeros((num_frames, 2), dtype=np.float64)
+
             if not tb_active:
-                # Normal Studio state: Mic on Left (0), Right (1) plays release tone if concluding, else silence
+                # Normal Studio Split state: Mic on Left (0), Right (1) plays release tone if concluding, else silence
                 out[:, 0] = mic_signal
                 rel_pos = self._release_tone_samples_emitted
                 rel_total = self._release_tone_samples_total

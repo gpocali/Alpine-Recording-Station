@@ -248,7 +248,7 @@ class StorageMonitorWidget(QFrame):
         badge_pad_h = max(6, int(round(8 * self._scale)))
 
         ch_desc = (
-            "Studio Stereo (2ch)"
+            "Studio Split Stereo (2ch)"
             if st.studio_mode
             else ("Stereo (2ch)" if st.effective_channels >= 2 else "Mono (1ch)")
         )

@@ -722,7 +722,7 @@ class HelpDialog(QDialog):
             ),
             self._build_section_card(
                 "TALKBACK  [Hotkey: T]",
-                "Available in <b>Studio Mode</b> for slating, producer talkback, and session notes:<br>"
+                "Available in both <b>Studio Split Mode</b> and <b>Normal Mode</b> for slating, producer talkback, and session notes:<br>"
                 "• <b>When Idle (Not Recording):</b> Click <b>Talkback</b> (or press <code>[T]</code>) to "
                 "<b>latch</b> Talkback ON for hands-free conversation. Click or press <code>[T]</code> again "
                 "to unlatch. Starting a recording automatically unlatches Talkback and switches it to "
@@ -734,10 +734,10 @@ class HelpDialog(QDialog):
                 "while Talkback is active and restores the mute when released.<br>"
                 "• <b>Shared Producer && Talent Talkback:</b> If both Producer and Talent press Talkback "
                 "simultaneously, Talkback stays open seamlessly without extra marker tones until both release.<br>"
-                "• Mutes the Left (Voiceover) channel so notes stay off the primary performance track.<br>"
-                "• Emits a configurable press marker tone into the headset and on the Right (Talkback) channel so talent knows Talkback is active.<br>"
-                "• Records spoken notes onto the Right channel while active (and sends them to the Remote Producer).<br>"
-                "• Emits a configurable release marker tone into the headset and on the Right channel when released."
+                "• <b>Studio Split Mode Routing:</b> Mutes the Left (Voiceover) channel so notes stay off the primary "
+                "performance track, and places the configurable press/release marker tones and spoken notes onto the Right (Talkback) channel.<br>"
+                "• <b>Normal Mode Routing:</b> Places the configurable press/release marker tones and spoken notes "
+                "directly onto the main recording channel(s)."
             ),
             self._build_section_card(
                 "COUGH / MUTED  [Hotkey: Hold B or Click]",
@@ -808,14 +808,16 @@ class HelpDialog(QDialog):
                 "director to listen to the session live and prompt the talent using Talkback."
             ),
             self._build_section_card(
-                "MIX-MINUS && STUDIO MODE RIGHT-CHANNEL ROUTING",
+                "MIX-MINUS && TALKBACK CHANNEL ROUTING",
                 "• <b>Mix-Minus Monitoring:</b> The remote producer hears only the local talent microphone "
                 "(when not muted), and the local talent headphones hear only the remote producer during "
                 "talkback — preventing echo or feedback loops.<br>"
-                "• <b>Studio Mode Right Channel:</b> When either the remote producer or local talent engages "
-                "Talkback in Studio Mode, the Left (VO) channel is muted, marker tones are inserted on the "
+                "• <b>Studio Split Mode Right Channel:</b> When either the remote producer or local talent engages "
+                "Talkback in Studio Split Mode, the Left (VO) channel is muted, marker tones are inserted on the "
                 "Right channel, and both the remote producer and local talent mic are mixed onto the Right "
-                "(Talkback) channel so the full conversation is preserved."
+                "(Talkback) channel so the full conversation is preserved separately.<br>"
+                "• <b>Normal Mode Main Channels:</b> When Talkback is engaged in Normal Mode, the marker tones "
+                "and mixed producer + talent talkback audio are recorded directly onto the main recording channel(s)."
             ),
             self._build_section_card(
                 "QR CODE, SESSION LINK && SSL CERTIFICATES",
@@ -838,10 +840,10 @@ class HelpDialog(QDialog):
                 "• <b>Input / Output Audio Interface:</b> Select the ALSA hardware capture and playback devices.<br>"
                 "• <b>Bit Depth && Sample Rate:</b> Defaults automatically to the highest bit depth (e.g. 24/32-bit) "
                 "and sample rate supported by your USB audio interface.<br>"
-                "• <b>Recording Mode:</b> Choose <b>Normal Mode</b> (standard 1ch Mono or 2ch Stereo) or "
-                "<b>Studio Mode</b> (2ch Stereo with Left = Voiceover Mic and Right = Marker Tone + Talkback).<br>"
+                "• <b>Recording Mode:</b> Choose <b>Normal Mode</b> (standard 1ch Mono or 2ch Stereo with Talkback on main channels) or "
+                "<b>Studio Split Mode</b> (2ch Stereo with Left = Voiceover Mic and Right = Marker Tone + Talkback).<br>"
                 "• <b>Mic Input Channel:</b> Selects which hardware input channel (e.g. Input 1 / Ch 0) feeds the "
-                "Mono track or Studio Mode Left/Right tracks.<br>"
+                "Mono track or Studio Split Mode Left/Right tracks.<br>"
                 "• <b>Talkback Tone Frequency && Durations:</b> Customize the marker tone pitch (330 Hz to 1000 Hz) "
                 "and independent Press (default 1.0s) and Release (default 0.5s) durations.<br>"
                 "• <b>On-Screen Keyboard:</b> Enables or disables the pop-up touch keyboard for text fields.<br>"
@@ -861,7 +863,7 @@ class HelpDialog(QDialog):
                 "• <code>T</code> : Toggle Talkback Latch when idle; Hold for Push-to-Talk while recording<br>"
                 "• <code>Hold B</code> : Momentary Talent Cough Mute<br>"
                 "• <code>C</code> : Reset VU Peak Hold && Clip Indicator<br>"
-                "• <code>M</code> : Toggle Studio Mode / Normal Mode (when idle)<br>"
+                "• <code>M</code> : Toggle Studio Split Mode / Normal Mode (when idle)<br>"
                 "• <code>N</code> or <code>F4</code> : Rename selected project recording (when idle)<br>"
                 "• <code>Del</code> : Delete selected recording with confirmation (when idle)<br>"
                 "• <code>S</code> : Stop Reference Playback<br>"
@@ -1067,8 +1069,8 @@ class MainWindow(QMainWindow):
         deck_layout.setContentsMargins(16, 8, 16, 10)
         deck_layout.setSpacing(6)
 
-        # Studio Mode / Paused Recording visual indicator banner
-        self.talkback_banner = QLabel("STUDIO MODE")
+        # Studio Split Mode / Paused Recording visual indicator banner
+        self.talkback_banner = QLabel("STUDIO SPLIT MODE")
         self.talkback_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.talkback_banner.setWordWrap(True)
         deck_layout.addWidget(self.talkback_banner)
@@ -1506,7 +1508,7 @@ class MainWindow(QMainWindow):
             self.format_badge_label.setText("OFFLINE")
         else:
             ch_desc = (
-                "STUDIO STEREO"
+                "STUDIO SPLIT STEREO"
                 if settings.studio_mode
                 else ("STEREO (2ch)" if settings.channels >= 2 else "MONO (1ch)")
             )
@@ -1573,10 +1575,8 @@ class MainWindow(QMainWindow):
 
         # Talkback button & visual banner state
         tb_active = self.audio_engine.talkback_active
-        tb_enabled = bool(
-            settings.studio_mode and dev is not None and not is_rec_paused
-        )
-        self.talkback_btn.setVisible(bool(settings.studio_mode))
+        tb_enabled = bool(dev is not None and not is_rec_paused)
+        self.talkback_btn.setVisible(True)
         self.talkback_btn.setEnabled(tb_enabled)
         self.talkback_btn.setText("⚡  Talkback" if tb_active else "◉  Talkback")
         self.talkback_btn.setStyleSheet(
@@ -1601,32 +1601,39 @@ class MainWindow(QMainWindow):
             self.talkback_banner.setVisible(True)
             if tb_active:
                 if self.audio_engine.remote_talkback_active and self.audio_engine.local_talkback_active:
-                    self.talkback_banner.setText("⚡ STUDIO MODE — PRODUCER & TALENT TALKBACK")
+                    self.talkback_banner.setText("⚡ STUDIO SPLIT MODE — PRODUCER & TALENT TALKBACK")
                 elif self.audio_engine.remote_talkback_active:
                     if self.audio_engine.remote_talkback_latched:
-                        self.talkback_banner.setText("⚡ STUDIO MODE — REMOTE PRODUCER TALKBACK (LATCHED)")
+                        self.talkback_banner.setText("⚡ STUDIO SPLIT MODE — REMOTE PRODUCER TALKBACK (LATCHED)")
                     else:
-                        self.talkback_banner.setText("⚡ STUDIO MODE — REMOTE PRODUCER TALKBACK")
+                        self.talkback_banner.setText("⚡ STUDIO SPLIT MODE — REMOTE PRODUCER TALKBACK")
                 elif self.audio_engine.local_talkback_latched:
-                    self.talkback_banner.setText("⚡ STUDIO MODE — TALKBACK LATCHED")
+                    self.talkback_banner.setText("⚡ STUDIO SPLIT MODE — TALKBACK LATCHED")
                 else:
-                    self.talkback_banner.setText("⚡ STUDIO MODE — TALKBACK ACTIVE")
+                    self.talkback_banner.setText("⚡ STUDIO SPLIT MODE — TALKBACK ACTIVE")
                 self.talkback_banner.setStyleSheet(
                     "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
                     "padding: 6px; border-radius: 6px; border: 2px solid #FFDF5D;"
                 )
             else:
-                self.talkback_banner.setText("STUDIO MODE")
+                self.talkback_banner.setText("STUDIO SPLIT MODE")
                 self.talkback_banner.setStyleSheet(
                     "background-color: #161B22; color: #58A6FF; font-weight: 600; "
                     "padding: 6px; border-radius: 6px; border: 1px solid #1F6FEB;"
                 )
-        elif self.audio_engine.remote_talkback_active:
+        elif tb_active:
             self.talkback_banner.setVisible(True)
-            if self.audio_engine.remote_talkback_latched:
-                self.talkback_banner.setText("⚡ NORMAL MODE — REMOTE PRODUCER TALKBACK (LATCHED)")
+            if self.audio_engine.remote_talkback_active and self.audio_engine.local_talkback_active:
+                self.talkback_banner.setText("⚡ NORMAL MODE — PRODUCER & TALENT TALKBACK")
+            elif self.audio_engine.remote_talkback_active:
+                if self.audio_engine.remote_talkback_latched:
+                    self.talkback_banner.setText("⚡ NORMAL MODE — REMOTE PRODUCER TALKBACK (LATCHED)")
+                else:
+                    self.talkback_banner.setText("⚡ NORMAL MODE — REMOTE PRODUCER TALKBACK")
+            elif self.audio_engine.local_talkback_latched:
+                self.talkback_banner.setText("⚡ NORMAL MODE — TALKBACK LATCHED")
             else:
-                self.talkback_banner.setText("⚡ NORMAL MODE — REMOTE PRODUCER TALKBACK")
+                self.talkback_banner.setText("⚡ NORMAL MODE — TALKBACK ACTIVE")
             self.talkback_banner.setStyleSheet(
                 "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
                 "padding: 6px; border-radius: 6px; border: 2px solid #FFDF5D;"
@@ -1771,7 +1778,7 @@ class MainWindow(QMainWindow):
 
     def _on_talkback_pressed(self) -> None:
         if (
-            not self.config_manager.settings.studio_mode
+            self._active_input_device is None
             or self.audio_engine.is_record_paused
         ):
             return

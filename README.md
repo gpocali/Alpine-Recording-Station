@@ -18,17 +18,17 @@ An optimized **Alpine Linux** kiosk configuration and fullscreen studio applicat
   - Dedicated horizontal telemetry strip positioned between the Studio Deck and the Project Recordings pane (visually distinct from the audio VU meter), featuring a **Smooth Continuous Capacity Pill Bar** with overlaid capacity text (`XX.X% USED • X.X GB FREE`) and a **Digital Recording Time Remaining Readout Box** (`HHh MMm SSs` at `MB/min`) calculated dynamically for the active Bit Depth, Sample Rate, and Channel/Studio Mode settings (and live in **Settings** as you adjust format options).
   - Automatically ensures `/storage` is mounted from `/etc/fstab` before measuring capacity (resolving symlinks and `/proc/mounts` device info so it always measures the persistent `/storage` drive rather than the diskless `tmpfs` RAM root).
   - Escalates to high-visibility **Amber Warning** (`⚠ LOW SPACE` / `DRIVE GETTING FULL` at `>= 80%` used or `<= 30 minutes` remaining) and **Red Critical** (`⚠ CRITICAL` / `DRIVE CRITICALLY FULL` at `>= 90%` used or `<= 10 minutes` remaining) banners and borders so it is immediately clear when the drive is getting close to full.
-- **Normal Mode & Studio Mode (with Momentary Talkback)**:
-  - **Normal Mode**: Records Mono (`1ch`) or Stereo (`2ch`) `.wav` files at the selected bit depth and sample rate.
-  - **Studio Mode**: Defaults to Stereo (`2ch`) output where:
+- **Normal Mode & Studio Split Mode (with Talkback)**:
+  - **Normal Mode**: Records Mono (`1ch`) or Stereo (`2ch`) `.wav` files at the selected bit depth and sample rate. Activating **Talkback** emits the configurable press/release marker tones and mixes spoken notes (and Remote Producer talkback) directly onto the main recording channel(s).
+  - **Studio Split Mode**: Defaults to Stereo (`2ch`) output where:
     - **Left Channel**: Records the microphone take.
     - **Right Channel**: Silent during normal recording. Holding the **Talkback** button (via mouse, touchscreen, or holding `[T]`) immediately **mutes the Left channel**, emits a configurable **press marker tone** (`1.0 second` by default) on the Right channel, records spoken notes from the microphone onto the Right channel while held, and emits a configurable **release marker tone** (`0.5 seconds` by default) on the Right channel when Talkback is concluded.
     - **Adjustable Tone Frequency & Durations**: Both the press and release tone durations (`Off / 0.0s` through `3.0s`) and the marker tone frequency (`330 Hz`, `440 Hz`, `528 Hz`, `660 Hz`, `800 Hz`, `1000 Hz / 1 kHz`, `1200 Hz`) are adjustable in **Settings & Samba → Audio & Recording Settings** so you can choose a warmer, easier-on-the-ear tone.
     - Provides high-contrast visual indication whenever Talkback is active, enabling fast visual or AI-assisted assembly in a DAW.
 - **Remote Producer Option (Guided VO over HTTPS / WSS)**:
   - Optional low-latency, bidirectional audio & telemetry web console (`https://<IP>:8443/`) that allows a remote producer or director to listen live to the talent's performance and use a momentary **Talkback** control (`Hold T` or `Space`) to prompt the talent in real time.
-  - **Full Mix-Minus & Right-Channel Producer + Talent Mix**:
-    - **Right Channel (Studio Mode Talkback Track)**: Whenever Talkback is active (triggered by either the Remote Producer or the Local Talent), the Left (VO) channel is muted (`0.0`) and **both the Remote Producer's voice and the Local Talent's microphone** are summed onto the Right channel (between the press and release marker tones) so two-way direction and talent responses are captured together on the Talkback track.
+  - **Full Mix-Minus & Talkback Routing**:
+    - **Right Channel (Studio Split Mode Talkback Track) / Main Channels (Normal Mode)**: Whenever Talkback is active (triggered by either the Remote Producer or the Local Talent), in **Studio Split Mode** the Left (VO) channel is muted (`0.0`) and **both the Remote Producer's voice and the Local Talent's microphone** are summed onto the Right channel (between the press and release marker tones) so two-way direction and talent responses are captured together on the Talkback track. In **Normal Mode**, the marker tones and mixed Producer + Talent Talkback audio are recorded directly onto the main recording channel(s).
     - **Mix-Minus to Remote Producer**: The live stream sent to the Remote Producer contains **only the Local Talent's microphone** (minus the producer's own voice and marker tones).
     - **Mix-Minus to Local Talent Headphones**: The headphone monitor output feeds **only the Remote Producer's Talkback audio** to the local talent's headphones (minus the local talent's microphone, preventing software-loopback echo).
   - **Stripped-Down Studio Web UI**: Matches the talent's dark studio theme with a live 60-segment LED VU & Peak Hold meter, elapsed timer, recording/pause/talkback state banner, session take count, and remaining storage time, while intentionally omitting hardware configuration, Samba administration, and transport mutation controls so the talent retains full independent control.
@@ -70,10 +70,10 @@ All buttons display their keyboard hotkeys on mouse hover:
 | **Record / Stop** | `R` or `Space` | Start or stop recording (`Green` = Ready, `Red` = Recording, `Grey` = No/Invalid Interface) |
 | **Pause / Resume Recording** | `P` or `Pause` | Pause active recording (safely closes `.wav` file on disk) or reopen & resume into the same file |
 | **Reset Peak Hold** | `C` | Reset maintained Peak Hold level and `CLIP` indicator on the VU meter |
-| **Talkback (Studio Mode)** | Hold `T` | Momentary push-to-talk: mutes Left ch, plays 1.0s press tone + records mic on Right ch while held, then plays 0.5s release tone |
+| **Talkback** | `T` (Click / Hold) | Latch Talkback when idle or hold for momentary push-to-talk while recording (Right ch in Studio Split Mode; main ch in Normal Mode) |
 | **Mic to Producer / Cough Mute** | Hold `B` (or Click) | Hold `B` for momentary Cough Mute of feed to Remote Producer, or click button to toggle persistent Privacy Mute |
 | **Remote Producer & SSL Setup** | `F3` | Open Guided VO Remote Producer setup dialog (QR code, session link, passcode rotation, and SSL certificate import) |
-| **Toggle Mode** | `M` | Switch between Normal Mode and Studio Mode (when stopped) |
+| **Toggle Mode** | `M` | Switch between Normal Mode and Studio Split Mode (when stopped) |
 | **Rename Recording** | `N` or `F4` | Rename the selected completed `.wav` recording inside the project folder (when not recording) |
 | **Delete Recording** | `Del` | Delete the selected `.wav` recording after confirmation showing drive space recovered |
 | **Storage File Manager** | `F6` | Open fullscreen Storage File Manager to browse, play, rename, and delete files or project folders across all projects |

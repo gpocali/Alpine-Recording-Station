@@ -595,7 +595,12 @@ class RemoteProducerServer:
             overall_hold_db = max(vo_hold_db, tb_hold_db)
         else:
             eff_ch = max(1, min(2, int(settings.effective_channels)))
-            if talent_live:
+            rem_peak, rem_rms = (
+                self.audio_engine.get_remote_talkback_levels()
+                if tb_active
+                else (0.0, 0.0)
+            )
+            if talent_live or local_tb:
                 raw_peaks = list(vu.channel_peaks[:eff_ch]) if vu.channel_peaks else [vu.peak_level]
                 raw_rms = list(vu.channel_rms[:eff_ch]) if vu.channel_rms else [vu.rms_level]
                 raw_holds = list(vu.channel_peak_holds[:eff_ch]) if vu.channel_peak_holds else [vu.peak_hold_level]
@@ -605,12 +610,30 @@ class RemoteProducerServer:
                     raw_rms.append(raw_rms[0] if raw_rms else 0.0)
                 while len(raw_holds) < eff_ch:
                     raw_holds.append(raw_holds[0] if raw_holds else 0.0)
+            else:
+                raw_peaks = [0.0] * eff_ch
+                raw_rms = [0.0] * eff_ch
+                raw_holds = [0.0] * eff_ch
+
+            if tb_active:
+                raw_peaks = [min(1.0, p + rem_peak) for p in raw_peaks]
+                raw_rms = [
+                    min(1.0, math.sqrt(r * r + rem_rms * rem_rms)) for r in raw_rms
+                ]
+                raw_holds = [max(h, p) for h, p in zip(raw_holds, raw_peaks)]
+
+            if talent_live or tb_active:
                 ch_peaks_db = [round(float(linear_to_dbfs(x)), 1) for x in raw_peaks]
                 ch_rms_db = [round(float(linear_to_dbfs(x)), 1) for x in raw_rms]
                 ch_holds_db = [round(float(linear_to_dbfs(x)), 1) for x in raw_holds]
-                overall_peak_db = round(float(vu.peak_db), 1)
-                overall_rms_db = round(float(vu.rms_db), 1)
-                overall_hold_db = round(float(vu.peak_hold_db), 1)
+                overall_peak_db = max(ch_peaks_db) if ch_peaks_db else -60.0
+                overall_rms_db = max(ch_rms_db) if ch_rms_db else -60.0
+                overall_hold_db = max(ch_holds_db) if ch_holds_db else -60.0
+                if tb_active and overall_peak_db > self._tb_peak_hold_db:
+                    self._tb_peak_hold_db = overall_peak_db
+                    tb_hold_val = round(float(self._tb_peak_hold_db), 1)
+                    overall_hold_db = max(overall_hold_db, tb_hold_val)
+                    ch_holds_db = [max(h, tb_hold_val) for h in ch_holds_db]
             else:
                 ch_peaks_db = [-60.0] * eff_ch
                 ch_rms_db = [-60.0] * eff_ch
@@ -1621,7 +1644,7 @@ input[type="range"].brand-slider {{
         <div>
           <div class="state-banner" id="state-banner">● STANDBY — LIVE INPUT MONITOR</div>
           <div style="margin-top:8px; font-size:12px; color:#8B949E;" id="mode-summary">
-            Mode: Studio Mode (2-Ch Dual Track: L = VO Talent, R = Producer &amp; Talent Talkback)
+            Mode: Studio Split Mode (2-Ch Dual Track: L = VO Talent, R = Producer &amp; Talent Talkback)
           </div>
         </div>
         <div class="timer-display" id="timer-display">00:00:00.0</div>
@@ -1686,7 +1709,7 @@ input[type="range"].brand-slider {{
 
     <div class="card" style="margin-top:14px; padding:12px 18px;">
       <div class="status-Strip">
-        <span>Mix-Minus Active: You hear the Talent Mic; Talent headphones hear your Talkback. In Studio Mode, Track R mixes Producer + Talent Mic with marker tones while Track L (VO) is muted.</span>
+        <span>Mix-Minus Active: You hear the Talent Mic; Talent headphones hear your Talkback. In Studio Split Mode, Track R mixes Producer + Talent Mic with marker tones while Track L (VO) is muted; in Normal Mode, Talkback mixes onto the main channel(s).</span>
         <span id="rtt-readout">Link Latency: -- ms</span>
       </div>
     </div>
@@ -2311,7 +2334,7 @@ input[type="range"].brand-slider {{
 
     if (latestStudioMode) {{
       modeSummary.textContent =
-        "Mode: Studio Mode (Track L = Talent VO, Track R = Producer & Talent Talkback) @ " +
+        "Mode: Studio Split Mode (Track L = Talent VO, Track R = Producer & Talent Talkback) @ " +
         (msg.sample_rate || 48000) + " Hz / " + (msg.bit_depth || 24) + "-bit";
     }} else {{
       modeSummary.textContent =
@@ -2333,7 +2356,10 @@ input[type="range"].brand-slider {{
         : (msg.remote_talkback_active
           ? (msg.remote_talkback_latched ? "PRODUCER TALKBACK LATCHED" : "PRODUCER TALKBACK ON AIR")
           : (msg.local_talkback_latched ? "TALENT TALKBACK LATCHED" : "TALENT TALKBACK ACTIVE"));
-      stateBanner.textContent = "⚡ " + who + (msg.is_recording ? " — RECORDING TO TALKBACK TRACK (R)" : "");
+      const recTarget = latestStudioMode
+        ? " — RECORDING TO TALKBACK TRACK (R)"
+        : " — RECORDING TO MAIN CHANNEL(S)";
+      stateBanner.textContent = "⚡ " + who + (msg.is_recording ? recTarget : "");
       timerDisplay.className = msg.is_recording ? "timer-display timer-rec" : "timer-display";
     }} else if (msg.is_recording && msg.is_record_paused) {{
       studioDeck.className = "studio-deck deck-paused";
