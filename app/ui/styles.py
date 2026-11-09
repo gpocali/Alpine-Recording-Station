@@ -514,12 +514,26 @@ def build_studio_clock_badge_style(scale: float = 1.0) -> str:
     )
 
 
-def build_playback_button_style(state: str, scale: float = 1.0) -> str:
+def build_playback_button_style(
+    state: str, scale: float = 1.0, compact: bool = False
+) -> str:
     """Return stylesheet for the recordings list Play / Pause / Resume control button."""
-    font_px = max(11, int(round(13 * scale)))
-    pad_v = max(4, int(round(6 * scale)))
-    pad_h = max(10, int(round(14 * scale)))
-    radius = max(4, int(round(6 * scale)))
+    font_px = (
+        max(10, int(round(12 * scale)))
+        if compact
+        else max(11, int(round(13 * scale)))
+    )
+    pad_v = (
+        max(1, int(round(2 * scale)))
+        if compact
+        else max(4, int(round(6 * scale)))
+    )
+    pad_h = (
+        max(6, int(round(8 * scale)))
+        if compact
+        else max(10, int(round(14 * scale)))
+    )
+    radius = max(4, int(round(5 * scale if compact else 6 * scale)))
 
     if state == "playing":
         return f"""

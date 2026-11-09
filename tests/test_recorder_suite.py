@@ -1027,7 +1027,11 @@ class TestUiGlyphsAndButtonMnemonics(unittest.TestCase):
                 win._on_project_name_changed("Episode 42")
                 self.assertTrue((cm.storage_dir / "Episode_42").is_dir())
                 self.assertIn("Episode_42/Episode_42_", win.filename_preview_label.text())
-                self.assertIn("[Episode_42/]", win.takes_title_label.text())
+                self.assertEqual(win.takes_title_label.text(), "Project Recordings")
+                self.assertNotIn("[Episode_42", win.takes_title_label.text())
+                self.assertIn("Episode 42", win.project_name_label.text())
+                self.assertEqual(win.refresh_takes_btn.text(), "↻")
+                self.assertIn("Refresh", win.refresh_takes_btn.toolTip())
 
                 # Create a completed recording in the Episode_42 subfolder and test RenameRecordingDialog
                 sample_wav = cm.ensure_project_dir("Episode 42") / "Episode_42_2026-11-08_12.00.00_EST.wav"
@@ -1856,6 +1860,8 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                 ROLE_PLAYBACK_PAUSED,
                 ROLE_PLAYBACK_POS_SEC,
                 ROLE_PLAYBACK_PROGRESS,
+                RecordingClipItemDelegate,
+                abbreviate_text_to_width,
                 format_clip_progress_bar,
                 format_playback_time,
             )
@@ -1867,6 +1873,14 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
         self.assertEqual(format_playback_time(65), "01:05")
         self.assertIn("●", format_clip_progress_bar(0.5, width=10))
         self.assertIn("50%", format_clip_progress_bar(0.5, width=10))
+        self.assertEqual(abbreviate_text_to_width("short.wav", 120, lambda s: len(s) * 8), "short.wav")
+        abbreviated = abbreviate_text_to_width(
+            "very_long_recording_filename_that_exceeds_row_width.wav", 120, lambda s: len(s) * 8
+        )
+        self.assertTrue(abbreviated.endswith("..."))
+        self.assertLessEqual(len(abbreviated) * 8, 120)
+        self.assertEqual(RecordingClipItemDelegate.compute_name_scroll_offset(0, now_mono=5.0), 0)
+        self.assertGreater(RecordingClipItemDelegate.compute_name_scroll_offset(100, now_mono=2.5), 0)
 
         app = QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as tmp:
@@ -1898,6 +1912,11 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
             )
             try:
                 self.assertEqual(win.recordings_list.count(), 2)
+                self.assertEqual(win.takes_title_label.text(), "Project Recordings")
+                self.assertIn("InlinePlayTest", win.project_name_label.text())
+                self.assertEqual(win.refresh_takes_btn.text(), "↻")
+                self.assertIn("Refresh", win.refresh_takes_btn.toolTip())
+                self.assertIs(win.play_btn.parentWidget(), win.recordings_list.viewport())
                 win.recordings_list.setCurrentRow(0)
                 self.assertEqual(win.play_btn.text(), "▶ Play")
 
@@ -1921,7 +1940,7 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                 self.assertGreater(float(item0.data(ROLE_PLAYBACK_DUR_SEC)), 0.4)
                 self.assertIn("▶ PLAYING", item0.text())
                 self.assertIn("00:00 / 00:01", item0.text())
-                self.assertIn("%]", item0.text())
+                self.assertNotIn("%]", item0.text())
                 self.assertFalse(bool(item1.data(ROLE_PLAYBACK_ACTIVE)))
 
                 # Selecting row 1 while row 0 is playing switches play_btn to "▶ Play"
@@ -1930,8 +1949,18 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                 self.assertEqual(win.play_btn.text(), "▶ Play")
                 self.assertTrue(bool(item0.data(ROLE_PLAYBACK_ACTIVE)))
 
-                # Reselect row 0 -> play_btn shows "❚❚ Pause" again; clicking pauses playback
+                # Starting playback on row 1 stops row 0 automatically so only one file plays at a time
+                win._on_play_pause_clicked()
+                win._on_ui_tick()
+                self.assertTrue(engine.is_playing)
+                self.assertEqual(win.play_btn.text(), "❚❚ Pause")
+                self.assertFalse(bool(item0.data(ROLE_PLAYBACK_ACTIVE)))
+                self.assertTrue(bool(item1.data(ROLE_PLAYBACK_ACTIVE)))
+
+                # Switch back to row 0 and start it again, then test pause and stop
                 win.recordings_list.setCurrentRow(0)
+                self.assertEqual(win.play_btn.text(), "▶ Play")
+                win._on_play_pause_clicked()
                 self.assertEqual(win.play_btn.text(), "❚❚ Pause")
                 win._on_play_pause_clicked()
                 self.assertTrue(engine.is_paused)

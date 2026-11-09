@@ -2529,11 +2529,11 @@ class AudioEngine:
         on_finished: Optional[Callable[[], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
     ) -> None:
-        """Start reference playback of a recorded WAV file."""
+        """Start reference playback of a recorded WAV file (stopping any active playback first)."""
         if self.is_recording:
             return
 
-        self.stop_playback()
+        self.stop_playback(resume_monitoring=False)
         self._stop_monitoring_thread()
 
         with self._play_lock:
@@ -2573,7 +2573,7 @@ class AudioEngine:
             self._clear_live_meter_levels()
         return paused
 
-    def stop_playback(self) -> None:
+    def stop_playback(self, resume_monitoring: bool = True) -> None:
         """Stop active reference playback."""
         with self._play_lock:
             if not self._is_playing:
@@ -2592,9 +2592,11 @@ class AudioEngine:
             self._play_position_sec = 0.0
             self._playing_filepath = None
             self._seek_target_sec = None
+            self._play_thread = None
 
         self._clear_live_meter_levels()
-        self._resume_monitoring_if_configured()
+        if resume_monitoring:
+            self._resume_monitoring_if_configured()
 
     @staticmethod
     def _downmix_playback_to_mono(playback_block: np.ndarray) -> np.ndarray:
@@ -2664,16 +2666,22 @@ class AudioEngine:
             if on_error:
                 on_error(str(exc))
         finally:
+            was_stopped = self._stop_play_event.is_set()
+            is_current_worker = False
             with self._play_lock:
-                self._is_playing = False
-                self._is_paused = False
-                self._play_position_sec = 0.0
-                self._playing_filepath = None
-                self._seek_target_sec = None
-            self._clear_live_meter_levels()
-            self._resume_monitoring_if_configured()
-            if on_finished:
-                on_finished()
+                if self._play_thread is threading.current_thread():
+                    is_current_worker = True
+                    self._is_playing = False
+                    self._is_paused = False
+                    self._play_position_sec = 0.0
+                    self._playing_filepath = None
+                    self._seek_target_sec = None
+                    self._play_thread = None
+            if is_current_worker and not was_stopped:
+                self._clear_live_meter_levels()
+                self._resume_monitoring_if_configured()
+                if on_finished:
+                    on_finished()
 
     def _playback_simulated_loop(self, frames: np.ndarray, sample_rate: int) -> None:
         total_frames = frames.shape[0]

@@ -7,8 +7,16 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from PyQt6.QtCore import QRectF, Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPen, QResizeEvent
+from PyQt6.QtCore import QRectF, QSize, Qt, QTimer
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QKeyEvent,
+    QPainter,
+    QPen,
+    QResizeEvent,
+)
 from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
@@ -75,6 +83,8 @@ ROLE_PLAYBACK_PAUSED = int(Qt.ItemDataRole.UserRole) + 2
 ROLE_PLAYBACK_PROGRESS = int(Qt.ItemDataRole.UserRole) + 3
 ROLE_PLAYBACK_POS_SEC = int(Qt.ItemDataRole.UserRole) + 4
 ROLE_PLAYBACK_DUR_SEC = int(Qt.ItemDataRole.UserRole) + 5
+ROLE_RECORDING_FILENAME = int(Qt.ItemDataRole.UserRole) + 6
+ROLE_RECORDING_META = int(Qt.ItemDataRole.UserRole) + 7
 
 
 def format_playback_time(seconds: float) -> str:
@@ -99,8 +109,83 @@ def format_clip_progress_bar(ratio: float, width: int = 10) -> str:
     return f"{before}●{after} {pct:3d}%"
 
 
+def abbreviate_text_to_width(
+    text: str, font_metrics: QFontMetrics, max_width_px: float
+) -> str:
+    """Abbreviate text with '...' if its pixel width exceeds max_width_px."""
+    raw = str(text or "")
+    limit = max(24, int(max_width_px))
+    if font_metrics.horizontalAdvance(raw) <= limit:
+        return raw
+    ellipsis = "..."
+    ell_w = font_metrics.horizontalAdvance(ellipsis)
+    if limit <= ell_w + 4:
+        return ellipsis
+    lo = 0
+    hi = len(raw)
+    best = ellipsis
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = raw[:mid].rstrip() + ellipsis
+        if font_metrics.horizontalAdvance(candidate) <= limit:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
 class RecordingClipItemDelegate(QStyledItemDelegate):
-    """Custom list delegate that draws an inline progress bar and playhead on the playing clip's row."""
+    """Custom list delegate for project recordings.
+
+    - Draws a proportional background progress fill on the actively playing clip row
+      (without a redundant slider bar).
+    - Reserves space on the rightmost side of the selected row for the inline Play/Pause button.
+    - Abbreviates long filenames with '...' when unselected so columns never overlap,
+      and smoothly scrolls long filenames horizontally when selected to reveal the full name.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._scale: float = 1.0
+        self._inline_button_reserve_px: int = 128
+        self._scroll_start_mono: float = time.monotonic()
+        self._selected_row_scrolling: bool = False
+
+    @property
+    def is_selected_row_scrolling(self) -> bool:
+        return self._selected_row_scrolling
+
+    def apply_scale(self, scale: float, inline_button_width: int = 120) -> None:
+        self._scale = max(0.55, float(scale))
+        self._inline_button_reserve_px = max(84, int(inline_button_width))
+
+    def reset_scroll_timer(self) -> None:
+        self._scroll_start_mono = time.monotonic()
+
+    @staticmethod
+    def compute_name_scroll_offset(
+        overflow_px: float, elapsed_sec: float, scale: float = 1.0
+    ) -> float:
+        """Compute horizontal marquee pixel offset for a selected row whose name overflows."""
+        if overflow_px <= 0.5:
+            return 0.0
+        pause_start = 0.85
+        pause_end = 1.10
+        speed_px_per_sec = max(32.0, 52.0 * max(0.7, float(scale)))
+        scroll_dur = max(0.4, float(overflow_px) / speed_px_per_sec)
+        cycle_dur = pause_start + scroll_dur + pause_end
+        t = max(0.0, float(elapsed_sec)) % cycle_dur
+        if t <= pause_start:
+            return 0.0
+        if t >= pause_start + scroll_dur:
+            return float(overflow_px)
+        return min(float(overflow_px), (t - pause_start) * speed_px_per_sec)
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:  # type: ignore[override]
+        base = super().sizeHint(option, index)
+        row_h = max(34, int(round(38 * self._scale)))
+        return QSize(base.width(), max(base.height(), row_h))
 
     def paint(
         self,
@@ -109,84 +194,177 @@ class RecordingClipItemDelegate(QStyledItemDelegate):
         index,
     ) -> None:
         is_active = bool(index.data(ROLE_PLAYBACK_ACTIVE))
-        if not is_active:
-            super().paint(painter, option, index)
-            return
-
         is_paused = bool(index.data(ROLE_PLAYBACK_PAUSED))
         raw_prog = index.data(ROLE_PLAYBACK_PROGRESS)
         progress = max(0.0, min(1.0, float(raw_prog if raw_prog is not None else 0.0)))
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
 
+        filename = str(index.data(ROLE_RECORDING_FILENAME) or "")
+        meta_text = str(index.data(ROLE_RECORDING_META) or "")
+        if not filename:
+            raw_display = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+            parts = raw_display.split("    |    ", 1)
+            filename = parts[0]
+            for badge_prefix in ("▶ PLAYING  ", "❚❚ PAUSED  "):
+                if filename.startswith(badge_prefix):
+                    filename = filename[len(badge_prefix) :]
+                    break
+            meta_text = parts[1] if len(parts) > 1 else ""
+
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         rect = QRectF(option.rect).adjusted(2.0, 1.0, -2.0, -1.0)
-        radius = 4.0
+        radius = 5.0
 
-        # 1. Base row background
-        if is_paused:
-            bg_color = QColor("#241A08") if is_selected else QColor("#1B1408")
-            fill_color = QColor(210, 153, 34, 78)
-            accent_color = QColor("#F0B72F")
-            text_color = QColor("#FFDF5D")
+        # 1. Row background & proportional background progress meter (when active)
+        if is_active:
+            if is_paused:
+                bg_color = QColor("#241A08") if is_selected else QColor("#1B1408")
+                fill_color = QColor(210, 153, 34, 86)
+                accent_color = QColor("#F0B72F")
+                name_color = QColor("#FFDF5D")
+                meta_color = QColor("#F0B72F")
+            else:
+                bg_color = QColor("#0E2238") if is_selected else QColor("#0B1929")
+                fill_color = QColor(56, 139, 253, 90)
+                accent_color = QColor("#58A6FF")
+                name_color = QColor("#79C0FF")
+                meta_color = QColor("#A5D6FF")
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bg_color)
+            painter.drawRoundedRect(rect, radius, radius)
+
+            # Background progress fill across the playing clip row (no slider bar)
+            if progress > 0.0:
+                fill_w = max(4.0, rect.width() * progress)
+                fill_rect = QRectF(rect.left(), rect.top(), fill_w, rect.height())
+                painter.setBrush(fill_color)
+                painter.drawRoundedRect(fill_rect, radius, radius)
+
+            border_pen = QPen(accent_color, 1.8 if is_selected else 1.0)
+            painter.setPen(border_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect, radius, radius)
+        elif is_selected:
+            painter.setPen(QPen(QColor("#388BFD"), 1.5))
+            painter.setBrush(QColor("#1A2B42"))
+            painter.drawRoundedRect(rect, radius, radius)
+            name_color = QColor("#FFFFFF")
+            meta_color = QColor("#C9D1D9")
         else:
-            bg_color = QColor("#0E2238") if is_selected else QColor("#0B1929")
-            fill_color = QColor(56, 139, 253, 82)
-            accent_color = QColor("#58A6FF")
-            text_color = QColor("#79C0FF")
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#161B22"))
+            painter.drawRoundedRect(rect, radius, radius)
+            painter.setPen(QPen(QColor("#21262D"), 1.0))
+            painter.drawLine(
+                int(rect.left() + 6.0),
+                int(rect.bottom()),
+                int(rect.right() - 6.0),
+                int(rect.bottom()),
+            )
+            name_color = QColor("#E6EDF3")
+            meta_color = QColor("#8B949E")
 
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(bg_color)
-        painter.drawRoundedRect(rect, radius, radius)
+        # 2. Non-overlapping column layout (reserving right space on selected row for Play/Pause button)
+        pad_l = max(10.0, round(12.0 * self._scale))
+        if is_selected:
+            pad_r = float(self._inline_button_reserve_px) + max(14.0, round(18.0 * self._scale))
+        else:
+            pad_r = max(10.0, round(12.0 * self._scale))
 
-        # 2. Proportional playback progress fill across the clip row
-        if progress > 0.0:
-            fill_w = max(4.0, rect.width() * progress)
-            fill_rect = QRectF(rect.left(), rect.top(), fill_w, rect.height())
-            painter.setBrush(fill_color)
-            painter.drawRoundedRect(fill_rect, radius, radius)
-
-        # 3. Bottom progress track & playhead position marker
-        rail_h = 3.0
-        rail_rect = QRectF(rect.left() + 4.0, rect.bottom() - rail_h - 1.0, max(8.0, rect.width() - 8.0), rail_h)
-        painter.setBrush(QColor("#21262D"))
-        painter.drawRoundedRect(rail_rect, 1.5, 1.5)
-
-        playhead_x = rail_rect.left() + rail_rect.width() * progress
-        if progress > 0.0:
-            active_rail = QRectF(rail_rect.left(), rail_rect.top(), playhead_x - rail_rect.left(), rail_h)
-            painter.setBrush(accent_color)
-            painter.drawRoundedRect(active_rail, 1.5, 1.5)
-
-        # Vertical playhead cursor line + dot on the playing row
-        head_pen = QPen(accent_color, 2.0)
-        painter.setPen(head_pen)
-        painter.drawLine(
-            int(round(playhead_x)),
-            int(round(rect.top() + 2.0)),
-            int(round(playhead_x)),
-            int(round(rect.bottom() - 2.0)),
-        )
-
-        # 4. Row border
-        border_pen = QPen(accent_color, 1.5 if is_selected else 1.0)
-        painter.setPen(border_pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(rect, radius, radius)
-
-        # 5. Clip row text with live play position
-        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
         font = QFont(option.font)
-        font.setBold(True)
+        font.setBold(bool(is_active or is_selected))
         painter.setFont(font)
-        painter.setPen(text_color)
-        text_rect = rect.adjusted(10.0, 0.0, -10.0, -rail_h)
-        painter.drawText(
-            text_rect,
-            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            text,
-        )
+        fm = painter.fontMetrics()
+
+        avail_total_w = max(80.0, rect.width() - pad_l - pad_r)
+        meta_sep = f"    |    {meta_text}" if meta_text else ""
+        meta_w = float(fm.horizontalAdvance(meta_sep)) if meta_sep else 0.0
+        max_meta_w = avail_total_w * 0.62
+        if meta_w > max_meta_w and meta_sep:
+            meta_sep = abbreviate_text_to_width(meta_sep, fm, max_meta_w)
+            meta_w = float(fm.horizontalAdvance(meta_sep))
+
+        badge_str = ("❚❚ PAUSED  " if is_paused else "▶ PLAYING  ") if is_active else ""
+        badge_w = float(fm.horizontalAdvance(badge_str)) if badge_str else 0.0
+
+        avail_name_w = max(48.0, avail_total_w - meta_w - badge_w)
+        cursor_x = rect.left() + pad_l
+
+        # Draw active state badge ('▶ PLAYING  ' or '❚❚ PAUSED  ')
+        if badge_str:
+            painter.setPen(name_color)
+            badge_rect = QRectF(cursor_x, rect.top(), badge_w, rect.height())
+            painter.drawText(
+                badge_rect,
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                badge_str,
+            )
+            cursor_x += badge_w
+
+        # Draw filename (abbreviated when unselected and too long; scrolling when selected and too long)
+        full_name_w = float(fm.horizontalAdvance(filename))
+        name_rect = QRectF(cursor_x, rect.top(), avail_name_w, rect.height())
+        painter.setPen(name_color)
+
+        if full_name_w <= avail_name_w:
+            if is_selected:
+                self._selected_row_scrolling = False
+            painter.drawText(
+                name_rect,
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                filename,
+            )
+            meta_start_x = cursor_x + full_name_w
+        elif not is_selected:
+            abbreviated = abbreviate_text_to_width(filename, fm, avail_name_w)
+            painter.drawText(
+                name_rect,
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                abbreviated,
+            )
+            meta_start_x = cursor_x + avail_name_w
+        else:
+            # Selected row with long filename: smoothly scroll to show entire name
+            self._selected_row_scrolling = True
+            overflow_px = full_name_w - avail_name_w
+            offset_px = self.compute_name_scroll_offset(
+                overflow_px,
+                time.monotonic() - self._scroll_start_mono,
+                self._scale,
+            )
+            painter.save()
+            painter.setClipRect(name_rect)
+            scroll_draw_rect = QRectF(
+                name_rect.left() - offset_px,
+                name_rect.top(),
+                full_name_w + 8.0,
+                name_rect.height(),
+            )
+            painter.drawText(
+                scroll_draw_rect,
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                filename,
+            )
+            painter.restore()
+            meta_start_x = cursor_x + avail_name_w
+
+        # Draw metadata (elapsed/total time or duration, format, size)
+        if meta_sep:
+            painter.setPen(name_color if is_active else meta_color)
+            meta_rect = QRectF(
+                meta_start_x,
+                rect.top(),
+                max(0.0, rect.right() - pad_r - meta_start_x),
+                rect.height(),
+            )
+            painter.drawText(
+                meta_rect,
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                meta_sep,
+            )
 
         painter.restore()
 
@@ -809,8 +987,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.main_layout = QVBoxLayout(central)
-        self.main_layout.setContentsMargins(18, 14, 18, 8)
-        self.main_layout.setSpacing(12)
+        self.main_layout.setContentsMargins(16, 10, 16, 6)
+        self.main_layout.setSpacing(8)
 
         # 1. Top Bar: Next Filename Preview, Remote Producer, Settings
         top_frame = QFrame()
@@ -886,8 +1064,8 @@ class MainWindow(QMainWindow):
         )
         self.deck_frame.setObjectName("StudioDeck")
         deck_layout = QVBoxLayout(self.deck_frame)
-        deck_layout.setContentsMargins(16, 12, 16, 14)
-        deck_layout.setSpacing(10)
+        deck_layout.setContentsMargins(16, 8, 16, 10)
+        deck_layout.setSpacing(6)
 
         # Studio Mode / Paused Recording visual indicator banner
         self.talkback_banner = QLabel("STUDIO MODE")
@@ -956,7 +1134,7 @@ class MainWindow(QMainWindow):
         controls_row.addWidget(self.cough_privacy_btn, stretch=2)
 
         deck_layout.addLayout(controls_row, stretch=1)
-        self.main_layout.addWidget(self.deck_frame, stretch=3)
+        self.main_layout.addWidget(self.deck_frame, stretch=2)
 
         # 4. Storage Capacity & Recording Time Remaining Strip (outside Studio Deck, above Recordings Pane)
         self.storage_monitor = StorageMonitorWidget(parent=central)
@@ -969,10 +1147,13 @@ class MainWindow(QMainWindow):
         )
         takes_frame.setObjectName("TakesPane")
         takes_layout = QVBoxLayout(takes_frame)
-        takes_layout.setContentsMargins(12, 10, 12, 10)
-        takes_layout.setSpacing(8)
+        takes_layout.setContentsMargins(12, 8, 12, 10)
+        takes_layout.setSpacing(6)
 
         takes_header_row = QHBoxLayout()
+        takes_header_row.setContentsMargins(0, 0, 0, 0)
+        takes_header_row.setSpacing(10)
+
         self.takes_title_label = QLabel("Project Recordings")
         self.takes_title_label.setObjectName("HeaderTitle")
         takes_header_row.addWidget(self.takes_title_label)
@@ -1000,17 +1181,6 @@ class MainWindow(QMainWindow):
 
         takes_header_row.addStretch(1)
 
-        self.playback_status_label = QLabel("")
-        self.playback_status_label.setStyleSheet("color: #8B949E; font-family: monospace;")
-        takes_header_row.addWidget(self.playback_status_label)
-
-        self.play_btn = QPushButton("▶ Play")
-        self.play_btn.setToolTip(
-            "Play or pause the selected project recording for reference and stream to Remote Producer [Hotkey: P]"
-        )
-        self.play_btn.clicked.connect(self._on_play_pause_clicked)
-        takes_header_row.addWidget(self.play_btn)
-
         self.stop_play_btn = QPushButton("■ Stop")
         self.stop_play_btn.setToolTip(
             "Stop reference audio playback [Hotkey: S]"
@@ -1018,32 +1188,73 @@ class MainWindow(QMainWindow):
         self.stop_play_btn.clicked.connect(self._on_stop_playback_clicked)
         takes_header_row.addWidget(self.stop_play_btn)
 
-        self.refresh_takes_btn = QPushButton("↻ Refresh")
+        self.refresh_takes_btn = QPushButton("↻")
         self.refresh_takes_btn.setToolTip(
-            "Rescan /storage for project recordings and audio devices [Hotkey: F5]"
+            "Refresh: Rescan /storage for project recordings and audio devices [Hotkey: F5]"
         )
         self.refresh_takes_btn.clicked.connect(self._on_manual_refresh)
         takes_header_row.addWidget(self.refresh_takes_btn)
 
         takes_layout.addLayout(takes_header_row)
 
+        # Subtitle row directly below Project Recordings heading showing the active Project Name
+        takes_sub_row = QHBoxLayout()
+        takes_sub_row.setContentsMargins(2, 0, 2, 0)
+        takes_sub_row.setSpacing(12)
+
+        self.project_name_label = QLabel()
+        self.project_name_label.setObjectName("ProjectNameSubLabel")
+        self.project_name_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self.project_name_label.setStyleSheet(
+            "border: none; color: #58A6FF; font-weight: bold;"
+        )
+        takes_sub_row.addWidget(self.project_name_label, stretch=1)
+
+        self.playback_status_label = QLabel("")
+        self.playback_status_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.playback_status_label.setStyleSheet(
+            "border: none; color: #8B949E; font-family: monospace;"
+        )
+        takes_sub_row.addWidget(self.playback_status_label)
+
+        takes_layout.addLayout(takes_sub_row)
+
         self.recordings_list = QListWidget()
         self.recordings_item_delegate = RecordingClipItemDelegate(self.recordings_list)
         self.recordings_list.setItemDelegate(self.recordings_item_delegate)
         self.recordings_list.setToolTip(
             "Finished WAV recordings in the active project subfolder (/storage/<ProjectName>/). "
-            "Double-click or press [P] to play back (also streamed to Remote Producer), "
-            "[Left]/[Right] to seek ±3s, or click Rename File [N] to categorize."
+            "Select a file and click its Play/Pause button on the right (or double-click / press [P]) to play back "
+            "(also streamed to Remote Producer), [Left]/[Right] to seek ±3s, or click Rename File [N] to categorize."
         )
         self.recordings_list.itemDoubleClicked.connect(
             lambda _item: self._on_play_pause_clicked(force_new=True)
         )
         self.recordings_list.currentRowChanged.connect(
-            lambda _row: self._update_playback_buttons_state()
+            self._on_selected_recording_row_changed
         )
+        v_scroll = self.recordings_list.verticalScrollBar()
+        if v_scroll is not None:
+            v_scroll.valueChanged.connect(
+                lambda _val: self._reposition_inline_play_button()
+            )
+
+        # Inline Play/Pause button rendered on the rightmost side of the selected file entry
+        self.play_btn = QPushButton("▶ Play", self.recordings_list.viewport())
+        self.play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.play_btn.setToolTip(
+            "Play or pause the selected project recording for reference and stream to Remote Producer [Hotkey: P]"
+        )
+        self.play_btn.clicked.connect(self._on_play_pause_clicked)
+        self.play_btn.setVisible(False)
+
         takes_layout.addWidget(self.recordings_list, stretch=1)
 
-        self.main_layout.addWidget(takes_frame, stretch=2)
+        self.main_layout.addWidget(takes_frame, stretch=3)
 
         # 5. Subtle Bottom Status Bar showing Device IP, Samba Share Path & System CPU/RAM Load
         self.bottom_bar_frame = QFrame()
@@ -1098,27 +1309,35 @@ class MainWindow(QMainWindow):
 
         self.setStyleSheet(build_main_stylesheet(self._scale))
 
-        timer_px = max(32, int(round(62 * self._scale)))
+        timer_px = max(28, int(round(52 * self._scale)))
         timer_font = QFont("DejaVu Sans Mono", timer_px, QFont.Weight.Bold)
         timer_font.setStyleHint(QFont.StyleHint.Monospace)
         self.timer_label.setFont(timer_font)
 
-        btn_min_h = max(68, int(round(120 * self._scale)))
+        btn_min_h = max(60, int(round(98 * self._scale)))
         self.record_btn.setFixedHeight(btn_min_h)
         self.pause_record_btn.setFixedHeight(btn_min_h)
         self.talkback_btn.setFixedHeight(btn_min_h)
         self.cough_privacy_btn.setFixedHeight(btn_min_h)
 
-        # Static relative widths for header and playback bar buttons so they never resize on click
-        self.remote_producer_btn.setFixedWidth(max(195, int(round(250 * self._scale))))
-        self.settings_btn.setFixedWidth(max(150, int(round(190 * self._scale))))
-        self.help_btn.setFixedWidth(max(90, int(round(115 * self._scale))))
-        self.project_prefix_btn.setFixedWidth(max(135, int(round(170 * self._scale))))
-        self.rename_take_btn.setFixedWidth(max(125, int(round(160 * self._scale))))
-        self.file_manager_btn.setFixedWidth(max(135, int(round(170 * self._scale))))
-        self.play_btn.setFixedWidth(max(130, int(round(165 * self._scale))))
-        self.stop_play_btn.setFixedWidth(max(90, int(round(115 * self._scale))))
-        self.refresh_takes_btn.setFixedWidth(max(105, int(round(135 * self._scale))))
+        # Ensure header and toolbar buttons fit their text comfortably at 1920x1080 and never overlap
+        self.remote_producer_btn.setMinimumWidth(max(195, int(round(250 * self._scale))))
+        self.settings_btn.setMinimumWidth(max(150, int(round(195 * self._scale))))
+        self.help_btn.setMinimumWidth(max(90, int(round(115 * self._scale))))
+        self.project_prefix_btn.setMinimumWidth(max(140, int(round(180 * self._scale))))
+        self.rename_take_btn.setMinimumWidth(max(130, int(round(170 * self._scale))))
+        self.file_manager_btn.setMinimumWidth(max(140, int(round(180 * self._scale))))
+        self.stop_play_btn.setMinimumWidth(max(95, int(round(125 * self._scale))))
+
+        # Compact icon-only Refresh button
+        icon_btn_w = max(38, int(round(48 * self._scale)))
+        self.refresh_takes_btn.setFixedWidth(icon_btn_w)
+
+        # Inline Play/Pause button on the right-most side of the selected file entry
+        inline_play_w = max(98, int(round(128 * self._scale)))
+        self.recordings_item_delegate.apply_scale(
+            self._scale, inline_button_width=inline_play_w
+        )
 
         self.vu_meter.apply_scale(self._scale)
         self.storage_monitor.apply_scale(self._scale)
@@ -1127,7 +1346,9 @@ class MainWindow(QMainWindow):
             build_system_resource_badge_style(self._last_resource_status.level, self._scale)
         )
 
+        self._update_project_name_label()
         self._refresh_transport_styles()
+        self._reposition_inline_play_button()
 
     # -------------------------------------------------------------------------
     # Hardware State & Defaults
@@ -1752,18 +1973,62 @@ class MainWindow(QMainWindow):
             "border: none; color: #8B949E; font-family: monospace;"
         )
 
+    def _update_project_name_label(self) -> None:
+        """Display the active Project Name below the Project Recordings heading (abbreviated if very long)."""
+        raw_name = (self.config_manager.settings.project_name or "").strip()
+        folder = sanitize_project_name(raw_name)
+        display_proj = raw_name if raw_name else folder
+        full_text = f"Project: {display_proj}"
+        self.project_name_label.setToolTip(
+            f"Active Project: {display_proj}  (Subfolder: /storage/{folder}/)"
+        )
+        avail_w = max(240, self.width() - int(round(320 * self._scale)))
+        fm = self.project_name_label.fontMetrics()
+        self.project_name_label.setText(
+            abbreviate_text_to_width(full_text, fm, avail_w)
+        )
+
+    def _on_selected_recording_row_changed(self, _row: int) -> None:
+        self.recordings_item_delegate.reset_scroll_timer()
+        self._update_playback_buttons_state()
+        self._reposition_inline_play_button()
+
+    def _reposition_inline_play_button(self) -> None:
+        """Position the Play/Pause button on the rightmost side of the currently selected file entry."""
+        viewport = self.recordings_list.viewport()
+        curr_item = self.recordings_list.currentItem()
+        if viewport is None or curr_item is None or self.recordings_list.count() == 0:
+            self.play_btn.setVisible(False)
+            return
+
+        item_rect = self.recordings_list.visualItemRect(curr_item)
+        vp_rect = viewport.rect()
+        if not item_rect.isValid() or not vp_rect.intersects(item_rect):
+            self.play_btn.setVisible(False)
+            return
+
+        btn_w = max(98, int(round(128 * self._scale)))
+        margin_v = max(3, int(round(4 * self._scale)))
+        margin_r = max(6, int(round(10 * self._scale)))
+        btn_h = max(22, item_rect.height() - margin_v * 2)
+        btn_x = max(4, item_rect.right() - btn_w - margin_r)
+        btn_y = item_rect.top() + (item_rect.height() - btn_h) // 2
+
+        self.play_btn.setGeometry(btn_x, btn_y, btn_w, btn_h)
+        self.play_btn.setVisible(True)
+        self.play_btn.raise_()
+
     @staticmethod
-    def _format_recording_row_text(
+    def _format_recording_meta_text(
         entry: RecordingEntry,
         is_playing_this: bool = False,
-        is_paused: bool = False,
         pos_sec: float = 0.0,
         dur_sec: float = 0.0,
     ) -> str:
+        """Format the metadata portion of a recording row (with elapsed / total time when playing)."""
         ch_label = "Stereo" if entry.channels == 2 else f"{entry.channels}ch"
         if not is_playing_this:
             return (
-                f"{entry.filename}    |    "
                 f"{entry.formatted_duration}    |    "
                 f"{entry.bit_depth}-bit {entry.sample_rate:,} Hz {ch_label}    |    "
                 f"{entry.formatted_size}"
@@ -1773,17 +2038,33 @@ class MainWindow(QMainWindow):
         clamped_pos = (
             max(0.0, min(pos_sec, eff_dur)) if eff_dur > 0.0 else max(0.0, pos_sec)
         )
-        ratio = (clamped_pos / eff_dur) if eff_dur > 0.0 else 0.0
         pos_str = format_playback_time(clamped_pos)
         dur_str = format_playback_time(eff_dur)
-        bar_str = format_clip_progress_bar(ratio, width=10)
-        state_badge = "❚❚ PAUSED" if is_paused else "▶ PLAYING"
         return (
-            f"{state_badge}  {entry.filename}    |    "
-            f"{pos_str} / {dur_str}  [{bar_str}]    |    "
+            f"{pos_str} / {dur_str}    |    "
             f"{entry.bit_depth}-bit {entry.sample_rate:,} Hz {ch_label}    |    "
             f"{entry.formatted_size}"
         )
+
+    @staticmethod
+    def _format_recording_row_text(
+        entry: RecordingEntry,
+        is_playing_this: bool = False,
+        is_paused: bool = False,
+        pos_sec: float = 0.0,
+        dur_sec: float = 0.0,
+    ) -> str:
+        meta_part = MainWindow._format_recording_meta_text(
+            entry,
+            is_playing_this=is_playing_this,
+            pos_sec=pos_sec,
+            dur_sec=dur_sec,
+        )
+        if not is_playing_this:
+            return f"{entry.filename}    |    {meta_part}"
+
+        state_badge = "❚❚ PAUSED" if is_paused else "▶ PLAYING"
+        return f"{state_badge}  {entry.filename}    |    {meta_part}"
 
     def _update_playing_clip_row(self, paused_override: Optional[bool] = None) -> None:
         """Update the line of the clip that is playing in recordings_list with live play position & progress."""
@@ -1811,6 +2092,12 @@ class MainWindow(QMainWindow):
                 progress = (
                     max(0.0, min(1.0, pos_sec / eff_dur)) if eff_dur > 0.0 else 0.0
                 )
+                meta_text = self._format_recording_meta_text(
+                    entry,
+                    is_playing_this=True,
+                    pos_sec=pos_sec,
+                    dur_sec=eff_dur,
+                )
                 row_text = self._format_recording_row_text(
                     entry,
                     is_playing_this=True,
@@ -1820,15 +2107,20 @@ class MainWindow(QMainWindow):
                 )
                 if item.text() != row_text:
                     item.setText(row_text)
+                item.setData(ROLE_RECORDING_FILENAME, entry.filename)
+                item.setData(ROLE_RECORDING_META, meta_text)
                 item.setData(ROLE_PLAYBACK_ACTIVE, True)
                 item.setData(ROLE_PLAYBACK_PAUSED, is_paused)
                 item.setData(ROLE_PLAYBACK_PROGRESS, progress)
                 item.setData(ROLE_PLAYBACK_POS_SEC, pos_sec)
                 item.setData(ROLE_PLAYBACK_DUR_SEC, eff_dur)
             elif was_active:
+                meta_text = self._format_recording_meta_text(entry, is_playing_this=False)
                 row_text = self._format_recording_row_text(entry, is_playing_this=False)
                 if item.text() != row_text:
                     item.setText(row_text)
+                item.setData(ROLE_RECORDING_FILENAME, entry.filename)
+                item.setData(ROLE_RECORDING_META, meta_text)
                 item.setData(ROLE_PLAYBACK_ACTIVE, False)
                 item.setData(ROLE_PLAYBACK_PAUSED, False)
                 item.setData(ROLE_PLAYBACK_PROGRESS, 0.0)
@@ -1840,8 +2132,8 @@ class MainWindow(QMainWindow):
             viewport.update()
 
     def _refresh_recordings_list(self, select_path: Optional[Path] = None) -> None:
-        prefix = sanitize_project_name(self.config_manager.settings.project_name)
-        self.takes_title_label.setText(f"Project Recordings  [{prefix}/]")
+        self.takes_title_label.setText("Project Recordings")
+        self._update_project_name_label()
 
         current_selected_path: Optional[Path] = select_path
         if current_selected_path is None:
@@ -1864,22 +2156,30 @@ class MainWindow(QMainWindow):
             is_this_playing = bool(
                 playing_path is not None and entry.filepath == playing_path
             )
-            meta = self._format_recording_row_text(
+            eff_dur = (
+                self.audio_engine.play_duration_sec
+                if (is_this_playing and self.audio_engine.play_duration_sec > 0.0)
+                else entry.duration_seconds
+            )
+            meta_part = self._format_recording_meta_text(
+                entry,
+                is_playing_this=is_this_playing,
+                pos_sec=self.audio_engine.play_position_sec,
+                dur_sec=eff_dur,
+            )
+            row_text = self._format_recording_row_text(
                 entry,
                 is_playing_this=is_this_playing,
                 is_paused=self.audio_engine.is_paused,
                 pos_sec=self.audio_engine.play_position_sec,
-                dur_sec=self.audio_engine.play_duration_sec,
+                dur_sec=eff_dur,
             )
-            item = QListWidgetItem(meta)
+            item = QListWidgetItem(row_text)
             item.setData(Qt.ItemDataRole.UserRole, entry.filepath)
+            item.setData(ROLE_RECORDING_FILENAME, entry.filename)
+            item.setData(ROLE_RECORDING_META, meta_part)
             item.setData(ROLE_PLAYBACK_ACTIVE, is_this_playing)
             item.setData(ROLE_PLAYBACK_PAUSED, self.audio_engine.is_paused if is_this_playing else False)
-            eff_dur = (
-                self.audio_engine.play_duration_sec
-                if self.audio_engine.play_duration_sec > 0.0
-                else entry.duration_seconds
-            )
             prog = (
                 max(0.0, min(1.0, self.audio_engine.play_position_sec / eff_dur))
                 if (is_this_playing and eff_dur > 0.0)
@@ -1898,8 +2198,10 @@ class MainWindow(QMainWindow):
         if self._project_recordings:
             self.recordings_list.setCurrentRow(selected_row)
         self.recordings_list.blockSignals(False)
+        self.recordings_item_delegate.reset_scroll_timer()
         self._refresh_storage_status()
         self._update_playback_buttons_state()
+        self._reposition_inline_play_button()
 
     def _get_selected_recording_path(self) -> Optional[Path]:
         item = self.recordings_list.currentItem()
@@ -1990,19 +2292,20 @@ class MainWindow(QMainWindow):
             if is_paused:
                 self.play_btn.setText("▶ Resume")
                 self.play_btn.setStyleSheet(
-                    build_playback_button_style("paused", self._scale)
+                    build_playback_button_style("paused", self._scale, compact=True)
                 )
             else:
                 self.play_btn.setText("❚❚ Pause")
                 self.play_btn.setStyleSheet(
-                    build_playback_button_style("playing", self._scale)
+                    build_playback_button_style("playing", self._scale, compact=True)
                 )
         else:
             self.play_btn.setText("▶ Play")
             self.play_btn.setStyleSheet(
-                build_playback_button_style("ready", self._scale)
+                build_playback_button_style("ready", self._scale, compact=True)
             )
 
+        self._reposition_inline_play_button()
         self._update_playing_clip_row(paused_override=is_paused)
 
         if is_playing:
@@ -2145,6 +2448,11 @@ class MainWindow(QMainWindow):
                 self.playback_status_label.setText(
                     f"▶ Playing  [{pos_str} / {dur_str}]"
                 )
+        elif self.recordings_item_delegate.is_selected_row_scrolling:
+            viewport = self.recordings_list.viewport()
+            curr_item = self.recordings_list.currentItem()
+            if viewport is not None and curr_item is not None:
+                viewport.update(self.recordings_list.visualItemRect(curr_item))
 
     def _on_background_tick(self) -> None:
         self.ip_bar_label.setText(get_primary_ip_display())

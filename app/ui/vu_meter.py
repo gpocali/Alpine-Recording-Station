@@ -51,9 +51,10 @@ class _VuMeterCanvas(QWidget):
         self._is_muted: bool = False
 
         self.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
-        self.setMinimumHeight(54)
+        self.setMinimumHeight(32)
+        self.setMaximumHeight(48)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(
             "Graphical Input VU & Peak Hold Meter (-60 to 0 dBFS).\n"
@@ -70,16 +71,22 @@ class _VuMeterCanvas(QWidget):
         has_device: bool,
         is_muted: bool = False,
     ) -> None:
+        prev_ch = self._readings.channels
         self._readings = readings
         self._has_device = has_device
         self._is_muted = bool(is_muted)
-        self.update()
+        if readings.channels != prev_ch:
+            self.apply_scale(self._scale)
+        else:
+            self.update()
 
     def apply_scale(self, scale: float) -> None:
         self._scale = max(0.55, float(scale))
         num_ch = max(1, min(2, self._readings.channels))
-        base_h = 56 if num_ch == 1 else 72
-        self.setMinimumHeight(max(46, int(round(base_h * self._scale))))
+        base_h = 34 if num_ch == 1 else 44
+        target_h = max(30, int(round(base_h * self._scale)))
+        self.setMinimumHeight(target_h)
+        self.setMaximumHeight(target_h)
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -310,13 +317,16 @@ class VuMeterWidget(QFrame):
         self._is_playing: bool = False
 
         self.setObjectName("VuMeterFrame")
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
         self.setStyleSheet(
             "QFrame#VuMeterFrame { background-color: #12161C; border: 1px solid #262C34; border-radius: 8px; }"
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(2)
 
         # Header Row: Meter status, Live dBFS, Maintained Peak Hold dBFS, CLIP badge, Reset Peak button
         header_row = QHBoxLayout()
