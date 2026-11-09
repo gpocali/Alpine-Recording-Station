@@ -35,11 +35,17 @@ An optimized **Alpine Linux** kiosk configuration and fullscreen studio applicat
   - **SSL/TLS by Default with Easy Certificate Replacement**: Automatically generates a valid X.509 v3 self-signed certificate (with SANs for `localhost` and LAN IPv4 addresses) out of the box, and supports one-click replacement with CA-issued certificates dropped into `/storage/ssl/` (`server.crt` + `server.key`) over Samba or via custom certificate paths.
   - **Session-Tied Authentication, QR Code & Invite Link**: Generates a unique **Session ID** (`ARS-XXXX`), 6-digit **Session Passcode (PIN)**, scannable **QR Code**, and copyable HTTPS invite link; rotating the session immediately revokes prior tokens, cookies, and active WebSocket connections.
   - **Bidirectional Mic Privacy & Cough Controls**: Both the local Talent Studio Deck (`◉ MIC TO PRODUCER` / `Hold [B]` Cough Mute) and the Remote Producer web console (`Send Producer Mic` switch defaulting to `OFF (Private)` + `Hold [C]` / `[M]` Cough Mute) provide dedicated privacy and cough controls so neither microphone is ever unexpectedly hot.
-- **Project Prefix & Take Management**:
-  - Output filenames follow the format: `<ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav`.
-  - Accessible via the **✎ Project Prefix** button on the **Project Recordings** header (opening a dedicated dialog with live filename preview and On-Screen Keyboard support), leaving the top bar open to display the full **Next / Recording / Paused** filename.
+- **Project Subfolders, Fullscreen Storage File Manager & Direct File Management**:
+  - Each project stores its recordings inside a dedicated subfolder: `/storage/<ProjectName>/<ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav`.
+  - Accessible via the **✎ Project Name** button on the **Project Recordings** header (opening a dedicated dialog with live subfolder/filename preview and On-Screen Keyboard support), leaving the top bar open to display the full **Next / Recording / Paused** relative path.
+  - **Direct UI File Renaming**: Once a recording is completed, click **✎ Rename File** (or press `[N]` / `[F4]`) to rename the `.wav` file directly inside its project folder (with On-Screen Keyboard support) so takes can be categorized immediately instead of only having the project and timestamp.
+  - **Fullscreen Storage File Manager (`▤ File Manager` / `[F6]`)**:
+    - Displays a full-screen file list across **All Projects** or filtered by any specific project folder, with search filtering (and On-Screen Keyboard support) and multi-mode sorting (`Newest First`, `Oldest First`, `Largest Size First`, `Smallest Size First`, `Filename A → Z`, `Project Name A → Z`), plus a `⇄ Fullscreen File List` toggle (`[F11]`) that collapses the project sidebar so the file list spans 100% of the screen width.
+    - Supports **playing/pausing** (`[P]` / `Space`), **seeking ±3s** (`[Left]` / `[Right]`), **renaming** (`[N]` / `[F4]`), and **deleting** (`[Del]`) any recording file across any project, with a modal confirmation dialog that previews the exact disk space and recording time to be recovered and the before/after drive utilization.
+    - **Project Folder Cleanup & Recursive Deletion with Extra Confirmations**: Supports cleaning up empty project folders (`↺ Clean Empty`), emptying all files inside a project folder while keeping the folder (`◈ Empty Folder...`), and recursively deleting a project folder and all of its contents (`✕ Delete Folder...`). Both recursive operations require a **2-step extra confirmation** workflow (Step 1: review file list and drive utilization impact; Step 2: check the mandatory final confirmation checkbox to unlock the destructive action button).
+    - **Live Drive Utilization & Space Cleared Counter**: Embeds the live `/storage` `StorageMonitorWidget` capacity bar alongside a real-time `SPACE CLEARED` session badge (`+MB/GB` and `+HHh MMm SSs` recording time gained) so it is immediately clear how much drive space is being freed.
   - **Corruption-Safe Record Pause & Resume**: Pausing an active recording (`⏸ PAUSE RECORDING` or pressing `[P]` / `[Pause]`) flushes the RIFF/WAVE header and **closes the `.wav` file on disk** so it cannot be accidentally corrupted while paused, then **reopens the exact same `.wav` file** in append mode when resumed (`▶ RESUME RECORDING`). While paused, the Studio Deck displays unmistakable flashing Amber/Gold warning banners, a pulsing `⏸ HH:MM:SS.d [PAUSED]` timer, a glowing deck border, and a pulsing **Resume Recording** button so a paused session is never forgotten.
-  - The scrollable recordings list at the bottom of the UI automatically filters `/storage` to show only recordings matching the active **Project Prefix**, with built-in reference playback (`Play / Pause`, `Stop`).
+  - The scrollable recordings list at the bottom of the UI automatically lists all `.wav` recordings inside the active project subfolder (`/storage/<ProjectName>/`, including renamed takes), with built-in reference playback (`Play / Pause`, `Stop`).
 - **Samba Share & User Administration**:
   - Shares `/storage` over SMB (`\\<IP>\storage`).
   - Built-in **Samba Share Administration** tab in Settings to **Add Users**, **Change Passwords**, and **Remove Users** (persisted via `lbu commit`).
@@ -68,6 +74,9 @@ All buttons display their keyboard hotkeys on mouse hover:
 | **Mic to Producer / Cough Mute** | Hold `B` (or Click) | Hold `B` for momentary Cough Mute of feed to Remote Producer, or click button to toggle persistent Privacy Mute |
 | **Remote Producer & SSL Setup** | `F3` | Open Guided VO Remote Producer setup dialog (QR code, session link, passcode rotation, and SSL certificate import) |
 | **Toggle Mode** | `M` | Switch between Normal Mode and Studio Mode (when stopped) |
+| **Rename Recording** | `N` or `F4` | Rename the selected completed `.wav` recording inside the project folder (when not recording) |
+| **Delete Recording** | `Del` | Delete the selected `.wav` recording after confirmation showing drive space recovered |
+| **Storage File Manager** | `F6` | Open fullscreen Storage File Manager to browse, play, rename, and delete files or project folders across all projects |
 | **Play / Pause Take** | `P` | Play or pause the selected project recording (when not recording) |
 | **Stop Playback** | `S` | Stop reference audio playback |
 | **Settings & Samba Admin** | `F2` or `Ctrl+,` | Open Audio Hardware, Recording Format, and Samba User Administration |
@@ -159,6 +168,7 @@ alpine-recorder recover       # Emergency recovery: stop Xorg, clean tty1 config
 - [`app/ssl_manager.py`](app/ssl_manager.py) — Default X.509 v3 self-signed certificate generator and `/storage/ssl` issued-certificate importer.
 - [`app/remote_producer.py`](app/remote_producer.py) — HTTPS + RFC 6455 WebSocket server, session-bound authenticator, and stripped-down Guided VO Remote Producer web console.
 - [`app/ui/main_window.py`](app/ui/main_window.py) — Responsive fullscreen PyQt6 studio interface.
+- [`app/ui/file_manager_dialog.py`](app/ui/file_manager_dialog.py) — Fullscreen Storage File Manager across all projects with file playback/renaming/deletion, 2-step confirmed recursive project cleanup/deletion, and live drive utilization.
 - [`app/ui/remote_producer_dialog.py`](app/ui/remote_producer_dialog.py) — Remote Producer session setup, QR code display, passcode rotation, and SSL certificate dialog.
 - [`app/ui/vu_meter.py`](app/ui/vu_meter.py) — Graphical studio LED VU & Peak Hold meter widget (`-60` to `0 dBFS`) for live input level setting.
 - [`app/ui/storage_monitor.py`](app/ui/storage_monitor.py) — Graphical `/storage` drive utilization bar (`0%` to `100%`), low-space/critical warning panel, and real-time recording time remaining monitor.

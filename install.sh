@@ -268,6 +268,7 @@ if command -v python3 >/dev/null 2>&1; then
         "${APP_DEST}/app/ssl_manager.py" \
         "${APP_DEST}/app/remote_producer.py" \
         "${APP_DEST}/app/ui/main_window.py" \
+        "${APP_DEST}/app/ui/file_manager_dialog.py" \
         "${APP_DEST}/app/ui/remote_producer_dialog.py" \
         "${APP_DEST}/app/ui/vu_meter.py" \
         "${APP_DEST}/app/ui/storage_monitor.py" \
@@ -410,6 +411,7 @@ if command -v lbu >/dev/null 2>&1; then
     lbu include "${APP_DEST}/app/qr_code.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/ssl_manager.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/remote_producer.py" 2>/dev/null || true
+    lbu include "${APP_DEST}/app/ui/file_manager_dialog.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/ui/remote_producer_dialog.py" 2>/dev/null || true
     lbu include "${ETC_CONFIG_DIR}" 2>/dev/null || true
     lbu include "${ETC_CONFIG_DIR}/ssl" 2>/dev/null || true

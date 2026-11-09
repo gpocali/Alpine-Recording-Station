@@ -307,6 +307,7 @@ class VuMeterWidget(QFrame):
         self._is_paused: bool = False
         self._is_muted: bool = False
         self._is_talkback_override: bool = False
+        self._is_playing: bool = False
 
         self.setObjectName("VuMeterFrame")
         self.setStyleSheet(
@@ -379,6 +380,7 @@ class VuMeterWidget(QFrame):
         is_paused: bool = False,
         is_muted: bool = False,
         is_talkback_override: bool = False,
+        is_playing: bool = False,
     ) -> None:
         """Update graphical VU meter bars, Peak Hold marker, and digital dBFS readouts."""
         self._readings = readings
@@ -387,7 +389,9 @@ class VuMeterWidget(QFrame):
         self._is_paused = bool(is_paused)
         self._is_muted = bool(is_muted)
         self._is_talkback_override = bool(is_talkback_override)
-        self.canvas.set_state(readings, has_device=has_device, is_muted=is_muted)
+        self._is_playing = bool(is_playing)
+        effective_muted = bool(is_muted and not is_playing)
+        self.canvas.set_state(readings, has_device=has_device or is_playing, is_muted=effective_muted)
         self._refresh_readouts(
             readings,
             is_recording=is_recording,
@@ -395,6 +399,7 @@ class VuMeterWidget(QFrame):
             is_paused=is_paused,
             is_muted=is_muted,
             is_talkback_override=is_talkback_override,
+            is_playing=is_playing,
         )
 
     def _refresh_readouts(
@@ -405,13 +410,25 @@ class VuMeterWidget(QFrame):
         is_paused: bool = False,
         is_muted: bool = False,
         is_talkback_override: bool = False,
+        is_playing: bool = False,
     ) -> None:
         small_px = max(10, int(round(12 * self._scale)))
         btn_pad_v = max(2, int(round(3 * self._scale)))
         btn_pad_h = max(6, int(round(9 * self._scale)))
 
         # Status title
-        if not has_device:
+        if is_playing:
+            if is_paused:
+                self.title_label.setText("❚❚ PLAYBACK VU METER (PAUSED)")
+                self.title_label.setStyleSheet(
+                    f"border: none; color: #FFDF5D; font-weight: bold; font-size: {small_px}px;"
+                )
+            else:
+                self.title_label.setText("▶ PLAYBACK VU METER (REVIEWING TAKE)")
+                self.title_label.setStyleSheet(
+                    f"border: none; color: #79C0FF; font-weight: bold; font-size: {small_px}px;"
+                )
+        elif not has_device:
             self.title_label.setText("○ INPUT VU METER (OFFLINE)")
             self.title_label.setStyleSheet(
                 f"border: none; color: #6E7681; font-weight: bold; font-size: {small_px}px;"
@@ -445,7 +462,7 @@ class VuMeterWidget(QFrame):
             )
 
         # Live input dBFS readout
-        if not has_device or is_muted or readings.peak_level <= 1e-4:
+        if (not has_device and not is_playing) or (is_muted and not is_playing) or readings.peak_level <= 1e-4:
             self.live_db_label.setText("LIVE: -∞ dBFS")
         else:
             self.live_db_label.setText(f"LIVE: {readings.peak_db:+5.1f} dBFS")
@@ -518,6 +535,7 @@ class VuMeterWidget(QFrame):
             is_paused=self._is_paused,
             is_muted=self._is_muted,
             is_talkback_override=self._is_talkback_override,
+            is_playing=self._is_playing,
         )
 
     def value(self) -> int:

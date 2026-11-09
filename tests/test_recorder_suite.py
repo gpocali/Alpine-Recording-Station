@@ -320,19 +320,48 @@ class TestConfigAndProjectFiltering(unittest.TestCase):
             cm.settings.on_screen_keyboard = False
             cm.save()
 
-            # Write 2 WAV files for PodcastA and 1 for OtherProject
-            for name in (
-                "PodcastA_2026-11-05_10.00.00_EST.wav",
-                "PodcastA_2026-11-05_10.05.00_EST.wav",
-                "OtherProject_2026-11-05_10.10.00_EST.wav",
+            # Write 2 WAV files for PodcastA in its project subfolder and 1 for OtherProject
+            podcast_dir = cm.ensure_project_dir("PodcastA")
+            other_dir = cm.ensure_project_dir("OtherProject")
+            for folder, name in (
+                (podcast_dir, "PodcastA_2026-11-05_10.00.00_EST.wav"),
+                (podcast_dir, "PodcastA_2026-11-05_10.05.00_EST.wav"),
+                (other_dir, "OtherProject_2026-11-05_10.10.00_EST.wav"),
             ):
-                w = WavFileWriter(storage / name, sample_rate=48000, channels=2, bit_depth=24)
+                w = WavFileWriter(folder / name, sample_rate=48000, channels=2, bit_depth=24)
                 w.write_float_frames(np.zeros((4800, 2), dtype=np.float64))
                 w.close()
 
             podcast_takes = cm.list_project_recordings("PodcastA")
             self.assertEqual(len(podcast_takes), 2)
             self.assertTrue(all(t.filename.startswith("PodcastA_") for t in podcast_takes))
+
+            # Rename one of the takes inside PodcastA/ so it can be categorized directly
+            ok, msg, renamed_path = cm.rename_recording(
+                podcast_dir / "PodcastA_2026-11-05_10.05.00_EST.wav",
+                "Intro_Segment_Select",
+            )
+            self.assertTrue(ok, msg)
+            self.assertIsNotNone(renamed_path)
+            if renamed_path is not None:
+                self.assertEqual(renamed_path.name, "Intro_Segment_Select.wav")
+                self.assertEqual(renamed_path.parent, podcast_dir)
+                self.assertTrue(renamed_path.is_file())
+
+            # Renamed file remains in the PodcastA project recordings list
+            podcast_takes_after = cm.list_project_recordings("PodcastA")
+            self.assertEqual(len(podcast_takes_after), 2)
+            filenames_after = {t.filename for t in podcast_takes_after}
+            self.assertIn("Intro_Segment_Select.wav", filenames_after)
+            self.assertIn("PodcastA_2026-11-05_10.00.00_EST.wav", filenames_after)
+
+            # Prevent overwriting an existing file in the same project folder
+            dup_ok, _dup_msg, dup_path = cm.rename_recording(
+                podcast_dir / "PodcastA_2026-11-05_10.00.00_EST.wav",
+                "Intro_Segment_Select.wav",
+            )
+            self.assertFalse(dup_ok)
+            self.assertIsNone(dup_path)
 
             other_takes = cm.list_project_recordings("OtherProject")
             self.assertEqual(len(other_takes), 1)
@@ -956,7 +985,11 @@ class TestUiGlyphsAndButtonMnemonics(unittest.TestCase):
 
             os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
             from PyQt6.QtWidgets import QApplication
-            from app.ui.main_window import MainWindow, ProjectPrefixDialog
+            from app.ui.main_window import (
+                MainWindow,
+                ProjectPrefixDialog,
+                RenameRecordingDialog,
+            )
         except Exception:
             return
 
@@ -974,7 +1007,7 @@ class TestUiGlyphsAndButtonMnemonics(unittest.TestCase):
             dlg = ProjectPrefixDialog(config_manager=cm)
             dlg.prefix_edit.setText("Episode 42")
             self.assertEqual(dlg.project_name, "Episode 42")
-            self.assertIn("Episode_42_", dlg.preview_label.text())
+            self.assertIn("Episode_42/Episode_42_", dlg.preview_label.text())
 
             win = MainWindow(
                 config_manager=cm,
@@ -985,14 +1018,38 @@ class TestUiGlyphsAndButtonMnemonics(unittest.TestCase):
             try:
                 self.assertFalse(hasattr(win, "mode_toggle_btn"))
                 self.assertTrue(hasattr(win, "project_prefix_btn"))
+                self.assertTrue(hasattr(win, "rename_take_btn"))
                 self.assertTrue(hasattr(win, "clock_label"))
                 self.assertTrue(len(win.clock_label.text()) > 0)
                 self.assertTrue(hasattr(win, "sys_resource_label"))
                 self.assertIn("CPU:", win.sys_resource_label.text())
                 self.assertIn("RAM:", win.sys_resource_label.text())
                 win._on_project_name_changed("Episode 42")
-                self.assertIn("Episode_42_", win.filename_preview_label.text())
-                self.assertIn("Episode_42_*.wav", win.takes_title_label.text())
+                self.assertTrue((cm.storage_dir / "Episode_42").is_dir())
+                self.assertIn("Episode_42/Episode_42_", win.filename_preview_label.text())
+                self.assertIn("[Episode_42/]", win.takes_title_label.text())
+
+                # Create a completed recording in the Episode_42 subfolder and test RenameRecordingDialog
+                sample_wav = cm.ensure_project_dir("Episode 42") / "Episode_42_2026-11-08_12.00.00_EST.wav"
+                w = WavFileWriter(sample_wav, sample_rate=48000, channels=1, bit_depth=24)
+                w.write_float_frames(np.zeros((2400, 1), dtype=np.float64))
+                w.close()
+                win._refresh_recordings_list(select_path=sample_wav)
+                self.assertTrue(win.rename_take_btn.isEnabled())
+
+                rename_dlg = RenameRecordingDialog(
+                    config_manager=cm,
+                    filepath=sample_wav,
+                    parent=win,
+                )
+                rename_dlg.name_edit.setText("Scene 1 Hero Line")
+                self.assertIn("Episode_42/Scene_1_Hero_Line.wav", rename_dlg.preview_label.text())
+                rename_dlg._on_save_clicked()
+                self.assertIsNotNone(rename_dlg.renamed_path)
+                if rename_dlg.renamed_path is not None:
+                    self.assertEqual(rename_dlg.renamed_path.name, "Scene_1_Hero_Line.wav")
+                    win._refresh_recordings_list(select_path=rename_dlg.renamed_path)
+                    self.assertEqual(win._get_selected_recording_path(), rename_dlg.renamed_path)
             finally:
                 win.close()
         _ = app
@@ -1678,6 +1735,474 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
         self.assertIn('lbu include "${APP_DEST}/app/ui/remote_producer_dialog.py"', install_sh)
         self.assertIn('lbu include "${ETC_CONFIG_DIR}/ssl"', install_sh)
         self.assertIn("lbu commit", install_sh)
+
+    def test_playback_streams_recorded_audio_and_status_to_remote_producer_even_when_mic_muted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg = ConfigManager(config_path=tmp_path / "settings.json", storage_dir=tmp_path / "storage")
+            engine = AudioEngine(simulate_if_empty=True)
+            ssl_mgr = SslCertificateManager(cert_dir=tmp_path / "ssl", storage_ssl_dir=tmp_path / "storage" / "ssl")
+            server = RemoteProducerServer(audio_engine=engine, config_manager=cfg, ssl_manager=ssl_mgr)
+
+            # 1. Verify Studio Mode 2ch downmix preserves unity gain for both Left (VO) and Right (Talkback)
+            stereo_vo = np.column_stack([
+                np.full(480, 0.5, dtype=np.float32),
+                np.zeros(480, dtype=np.float32),
+            ])
+            stereo_tb = np.column_stack([
+                np.zeros(480, dtype=np.float32),
+                np.full(480, -0.4, dtype=np.float32),
+            ])
+            mono_vo = AudioEngine._downmix_playback_to_mono(stereo_vo)
+            mono_tb = AudioEngine._downmix_playback_to_mono(stereo_tb)
+            self.assertAlmostEqual(float(np.mean(mono_vo)), 0.5, places=4)
+            self.assertAlmostEqual(float(np.mean(mono_tb)), -0.4, places=4)
+
+            # 2. Create a 2-channel Studio Mode WAV file on disk (0.4s @ 24kHz)
+            proj_dir = cfg.ensure_project_dir("GuidedReview")
+            wav_path = proj_dir / "GuidedReview_take1.wav"
+            sr = 24000
+            total_frames = int(sr * 0.45)
+            left_ch = np.full(total_frames, 0.4, dtype=np.float32)
+            right_ch = np.zeros(total_frames, dtype=np.float32)
+            interleaved_i16 = np.column_stack([
+                (left_ch * 32767.0).astype("<i2"),
+                (right_ch * 32767.0).astype("<i2"),
+            ])
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(interleaved_i16.tobytes())
+
+            # 3. Connect a simulated Remote Producer WebSocket client and mute the talent's live mic
+            class _CaptureSocket:
+                def __init__(self) -> None:
+                    self.binary_packets: list[bytes] = []
+
+                def sendall(self, data: bytes) -> None:
+                    # Extract payload from WebSocket binary frame (opcode 0x82)
+                    if len(data) >= 2 and data[0] == 0x82:
+                        length = data[1] & 0x7F
+                        offset = 2
+                        if length == 126:
+                            length = struct.unpack("!H", data[2:4])[0]
+                            offset = 4
+                        elif length == 127:
+                            length = struct.unpack("!Q", data[2:10])[0]
+                            offset = 10
+                        self.binary_packets.append(data[offset : offset + length])
+
+                def close(self) -> None:
+                    pass
+
+            cap_sock = _CaptureSocket()
+            ws_conn = _WebSocketConnection(cap_sock, ("127.0.0.1", 55100), "client-review")  # type: ignore[arg-type]
+            with server._clients_lock:
+                server._clients["client-review"] = ws_conn
+
+            # Even with Talent Mic muted for privacy, playback of recorded clips MUST stream to the producer
+            engine.set_talent_mic_send_enabled(False)
+            self.assertTrue(engine.is_mic_muted)
+
+            engine.start_playback(filepath=wav_path, output_device=None)
+            try:
+                deadline = time.monotonic() + 1.5
+                while len(cap_sock.binary_packets) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.03)
+
+                self.assertTrue(engine.is_playing)
+                self.assertGreaterEqual(len(cap_sock.binary_packets), 1)
+                pkt = cap_sock.binary_packets[-1]
+                frame_type, flags, rate_div100 = struct.unpack("<BBH", pkt[:4])
+                self.assertEqual(frame_type, FRAME_TALENT_AUDIO)
+                self.assertEqual(flags & 0x01, 0)  # NOT muted!
+                self.assertEqual(flags & 0x04, 0x04)  # Playback flag set
+                self.assertEqual(rate_div100 * 100, STREAM_SAMPLE_RATE)
+                pcm_samples = np.frombuffer(pkt[4:], dtype="<i2").astype(np.float32) / 32768.0
+                self.assertGreater(float(np.max(np.abs(pcm_samples))), 0.25)
+
+                # Verify Remote Producer status snapshot reflects PLAYING state, position/duration, and live VU
+                snap = server.build_status_snapshot()
+                self.assertEqual(snap["state"], "PLAYING")
+                self.assertTrue(snap["is_playing"])
+                self.assertFalse(snap["is_play_paused"])
+                self.assertEqual(snap["playing_take_name"], "GuidedReview_take1.wav")
+                self.assertGreater(snap["play_duration_sec"], 0.3)
+                self.assertGreater(snap["vu"]["peak_db"], -15.0)
+
+                # Test seeking during playback
+                self.assertTrue(engine.seek_playback(0.20))
+                self.assertAlmostEqual(engine.play_position_sec, 0.20, delta=0.12)
+
+                # Test pausing playback updates snapshot to PLAYBACK_PAUSED
+                paused = engine.toggle_pause_playback()
+                self.assertTrue(paused)
+                snap_paused = server.build_status_snapshot()
+                self.assertEqual(snap_paused["state"], "PLAYBACK_PAUSED")
+                self.assertTrue(snap_paused["is_playing"])
+                self.assertTrue(snap_paused["is_play_paused"])
+            finally:
+                engine.stop_playback()
+
+    def test_main_window_playback_controls_and_inline_clip_row_position(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PyQt6.QtWidgets import QApplication
+            from app.ui.main_window import (
+                MainWindow,
+                ROLE_PLAYBACK_ACTIVE,
+                ROLE_PLAYBACK_DUR_SEC,
+                ROLE_PLAYBACK_PAUSED,
+                ROLE_PLAYBACK_POS_SEC,
+                ROLE_PLAYBACK_PROGRESS,
+                format_clip_progress_bar,
+                format_playback_time,
+            )
+        except Exception as exc:
+            self.skipTest(f"PyQt6 unavailable for UI playback test: {exc}")
+            return
+
+        self.assertEqual(format_playback_time(0), "00:00")
+        self.assertEqual(format_playback_time(65), "01:05")
+        self.assertIn("●", format_clip_progress_bar(0.5, width=10))
+        self.assertIn("50%", format_clip_progress_bar(0.5, width=10))
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg = ConfigManager(config_path=tmp_path / "settings.json", storage_dir=tmp_path / "storage")
+            cfg.settings.project_name = "InlinePlayTest"
+            proj_dir = cfg.ensure_project_dir("InlinePlayTest")
+
+            sr = 24000
+            for idx, dur_s in enumerate((0.6, 0.5), start=1):
+                wav_path = proj_dir / f"InlinePlayTest_take{idx}.wav"
+                samples = (np.full(int(sr * dur_s), 0.3, dtype=np.float32) * 32767.0).astype("<i2")
+                with wave.open(str(wav_path), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sr)
+                    wf.writeframes(samples.tobytes())
+                time.sleep(0.02)
+
+            engine = AudioEngine(simulate_if_empty=True)
+            samba = SambaManager(storage_dir=tmp_path / "storage")
+            ssl_mgr = SslCertificateManager(cert_dir=tmp_path / "ssl", storage_ssl_dir=tmp_path / "storage" / "ssl")
+            win = MainWindow(
+                config_manager=cfg,
+                audio_engine=engine,
+                samba_manager=samba,
+                ssl_manager=ssl_mgr,
+                fullscreen=False,
+            )
+            try:
+                self.assertEqual(win.recordings_list.count(), 2)
+                win.recordings_list.setCurrentRow(0)
+                self.assertEqual(win.play_btn.text(), "▶ Play")
+
+                # Start playback on row 0
+                win._on_play_pause_clicked()
+                self.assertTrue(engine.is_playing)
+                self.assertEqual(win.play_btn.text(), "❚❚ Pause")
+                self.assertTrue(win.stop_play_btn.isEnabled())
+
+                # Seek to 0.3s and refresh UI tick
+                engine.seek_playback(0.30)
+                win._on_ui_tick()
+
+                item0 = win.recordings_list.item(0)
+                item1 = win.recordings_list.item(1)
+                self.assertIsNotNone(item0)
+                self.assertIsNotNone(item1)
+                self.assertTrue(bool(item0.data(ROLE_PLAYBACK_ACTIVE)))
+                self.assertFalse(bool(item0.data(ROLE_PLAYBACK_PAUSED)))
+                self.assertGreater(float(item0.data(ROLE_PLAYBACK_PROGRESS)), 0.2)
+                self.assertGreater(float(item0.data(ROLE_PLAYBACK_DUR_SEC)), 0.4)
+                self.assertIn("▶ PLAYING", item0.text())
+                self.assertIn("00:00 / 00:01", item0.text())
+                self.assertIn("%]", item0.text())
+                self.assertFalse(bool(item1.data(ROLE_PLAYBACK_ACTIVE)))
+
+                # Selecting row 1 while row 0 is playing switches play_btn to "▶ Play"
+                # while keeping row 0's inline play position active
+                win.recordings_list.setCurrentRow(1)
+                self.assertEqual(win.play_btn.text(), "▶ Play")
+                self.assertTrue(bool(item0.data(ROLE_PLAYBACK_ACTIVE)))
+
+                # Reselect row 0 -> play_btn shows "❚❚ Pause" again; clicking pauses playback
+                win.recordings_list.setCurrentRow(0)
+                self.assertEqual(win.play_btn.text(), "❚❚ Pause")
+                win._on_play_pause_clicked()
+                self.assertTrue(engine.is_paused)
+                self.assertEqual(win.play_btn.text(), "▶ Resume")
+                self.assertTrue(bool(item0.data(ROLE_PLAYBACK_PAUSED)))
+                self.assertIn("❚❚ PAUSED", item0.text())
+
+                # Stop playback -> row 0 returns to standard static text and play_btn shows "▶ Play"
+                win._on_stop_playback_clicked()
+                self.assertFalse(engine.is_playing)
+                self.assertEqual(win.play_btn.text(), "▶ Play")
+                self.assertFalse(bool(item0.data(ROLE_PLAYBACK_ACTIVE)))
+                self.assertNotIn("PLAYING", item0.text())
+                self.assertNotIn("PAUSED", item0.text())
+            finally:
+                win.close()
+                app.processEvents()
+
+
+class TestStorageFileManagerAndRecursiveDeletion(unittest.TestCase):
+    def _create_dummy_wav(
+        self, path: Path, duration_sec: float = 0.25, sample_rate: int = 24000
+    ) -> int:
+        import wave
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frames = int(sample_rate * duration_sec)
+        samples = (np.full(frames, 0.25, dtype=np.float32) * 32767.0).astype("<i2")
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(samples.tobytes())
+        return path.stat().st_size
+
+    def test_config_manager_cross_project_listing_delete_and_recursive_confirmations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            storage_dir = tmp_path / "storage"
+            cfg = ConfigManager(
+                config_path=tmp_path / "settings.json",
+                storage_dir=storage_dir,
+            )
+            cfg.settings.project_name = "Alpha"
+
+            # Protected directories should never appear in user project folder lists
+            (storage_dir / ".alpine-recorder").mkdir(parents=True, exist_ok=True)
+            (storage_dir / "ssl").mkdir(parents=True, exist_ok=True)
+            (storage_dir / "lost+found").mkdir(parents=True, exist_ok=True)
+
+            # Create 3 project folders: Alpha (2 WAVs), Beta (1 WAV + 1 note), EmptyProj (0 files)
+            w_a1 = storage_dir / "Alpha" / "Alpha_take1.wav"
+            w_a2 = storage_dir / "Alpha" / "Alpha_take2.wav"
+            w_b1 = storage_dir / "Beta" / "Beta_take1.wav"
+            note_b = storage_dir / "Beta" / "session_notes.txt"
+            empty_dir = storage_dir / "EmptyProj"
+            empty_dir.mkdir(parents=True, exist_ok=True)
+
+            sz_a1 = self._create_dummy_wav(w_a1, duration_sec=0.2)
+            time.sleep(0.01)
+            sz_a2 = self._create_dummy_wav(w_a2, duration_sec=0.4)
+            time.sleep(0.01)
+            sz_b1 = self._create_dummy_wav(w_b1, duration_sec=0.3)
+            note_b.write_text("take notes", encoding="utf-8")
+
+            # 1. List project folders
+            folders = cfg.list_project_folders()
+            folder_names = [f.project_name for f in folders]
+            self.assertEqual(set(folder_names), {"Alpha", "Beta", "EmptyProj"})
+            # Active project ("Alpha") should be sorted first
+            self.assertEqual(folders[0].project_name, "Alpha")
+            self.assertTrue(folders[0].is_active_project)
+            self.assertEqual(folders[0].recording_count, 2)
+            self.assertEqual(folders[0].total_size_bytes, sz_a1 + sz_a2)
+
+            beta_summary = next(f for f in folders if f.project_name == "Beta")
+            self.assertEqual(beta_summary.recording_count, 1)
+            self.assertEqual(beta_summary.other_file_count, 1)
+            self.assertFalse(beta_summary.is_empty)
+
+            empty_summary = next(f for f in folders if f.project_name == "EmptyProj")
+            self.assertTrue(empty_summary.is_empty)
+            self.assertEqual(empty_summary.total_item_count, 0)
+
+            # 2. List all recordings across all projects
+            all_recs = cfg.list_all_recordings()
+            self.assertEqual(len(all_recs), 3)
+            self.assertEqual({r.project_name for r in all_recs}, {"Alpha", "Beta"})
+
+            alpha_only = cfg.list_all_recordings(project_filter="Alpha")
+            self.assertEqual(len(alpha_only), 2)
+            self.assertTrue(all(r.project_name == "Alpha" for r in alpha_only))
+
+            # 3. Delete single recording and verify freed bytes & safety checks
+            outside_file = tmp_path / "outside.wav"
+            self._create_dummy_wav(outside_file, duration_sec=0.1)
+            ok_out, msg_out, freed_out = cfg.delete_recording(outside_file)
+            self.assertFalse(ok_out)
+            self.assertEqual(freed_out, 0)
+            self.assertTrue(outside_file.exists())
+
+            ok_del, msg_del, freed_del = cfg.delete_recording(w_a1)
+            self.assertTrue(ok_del, msg_del)
+            self.assertEqual(freed_del, sz_a1)
+            self.assertFalse(w_a1.exists())
+            self.assertEqual(len(cfg.list_all_recordings()), 2)
+
+            # 4. Clean up empty project folders
+            ok_clean_empty, msg_clean_empty, removed_cnt = cfg.cleanup_empty_project_folders()
+            self.assertTrue(ok_clean_empty, msg_clean_empty)
+            self.assertEqual(removed_cnt, 1)
+            self.assertFalse(empty_dir.exists())
+            self.assertTrue((storage_dir / ".alpine-recorder").exists())
+            self.assertTrue((storage_dir / "ssl").exists())
+
+            # 5. Cleanup project folder requires confirm_recursive=True
+            ok_no_conf, msg_no_conf, _ = cfg.cleanup_project_folder("Beta", confirm_recursive=False)
+            self.assertFalse(ok_no_conf)
+            self.assertIn("confirmation", msg_no_conf.lower())
+            self.assertTrue(w_b1.exists())
+
+            ok_clean_beta, msg_clean_beta, freed_beta = cfg.cleanup_project_folder(
+                "Beta", confirm_recursive=True
+            )
+            self.assertTrue(ok_clean_beta, msg_clean_beta)
+            self.assertGreaterEqual(freed_beta, sz_b1)
+            self.assertTrue((storage_dir / "Beta").is_dir())
+            self.assertFalse(w_b1.exists())
+            self.assertFalse(note_b.exists())
+
+            # 6. Delete project folder requires confirm_recursive=True and blocks protected dirs
+            ok_prot, _, _ = cfg.delete_project_folder(".alpine-recorder", confirm_recursive=True)
+            self.assertFalse(ok_prot)
+            ok_ssl, _, _ = cfg.delete_project_folder("ssl", confirm_recursive=True)
+            self.assertFalse(ok_ssl)
+
+            ok_del_noconf, _, _ = cfg.delete_project_folder("Alpha", confirm_recursive=False)
+            self.assertFalse(ok_del_noconf)
+            self.assertTrue(w_a2.exists())
+
+            ok_del_alpha, msg_del_alpha, freed_alpha = cfg.delete_project_folder(
+                "Alpha", confirm_recursive=True
+            )
+            self.assertTrue(ok_del_alpha, msg_del_alpha)
+            self.assertEqual(freed_alpha, sz_a2)
+            self.assertFalse((storage_dir / "Alpha").exists())
+
+    def test_storage_file_manager_dialog_ui_and_two_step_recursive_confirmation(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PyQt6.QtWidgets import QApplication
+            from app.ui.file_manager_dialog import (
+                DeleteFileConfirmDialog,
+                RecursiveProjectConfirmDialog,
+                StorageFileManagerDialog,
+            )
+        except Exception as exc:
+            self.skipTest(f"PyQt6 unavailable for File Manager UI test: {exc}")
+            return
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            storage_dir = tmp_path / "storage"
+            cfg = ConfigManager(
+                config_path=tmp_path / "settings.json",
+                storage_dir=storage_dir,
+            )
+            cfg.settings.project_name = "BookOne"
+
+            w1 = storage_dir / "BookOne" / "BookOne_ch1.wav"
+            w2 = storage_dir / "BookOne" / "BookOne_ch2.wav"
+            w3 = storage_dir / "BookTwo" / "BookTwo_intro.wav"
+            sz1 = self._create_dummy_wav(w1, duration_sec=0.20)
+            time.sleep(0.01)
+            sz2 = self._create_dummy_wav(w2, duration_sec=0.50)
+            time.sleep(0.01)
+            sz3 = self._create_dummy_wav(w3, duration_sec=0.35)
+
+            engine = AudioEngine(simulate_if_empty=True)
+            dlg = StorageFileManagerDialog(
+                config_manager=cfg,
+                audio_engine=engine,
+                fullscreen=False,
+            )
+            try:
+                # 1. Default view is All Projects ("*") showing all 3 recordings
+                self.assertEqual(dlg.selected_project_filter, "*")
+                self.assertEqual(dlg.files_list.count(), 3)
+                self.assertEqual(dlg.project_list.count(), 3)  # All Projects + BookOne + BookTwo
+
+                # 2. Test Fullscreen File List sidebar toggle
+                self.assertTrue(dlg._folders_pane_visible)
+                dlg.toggle_folders_sidebar()
+                self.assertFalse(dlg._folders_pane_visible)
+                self.assertIn("Show Project Folders", dlg.toggle_folders_pane_btn.text())
+                dlg.toggle_folders_sidebar()
+                self.assertTrue(dlg._folders_pane_visible)
+
+                # 3. Test sorting by Largest Size First ("size_desc")
+                idx_size_desc = dlg.sort_combo.findData("size_desc")
+                self.assertGreaterEqual(idx_size_desc, 0)
+                dlg.sort_combo.setCurrentIndex(idx_size_desc)
+                first_rec = dlg.get_selected_recording()
+                self.assertIsNotNone(first_rec)
+                self.assertEqual(first_rec.filepath, w2)  # 0.50s is largest
+
+                # 4. Test search filtering across projects
+                dlg.search_edit.setText("BookTwo")
+                self.assertEqual(dlg.files_list.count(), 1)
+                self.assertEqual(dlg.get_selected_recording().filepath, w3)
+                dlg.search_edit.setText("")
+                self.assertEqual(dlg.files_list.count(), 3)
+
+                # 5. Test DeleteFileConfirmDialog space impact and file deletion in File Manager
+                status = cfg.get_storage_status()
+                del_confirm = DeleteFileConfirmDialog(entry=first_rec, storage_status=status, parent=dlg)
+                self.assertIn("Space to Clear", del_confirm.space_impact_label.text())
+                del_confirm.close()
+
+                ok_del, _, freed = dlg.execute_delete_recording(first_rec)
+                self.assertTrue(ok_del)
+                self.assertEqual(freed, sz2)
+                self.assertEqual(dlg.session_cleared_bytes, sz2)
+                self.assertIn("SPACE CLEARED: +", dlg.space_cleared_badge.text())
+                self.assertEqual(dlg.files_list.count(), 2)
+
+                # 6. Test 2-step RecursiveProjectConfirmDialog for cleanup and delete
+                book_one_summary = next(
+                    s for s in dlg._project_summaries if s.project_name == "BookOne"
+                )
+                book_one_recs = [
+                    r for r in dlg._all_recordings if r.project_name == "BookOne"
+                ]
+                rec_dlg = RecursiveProjectConfirmDialog(
+                    folder_summary=book_one_summary,
+                    recordings=book_one_recs,
+                    storage_status=status,
+                    mode="delete",
+                    parent=dlg,
+                )
+                # Step 1 initial state: final button is disabled & hidden, confirmed_recursive is False
+                self.assertEqual(rec_dlg.current_step, 1)
+                self.assertFalse(rec_dlg.confirmed_recursive)
+                self.assertFalse(rec_dlg.final_confirm_btn.isEnabled())
+                # Attempting final confirm during Step 1 does nothing
+                rec_dlg._on_final_confirm_clicked()
+                self.assertFalse(rec_dlg.confirmed_recursive)
+
+                # Advance to Step 2: final button still disabled until checkbox is checked
+                rec_dlg.advance_to_final_step()
+                self.assertEqual(rec_dlg.current_step, 2)
+                self.assertFalse(rec_dlg.final_confirm_btn.isEnabled())
+                rec_dlg.confirm_checkbox.setChecked(True)
+                self.assertTrue(rec_dlg.final_confirm_btn.isEnabled())
+                rec_dlg._on_final_confirm_clicked()
+                self.assertTrue(rec_dlg.confirmed_recursive)
+                rec_dlg.close()
+
+                # Execute recursive folder deletion of BookOne and verify space cleared updates
+                ok_proj_del, _, proj_freed = dlg.execute_delete_project_folder(
+                    "BookOne", confirm_recursive=True
+                )
+                self.assertTrue(ok_proj_del)
+                self.assertEqual(proj_freed, sz1)
+                self.assertEqual(dlg.session_cleared_bytes, sz2 + sz1)
+                self.assertEqual(dlg.files_list.count(), 1)
+                self.assertFalse((storage_dir / "BookOne").exists())
+            finally:
+                dlg.close()
+                app.processEvents()
 
 
 if __name__ == "__main__":

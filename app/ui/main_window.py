@@ -7,8 +7,8 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont, QKeyEvent, QResizeEvent
+from PyQt6.QtCore import QRectF, Qt, QTimer
+from PyQt6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPen, QResizeEvent
 from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
@@ -23,6 +23,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -43,13 +46,19 @@ from app.network_info import (
 )
 from app.remote_producer import RemoteProducerServer
 from app.samba_manager import SambaManager
+from app.ui.file_manager_dialog import (
+    DeleteFileConfirmDialog,
+    StorageFileManagerDialog,
+)
 from app.ui.on_screen_keyboard import OnScreenKeyboardController
 from app.ui.remote_producer_dialog import RemoteProducerDialog
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.styles import (
     build_main_stylesheet,
     build_pause_record_button_style,
+    build_playback_button_style,
     build_record_button_style,
+    build_stop_playback_button_style,
     build_studio_clock_badge_style,
     build_system_resource_badge_style,
     build_talkback_button_style,
@@ -60,9 +69,131 @@ from app.ui.vu_meter import VuMeterWidget
 
 logger = logging.getLogger(__name__)
 
+ROLE_RECORDING_PATH = int(Qt.ItemDataRole.UserRole)
+ROLE_PLAYBACK_ACTIVE = int(Qt.ItemDataRole.UserRole) + 1
+ROLE_PLAYBACK_PAUSED = int(Qt.ItemDataRole.UserRole) + 2
+ROLE_PLAYBACK_PROGRESS = int(Qt.ItemDataRole.UserRole) + 3
+ROLE_PLAYBACK_POS_SEC = int(Qt.ItemDataRole.UserRole) + 4
+ROLE_PLAYBACK_DUR_SEC = int(Qt.ItemDataRole.UserRole) + 5
+
+
+def format_playback_time(seconds: float) -> str:
+    """Format playback position or duration in seconds as MM:SS (or HH:MM:SS)."""
+    total = max(0, int(round(seconds)))
+    hrs = total // 3600
+    mins = (total % 3600) // 60
+    secs = total % 60
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def format_clip_progress_bar(ratio: float, width: int = 10) -> str:
+    """Build a compact inline BMP playhead bar (e.g. '━━━●──────  35%') for a playing clip row."""
+    clamped = max(0.0, min(1.0, float(ratio)))
+    w = max(4, int(width))
+    head_idx = min(w - 1, int(round(clamped * (w - 1))))
+    before = "━" * head_idx
+    after = "─" * max(0, w - 1 - head_idx)
+    pct = int(round(clamped * 100.0))
+    return f"{before}●{after} {pct:3d}%"
+
+
+class RecordingClipItemDelegate(QStyledItemDelegate):
+    """Custom list delegate that draws an inline progress bar and playhead on the playing clip's row."""
+
+    def paint(
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index,
+    ) -> None:
+        is_active = bool(index.data(ROLE_PLAYBACK_ACTIVE))
+        if not is_active:
+            super().paint(painter, option, index)
+            return
+
+        is_paused = bool(index.data(ROLE_PLAYBACK_PAUSED))
+        raw_prog = index.data(ROLE_PLAYBACK_PROGRESS)
+        progress = max(0.0, min(1.0, float(raw_prog if raw_prog is not None else 0.0)))
+        is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = QRectF(option.rect).adjusted(2.0, 1.0, -2.0, -1.0)
+        radius = 4.0
+
+        # 1. Base row background
+        if is_paused:
+            bg_color = QColor("#241A08") if is_selected else QColor("#1B1408")
+            fill_color = QColor(210, 153, 34, 78)
+            accent_color = QColor("#F0B72F")
+            text_color = QColor("#FFDF5D")
+        else:
+            bg_color = QColor("#0E2238") if is_selected else QColor("#0B1929")
+            fill_color = QColor(56, 139, 253, 82)
+            accent_color = QColor("#58A6FF")
+            text_color = QColor("#79C0FF")
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bg_color)
+        painter.drawRoundedRect(rect, radius, radius)
+
+        # 2. Proportional playback progress fill across the clip row
+        if progress > 0.0:
+            fill_w = max(4.0, rect.width() * progress)
+            fill_rect = QRectF(rect.left(), rect.top(), fill_w, rect.height())
+            painter.setBrush(fill_color)
+            painter.drawRoundedRect(fill_rect, radius, radius)
+
+        # 3. Bottom progress track & playhead position marker
+        rail_h = 3.0
+        rail_rect = QRectF(rect.left() + 4.0, rect.bottom() - rail_h - 1.0, max(8.0, rect.width() - 8.0), rail_h)
+        painter.setBrush(QColor("#21262D"))
+        painter.drawRoundedRect(rail_rect, 1.5, 1.5)
+
+        playhead_x = rail_rect.left() + rail_rect.width() * progress
+        if progress > 0.0:
+            active_rail = QRectF(rail_rect.left(), rail_rect.top(), playhead_x - rail_rect.left(), rail_h)
+            painter.setBrush(accent_color)
+            painter.drawRoundedRect(active_rail, 1.5, 1.5)
+
+        # Vertical playhead cursor line + dot on the playing row
+        head_pen = QPen(accent_color, 2.0)
+        painter.setPen(head_pen)
+        painter.drawLine(
+            int(round(playhead_x)),
+            int(round(rect.top() + 2.0)),
+            int(round(playhead_x)),
+            int(round(rect.bottom() - 2.0)),
+        )
+
+        # 4. Row border
+        border_pen = QPen(accent_color, 1.5 if is_selected else 1.0)
+        painter.setPen(border_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect, radius, radius)
+
+        # 5. Clip row text with live play position
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        font = QFont(option.font)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(text_color)
+        text_rect = rect.adjusted(10.0, 0.0, -10.0, -rail_h)
+        painter.drawText(
+            text_rect,
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            text,
+        )
+
+        painter.restore()
+
+
 
 class ProjectPrefixDialog(QDialog):
-    """Modal dialog for viewing and editing the Project Prefix."""
+    """Modal dialog for viewing and editing the Project Name & Subfolder."""
 
     def __init__(
         self,
@@ -71,7 +202,7 @@ class ProjectPrefixDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.config_manager = config_manager
-        self.setWindowTitle("Set Project Prefix")
+        self.setWindowTitle("Set Project Name & Subfolder")
         self.setModal(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
@@ -92,8 +223,8 @@ class ProjectPrefixDialog(QDialog):
         self.setStyleSheet(build_main_stylesheet(self._scale))
         self.osk_controller.register_line_edit(
             self.prefix_edit,
-            title="Project Prefix",
-            hint="Output WAV format: <ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav",
+            title="Project Name",
+            hint="Stored in subfolder: <ProjectName>/<ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav",
         )
         self.osk_controller.attach_to_container(self)
         self._update_preview(self.prefix_edit.text())
@@ -107,13 +238,13 @@ class ProjectPrefixDialog(QDialog):
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(12)
 
-        title_label = QLabel("Project Prefix")
+        title_label = QLabel("Project Name && Subfolder")
         title_label.setObjectName("HeaderTitle")
         layout.addWidget(title_label)
 
         desc_label = QLabel(
-            "Enter the project name prefix for output WAV files.\n"
-            "Only takes matching this project prefix are shown in the Project Recordings list."
+            "Enter the project name. All recordings for this project are stored inside a matching "
+            "subfolder in /storage and can be renamed directly from the UI after recording."
         )
         desc_label.setWordWrap(True)
         desc_label.setStyleSheet("color: #8B949E;")
@@ -130,7 +261,7 @@ class ProjectPrefixDialog(QDialog):
 
         self.osk_btn = QPushButton("⌨ Touch Keyboard")
         self.osk_btn.setToolTip(
-            "Open On-Screen Touch Keyboard to edit Project Prefix"
+            "Open On-Screen Touch Keyboard to edit Project Name"
         )
         self.osk_btn.setVisible(bool(self.config_manager.settings.on_screen_keyboard))
         self.osk_btn.clicked.connect(
@@ -158,7 +289,7 @@ class ProjectPrefixDialog(QDialog):
         btn_row.addWidget(self.cancel_btn)
 
         self.save_btn = QPushButton("Save && Apply")
-        self.save_btn.setToolTip("Save the Project Prefix and update the recordings list [Hotkey: Enter]")
+        self.save_btn.setToolTip("Save the Project Name and update the project subfolder recordings list [Hotkey: Enter]")
         self.save_btn.setDefault(True)
         self.save_btn.setStyleSheet(
             "background-color: #1F6FEB; color: #FFFFFF; font-weight: bold;"
@@ -169,8 +300,156 @@ class ProjectPrefixDialog(QDialog):
         layout.addLayout(btn_row)
 
     def _update_preview(self, text: str) -> None:
+        folder = sanitize_project_name(text)
         sample = generate_recording_filename(text)
-        self.preview_label.setText(f"Next: {sample}")
+        self.preview_label.setText(f"Next: {folder}/{sample}")
+
+
+class RenameRecordingDialog(QDialog):
+    """Modal dialog for renaming a completed WAV recording within its project folder."""
+
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        filepath: Path,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.config_manager = config_manager
+        self.filepath = Path(filepath)
+        self.renamed_path: Optional[Path] = None
+
+        self.setWindowTitle("Rename Recording")
+        self.setModal(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        if parent is not None and parent.width() >= 480:
+            pw, ph = parent.width(), parent.height()
+            self._scale = compute_scale_factor(pw, ph)
+            self.resize(max(500, int(pw * 0.56)), max(260, int(ph * 0.40)))
+        else:
+            self._scale = 1.0
+            self.resize(540, 280)
+
+        self.osk_controller = OnScreenKeyboardController(
+            is_enabled=lambda: bool(self.config_manager.settings.on_screen_keyboard),
+            parent=self,
+        )
+
+        self._build_ui()
+        self.setStyleSheet(build_main_stylesheet(self._scale))
+        self.osk_controller.register_line_edit(
+            self.name_edit,
+            title="Rename Recording",
+            hint=f"Folder: {self.filepath.parent.name}/  (.wav added automatically)",
+        )
+        self.osk_controller.attach_to_container(self)
+        self._update_preview(self.name_edit.text())
+
+    @property
+    def new_filename(self) -> str:
+        return self.name_edit.text().strip()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        title_label = QLabel("Rename Recording File")
+        title_label.setObjectName("HeaderTitle")
+        layout.addWidget(title_label)
+
+        desc_label = QLabel(
+            f"Enter a new name to categorize this recording inside '{self.filepath.parent.name}/'.\n"
+            f"Current file: {self.filepath.name}"
+        )
+        desc_label.setWordWrap(True)
+        desc_label.setStyleSheet("color: #8B949E;")
+        layout.addWidget(desc_label)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+
+        initial_stem = (
+            self.filepath.name[:-4]
+            if self.filepath.name.lower().endswith(".wav")
+            else self.filepath.stem
+        )
+        self.name_edit = QLineEdit(initial_stem)
+        self.name_edit.setPlaceholderText("Enter new filename (e.g. Character_Line_01_Select)...")
+        self.name_edit.selectAll()
+        self.name_edit.textChanged.connect(self._update_preview)
+        self.name_edit.returnPressed.connect(self._on_save_clicked)
+        input_row.addWidget(self.name_edit, stretch=1)
+
+        self.osk_btn = QPushButton("⌨ Touch Keyboard")
+        self.osk_btn.setToolTip(
+            "Open On-Screen Touch Keyboard to rename the recording"
+        )
+        self.osk_btn.setVisible(bool(self.config_manager.settings.on_screen_keyboard))
+        self.osk_btn.clicked.connect(
+            lambda: self.osk_controller.open_for_line_edit(self.name_edit)
+        )
+        input_row.addWidget(self.osk_btn)
+        layout.addLayout(input_row)
+
+        self.preview_label = QLabel()
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet(
+            "background-color: #0D1014; color: #58A6FF; font-family: monospace; "
+            "padding: 8px 10px; border-radius: 6px; border: 1px solid #21262D;"
+        )
+        layout.addWidget(self.preview_label)
+
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setVisible(False)
+        self.error_label.setStyleSheet("color: #F85149; font-weight: bold;")
+        layout.addWidget(self.error_label)
+
+        layout.addStretch(1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip("Cancel renaming and close [Hotkey: Esc]")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.cancel_btn)
+
+        self.save_btn = QPushButton("Rename File")
+        self.save_btn.setToolTip("Rename the WAV file on disk [Hotkey: Enter]")
+        self.save_btn.setDefault(True)
+        self.save_btn.setStyleSheet(
+            "background-color: #1F6FEB; color: #FFFFFF; font-weight: bold;"
+        )
+        self.save_btn.clicked.connect(self._on_save_clicked)
+        btn_row.addWidget(self.save_btn)
+
+        layout.addLayout(btn_row)
+
+    def _update_preview(self, text: str) -> None:
+        self.error_label.setVisible(False)
+        raw = (text or "").strip()
+        if raw.lower().endswith(".wav"):
+            raw = raw[:-4].strip()
+        cleaned = sanitize_project_name(raw) if raw else ""
+        folder = self.filepath.parent.name
+        if cleaned:
+            self.preview_label.setText(f"Target: {folder}/{cleaned}.wav")
+        else:
+            self.preview_label.setText(f"Target: {folder}/<enter filename>.wav")
+
+    def _on_save_clicked(self) -> None:
+        ok, msg, new_path = self.config_manager.rename_recording(
+            self.filepath, self.name_edit.text()
+        )
+        if not ok or new_path is None:
+            self.error_label.setText(msg)
+            self.error_label.setVisible(True)
+            return
+        self.renamed_path = new_path
+        self.accept()
 
 
 class HelpDialog(QDialog):
@@ -249,8 +528,9 @@ class HelpDialog(QDialog):
         tab_controls = self._wrap_scrollable([
             self._build_section_card(
                 "RECORD / RECORDING  [Hotkey: R or Space]",
-                "<b>Record</b> (Green) starts capturing audio to a new timestamped WAV file in "
-                "<code>/storage</code> named <code>&lt;ProjectPrefix&gt;_yyyy-mm-dd_HH.MM.SS_TZ.wav</code>.<br>"
+                "<b>Record</b> (Green) starts capturing audio to a new timestamped WAV file inside the "
+                "project subfolder <code>/storage/&lt;ProjectName&gt;/</code> named "
+                "<code>&lt;ProjectName&gt;_yyyy-mm-dd_HH.MM.SS_TZ.wav</code>.<br>"
                 "While recording is active, the button displays <b>Recording</b> (Red). Clicking "
                 "<b>Recording</b> stops capture and finalizes the WAV header on disk."
             ),
@@ -325,11 +605,18 @@ class HelpDialog(QDialog):
                 "• <b>Overload Alert (Red — CPU ≥ 90% or RAM ≥ 90%):</b> System is heavily loaded and at risk of audio dropouts or instability."
             ),
             self._build_section_card(
-                "PROJECT PREFIX && REFERENCE PLAYBACK  [Hotkeys: P, S, F5]",
-                "• <b>Project Prefix:</b> Sets the filename prefix for new WAV recordings and filters the "
-                "Project Recordings list to show only takes belonging to the current project.<br>"
-                "• <b>Play / Pause [P] && Stop [S]:</b> Auditions the selected WAV take in the list through "
-                "the configured Playback Output Device.<br>"
+                "PROJECT SUBFOLDER, FILE RENAMING && PLAYBACK  [Hotkeys: N, P, S, F5, F6]",
+                "• <b>Project Name && Subfolder:</b> Sets the project subfolder (<code>/storage/&lt;ProjectName&gt;/</code>) "
+                "and default filename prefix for new WAV recordings, and shows all takes inside that project folder.<br>"
+                "• <b>Rename Recording [N or F4]:</b> Allows you to rename any completed WAV file inside the project folder "
+                "directly from the UI so takes can be categorized immediately instead of only having the project and timestamp.<br>"
+                "• <b>Storage File Manager [F6]:</b> Opens the fullscreen Storage File Manager to browse, filter, sort, play, "
+                "rename, and delete recordings across all projects, or clean up and delete project folders with extra confirmations "
+                "while watching live drive utilization and space cleared.<br>"
+                "• <b>Play / Pause [P] && Stop [S]:</b> Auditions the selected WAV take through the configured Playback Output "
+                "Device and simultaneously streams the playback audio to the connected <b>Remote Producer</b> so talent and "
+                "producer can review a take together. The active clip's row in the list displays a live progress bar, playhead "
+                "position, and elapsed/total time (use <code>[Left]</code> / <code>[Right]</code> arrow keys to seek ±3s).<br>"
                 "• <b>Refresh [F5]:</b> Rescans <code>/storage</code> and connected USB audio hardware."
             ),
         ])
@@ -397,11 +684,14 @@ class HelpDialog(QDialog):
                 "• <code>Hold B</code> : Momentary Talent Cough Mute<br>"
                 "• <code>C</code> : Reset VU Peak Hold && Clip Indicator<br>"
                 "• <code>M</code> : Toggle Studio Mode / Normal Mode (when idle)<br>"
+                "• <code>N</code> or <code>F4</code> : Rename selected project recording (when idle)<br>"
+                "• <code>Del</code> : Delete selected recording with confirmation (when idle)<br>"
                 "• <code>S</code> : Stop Reference Playback<br>"
                 "• <code>F1</code> : Open Help && Reference Guide<br>"
                 "• <code>F2</code> or <code>Ctrl+,</code> : Open Settings && Samba Administration<br>"
                 "• <code>F3</code> : Open Remote Producer && SSL Setup<br>"
                 "• <code>F5</code> : Refresh Storage && Audio Hardware<br>"
+                "• <code>F6</code> : Open Fullscreen Storage File Manager (when idle)<br>"
                 "• <code>F11</code> : Toggle Fullscreen / Windowed Mode<br>"
                 "• <code>Ctrl+Q</code> : Exit to Linux Console (when idle)"
             ),
@@ -434,6 +724,7 @@ class MainWindow(QMainWindow):
         samba_manager: SambaManager,
         fullscreen: bool = True,
         remote_producer_server: Optional[RemoteProducerServer] = None,
+        ssl_manager: Optional[object] = None,
     ) -> None:
         super().__init__()
         self.config_manager = config_manager
@@ -453,6 +744,7 @@ class MainWindow(QMainWindow):
             self.remote_producer_server = RemoteProducerServer(
                 audio_engine=self.audio_engine,
                 config_manager=self.config_manager,
+                ssl_manager=ssl_manager,  # type: ignore[arg-type]
                 status_provider=self._build_remote_producer_extra_status,
             )
             if getattr(self.config_manager.settings, "remote_producer_enabled", False):
@@ -685,12 +977,26 @@ class MainWindow(QMainWindow):
         self.takes_title_label.setObjectName("HeaderTitle")
         takes_header_row.addWidget(self.takes_title_label)
 
-        self.project_prefix_btn = QPushButton("✎ Project Prefix")
+        self.project_prefix_btn = QPushButton("✎ Project Name")
         self.project_prefix_btn.setToolTip(
-            "Open dialog to view or change the Project Prefix for output WAV files and take filtering"
+            "Open dialog to view or change the Project Name & Subfolder for output WAV files"
         )
         self.project_prefix_btn.clicked.connect(self._open_project_prefix_dialog)
         takes_header_row.addWidget(self.project_prefix_btn)
+
+        self.rename_take_btn = QPushButton("✎ Rename File")
+        self.rename_take_btn.setToolTip(
+            "Rename the selected WAV recording inside the project folder to categorize it directly [Hotkey: N or F4]"
+        )
+        self.rename_take_btn.clicked.connect(self._on_rename_recording_clicked)
+        takes_header_row.addWidget(self.rename_take_btn)
+
+        self.file_manager_btn = QPushButton("▤ File Manager")
+        self.file_manager_btn.setToolTip(
+            "Open fullscreen Storage File Manager to browse, play, rename, and delete files or project folders across all projects [Hotkey: F6]"
+        )
+        self.file_manager_btn.clicked.connect(self._open_file_manager_dialog)
+        takes_header_row.addWidget(self.file_manager_btn)
 
         takes_header_row.addStretch(1)
 
@@ -698,9 +1004,9 @@ class MainWindow(QMainWindow):
         self.playback_status_label.setStyleSheet("color: #8B949E; font-family: monospace;")
         takes_header_row.addWidget(self.playback_status_label)
 
-        self.play_btn = QPushButton("▶ Play / Pause")
+        self.play_btn = QPushButton("▶ Play")
         self.play_btn.setToolTip(
-            "Play or pause the selected project recording for reference [Hotkey: P]"
+            "Play or pause the selected project recording for reference and stream to Remote Producer [Hotkey: P]"
         )
         self.play_btn.clicked.connect(self._on_play_pause_clicked)
         takes_header_row.addWidget(self.play_btn)
@@ -722,9 +1028,12 @@ class MainWindow(QMainWindow):
         takes_layout.addLayout(takes_header_row)
 
         self.recordings_list = QListWidget()
+        self.recordings_item_delegate = RecordingClipItemDelegate(self.recordings_list)
+        self.recordings_list.setItemDelegate(self.recordings_item_delegate)
         self.recordings_list.setToolTip(
-            "Finished WAV recordings in /storage matching the current Project Prefix. "
-            "Double-click or press [P] to play back."
+            "Finished WAV recordings in the active project subfolder (/storage/<ProjectName>/). "
+            "Double-click or press [P] to play back (also streamed to Remote Producer), "
+            "[Left]/[Right] to seek ±3s, or click Rename File [N] to categorize."
         )
         self.recordings_list.itemDoubleClicked.connect(
             lambda _item: self._on_play_pause_clicked(force_new=True)
@@ -805,6 +1114,8 @@ class MainWindow(QMainWindow):
         self.settings_btn.setFixedWidth(max(150, int(round(190 * self._scale))))
         self.help_btn.setFixedWidth(max(90, int(round(115 * self._scale))))
         self.project_prefix_btn.setFixedWidth(max(135, int(round(170 * self._scale))))
+        self.rename_take_btn.setFixedWidth(max(125, int(round(160 * self._scale))))
+        self.file_manager_btn.setFixedWidth(max(135, int(round(170 * self._scale))))
         self.play_btn.setFixedWidth(max(130, int(round(165 * self._scale))))
         self.stop_play_btn.setFixedWidth(max(90, int(round(115 * self._scale))))
         self.refresh_takes_btn.setFixedWidth(max(105, int(round(135 * self._scale))))
@@ -895,6 +1206,7 @@ class MainWindow(QMainWindow):
 
         self.settings_btn.setEnabled(not is_rec)
         self.project_prefix_btn.setEnabled(not is_rec)
+        self.file_manager_btn.setEnabled(not is_rec)
 
         # Remote Producer Top Bar Button state
         if self.remote_producer_server.is_running:
@@ -1113,13 +1425,20 @@ class MainWindow(QMainWindow):
 
     def _refresh_vu_meter(self) -> None:
         readings = self.audio_engine.get_vu_readings()
+        is_playing = self.audio_engine.is_playing
+        is_paused = (
+            self.audio_engine.is_record_paused
+            if self.audio_engine.is_recording
+            else (self.audio_engine.is_paused if is_playing else False)
+        )
         self.vu_meter.set_readings(
             readings,
             is_recording=self.audio_engine.is_recording,
             has_device=(self._active_input_device is not None),
-            is_paused=self.audio_engine.is_record_paused,
+            is_paused=is_paused,
             is_muted=self.audio_engine.is_mic_muted,
             is_talkback_override=self.audio_engine.is_talkback_mute_override,
+            is_playing=is_playing,
         )
 
     def _refresh_storage_status(self) -> None:
@@ -1185,8 +1504,9 @@ class MainWindow(QMainWindow):
             return
 
         settings = self.config_manager.settings
+        proj_dir = self.config_manager.ensure_project_dir(settings.project_name)
         filename = generate_recording_filename(settings.project_name)
-        output_path = self.config_manager.storage_dir / filename
+        output_path = proj_dir / filename
 
         self.audio_engine.start_recording(
             device=dev,
@@ -1276,6 +1596,7 @@ class MainWindow(QMainWindow):
 
     def _build_remote_producer_extra_status(self) -> dict:
         rec_path = self.audio_engine.current_recording_path
+        play_path = self.audio_engine.playing_filepath
         active_take = rec_path.name if rec_path is not None else (
             self._project_recordings[0].filename if self._project_recordings else ""
         )
@@ -1283,6 +1604,7 @@ class MainWindow(QMainWindow):
             "project_name": self.config_manager.settings.project_name or "Session",
             "take_count": len(self._project_recordings),
             "active_take_name": active_take,
+            "playing_take_name": play_path.name if play_path is not None else "",
         }
 
     def _open_remote_producer_dialog(self) -> None:
@@ -1327,8 +1649,81 @@ class MainWindow(QMainWindow):
     def _on_project_name_changed(self, new_text: str) -> None:
         self.config_manager.settings.project_name = new_text
         self.config_manager.save(commit_lbu=True)
+        self.config_manager.ensure_project_dir(new_text)
         self._update_filename_preview()
         self._refresh_recordings_list()
+
+    def _on_rename_recording_clicked(self) -> None:
+        if self.audio_engine.is_recording:
+            return
+        selected_path = self._get_selected_recording_path()
+        if selected_path is None or not selected_path.is_file():
+            return
+        if self.audio_engine.is_playing and self.audio_engine.playing_filepath == selected_path:
+            self.audio_engine.stop_playback()
+
+        dlg = RenameRecordingDialog(
+            config_manager=self.config_manager,
+            filepath=selected_path,
+            parent=self,
+        )
+        if dlg.exec() and dlg.renamed_path is not None:
+            self._refresh_recordings_list(select_path=dlg.renamed_path)
+        else:
+            self._update_playback_buttons_state()
+        self.setFocus()
+
+    def _on_delete_recording_clicked(self) -> None:
+        if self.audio_engine.is_recording:
+            return
+        selected_path = self._get_selected_recording_path()
+        if selected_path is None or not selected_path.is_file():
+            return
+        target_entry: Optional[RecordingEntry] = None
+        for entry in self._project_recordings:
+            if entry.filepath == selected_path:
+                target_entry = entry
+                break
+        if target_entry is None:
+            return
+
+        status = self.config_manager.get_storage_status()
+        dlg = DeleteFileConfirmDialog(
+            entry=target_entry,
+            storage_status=status,
+            parent=self,
+        )
+        if dlg.exec():
+            if self.audio_engine.is_playing and self.audio_engine.playing_filepath == selected_path:
+                self.audio_engine.stop_playback()
+            self.config_manager.delete_recording(selected_path)
+            self._refresh_recordings_list()
+            self._on_playback_finished()
+        self.setFocus()
+
+    def _open_file_manager_dialog(self) -> None:
+        if self.audio_engine.is_recording:
+            return
+        if self.audio_engine.is_playing:
+            self.audio_engine.stop_playback()
+
+        dlg = StorageFileManagerDialog(
+            config_manager=self.config_manager,
+            audio_engine=self.audio_engine,
+            output_device=self._active_output_device,
+            rename_dialog_factory=lambda cm, fp, par: RenameRecordingDialog(
+                config_manager=cm,
+                filepath=fp,
+                parent=par,
+            ),
+            fullscreen=self.isFullScreen(),
+            parent=self,
+        )
+        dlg.exec()
+        self._sync_hardware_state()
+        self._update_filename_preview()
+        self._refresh_recordings_list()
+        self.setFocus()
 
     def _on_osk_field_committed(self, _line_edit: QLineEdit, _text: str) -> None:
         self.config_manager.save(commit_lbu=True)
@@ -1336,14 +1731,15 @@ class MainWindow(QMainWindow):
 
     def _update_filename_preview(self) -> None:
         rec_path = self.audio_engine.current_recording_path
+        folder = sanitize_project_name(self.config_manager.settings.project_name)
         if self.audio_engine.is_record_paused and rec_path is not None:
-            self.filename_preview_label.setText(f"❚❚ Paused File: {rec_path.name}")
+            self.filename_preview_label.setText(f"❚❚ Paused File: {folder}/{rec_path.name}")
             self.filename_preview_label.setStyleSheet(
                 "border: none; color: #FFDF5D; font-family: monospace; font-weight: bold;"
             )
             return
         if self.audio_engine.is_recording and rec_path is not None:
-            self.filename_preview_label.setText(f"● Recording: {rec_path.name}")
+            self.filename_preview_label.setText(f"● Recording: {folder}/{rec_path.name}")
             self.filename_preview_label.setStyleSheet(
                 "border: none; color: #FF6B7A; font-family: monospace; font-weight: bold;"
             )
@@ -1351,14 +1747,101 @@ class MainWindow(QMainWindow):
         sample_name = generate_recording_filename(
             self.config_manager.settings.project_name
         )
-        self.filename_preview_label.setText(f"Next: {sample_name}")
+        self.filename_preview_label.setText(f"Next: {folder}/{sample_name}")
         self.filename_preview_label.setStyleSheet(
             "border: none; color: #8B949E; font-family: monospace;"
         )
 
+    @staticmethod
+    def _format_recording_row_text(
+        entry: RecordingEntry,
+        is_playing_this: bool = False,
+        is_paused: bool = False,
+        pos_sec: float = 0.0,
+        dur_sec: float = 0.0,
+    ) -> str:
+        ch_label = "Stereo" if entry.channels == 2 else f"{entry.channels}ch"
+        if not is_playing_this:
+            return (
+                f"{entry.filename}    |    "
+                f"{entry.formatted_duration}    |    "
+                f"{entry.bit_depth}-bit {entry.sample_rate:,} Hz {ch_label}    |    "
+                f"{entry.formatted_size}"
+            )
+
+        eff_dur = dur_sec if dur_sec > 0.0 else entry.duration_seconds
+        clamped_pos = (
+            max(0.0, min(pos_sec, eff_dur)) if eff_dur > 0.0 else max(0.0, pos_sec)
+        )
+        ratio = (clamped_pos / eff_dur) if eff_dur > 0.0 else 0.0
+        pos_str = format_playback_time(clamped_pos)
+        dur_str = format_playback_time(eff_dur)
+        bar_str = format_clip_progress_bar(ratio, width=10)
+        state_badge = "❚❚ PAUSED" if is_paused else "▶ PLAYING"
+        return (
+            f"{state_badge}  {entry.filename}    |    "
+            f"{pos_str} / {dur_str}  [{bar_str}]    |    "
+            f"{entry.bit_depth}-bit {entry.sample_rate:,} Hz {ch_label}    |    "
+            f"{entry.formatted_size}"
+        )
+
+    def _update_playing_clip_row(self, paused_override: Optional[bool] = None) -> None:
+        """Update the line of the clip that is playing in recordings_list with live play position & progress."""
+        is_playing = self.audio_engine.is_playing
+        playing_path = self.audio_engine.playing_filepath if is_playing else None
+        is_paused = (
+            self.audio_engine.is_paused if paused_override is None else paused_override
+        )
+        pos_sec = self.audio_engine.play_position_sec if is_playing else 0.0
+        dur_sec = self.audio_engine.play_duration_sec if is_playing else 0.0
+
+        count = self.recordings_list.count()
+        for row_idx in range(count):
+            item = self.recordings_list.item(row_idx)
+            if item is None or row_idx >= len(self._project_recordings):
+                continue
+            entry = self._project_recordings[row_idx]
+            is_this_clip = bool(
+                is_playing and playing_path is not None and entry.filepath == playing_path
+            )
+            was_active = bool(item.data(ROLE_PLAYBACK_ACTIVE))
+
+            if is_this_clip:
+                eff_dur = dur_sec if dur_sec > 0.0 else entry.duration_seconds
+                progress = (
+                    max(0.0, min(1.0, pos_sec / eff_dur)) if eff_dur > 0.0 else 0.0
+                )
+                row_text = self._format_recording_row_text(
+                    entry,
+                    is_playing_this=True,
+                    is_paused=is_paused,
+                    pos_sec=pos_sec,
+                    dur_sec=eff_dur,
+                )
+                if item.text() != row_text:
+                    item.setText(row_text)
+                item.setData(ROLE_PLAYBACK_ACTIVE, True)
+                item.setData(ROLE_PLAYBACK_PAUSED, is_paused)
+                item.setData(ROLE_PLAYBACK_PROGRESS, progress)
+                item.setData(ROLE_PLAYBACK_POS_SEC, pos_sec)
+                item.setData(ROLE_PLAYBACK_DUR_SEC, eff_dur)
+            elif was_active:
+                row_text = self._format_recording_row_text(entry, is_playing_this=False)
+                if item.text() != row_text:
+                    item.setText(row_text)
+                item.setData(ROLE_PLAYBACK_ACTIVE, False)
+                item.setData(ROLE_PLAYBACK_PAUSED, False)
+                item.setData(ROLE_PLAYBACK_PROGRESS, 0.0)
+                item.setData(ROLE_PLAYBACK_POS_SEC, 0.0)
+                item.setData(ROLE_PLAYBACK_DUR_SEC, entry.duration_seconds)
+
+        viewport = self.recordings_list.viewport()
+        if viewport is not None:
+            viewport.update()
+
     def _refresh_recordings_list(self, select_path: Optional[Path] = None) -> None:
         prefix = sanitize_project_name(self.config_manager.settings.project_name)
-        self.takes_title_label.setText(f"Project Recordings  [{prefix}_*.wav]")
+        self.takes_title_label.setText(f"Project Recordings  [{prefix}/]")
 
         current_selected_path: Optional[Path] = select_path
         if current_selected_path is None:
@@ -1373,17 +1856,41 @@ class MainWindow(QMainWindow):
         self.recordings_list.blockSignals(True)
         self.recordings_list.clear()
 
+        playing_path = (
+            self.audio_engine.playing_filepath if self.audio_engine.is_playing else None
+        )
         selected_row = 0
         for idx, entry in enumerate(self._project_recordings):
-            ch_label = "Stereo" if entry.channels == 2 else f"{entry.channels}ch"
-            meta = (
-                f"{entry.filename}    |    "
-                f"{entry.formatted_duration}    |    "
-                f"{entry.bit_depth}-bit {entry.sample_rate:,} Hz {ch_label}    |    "
-                f"{entry.formatted_size}"
+            is_this_playing = bool(
+                playing_path is not None and entry.filepath == playing_path
+            )
+            meta = self._format_recording_row_text(
+                entry,
+                is_playing_this=is_this_playing,
+                is_paused=self.audio_engine.is_paused,
+                pos_sec=self.audio_engine.play_position_sec,
+                dur_sec=self.audio_engine.play_duration_sec,
             )
             item = QListWidgetItem(meta)
             item.setData(Qt.ItemDataRole.UserRole, entry.filepath)
+            item.setData(ROLE_PLAYBACK_ACTIVE, is_this_playing)
+            item.setData(ROLE_PLAYBACK_PAUSED, self.audio_engine.is_paused if is_this_playing else False)
+            eff_dur = (
+                self.audio_engine.play_duration_sec
+                if self.audio_engine.play_duration_sec > 0.0
+                else entry.duration_seconds
+            )
+            prog = (
+                max(0.0, min(1.0, self.audio_engine.play_position_sec / eff_dur))
+                if (is_this_playing and eff_dur > 0.0)
+                else 0.0
+            )
+            item.setData(ROLE_PLAYBACK_PROGRESS, prog)
+            item.setData(
+                ROLE_PLAYBACK_POS_SEC,
+                self.audio_engine.play_position_sec if is_this_playing else 0.0,
+            )
+            item.setData(ROLE_PLAYBACK_DUR_SEC, eff_dur)
             self.recordings_list.addItem(item)
             if current_selected_path and entry.filepath == current_selected_path:
                 selected_row = idx
@@ -1400,6 +1907,21 @@ class MainWindow(QMainWindow):
             return None
         path = item.data(Qt.ItemDataRole.UserRole)
         return Path(path) if path else None
+
+    def _on_playback_finished(self) -> None:
+        if not self.audio_engine.is_recording and not self.audio_engine.is_playing:
+            if self._active_input_device is not None:
+                settings = self.config_manager.settings
+                self.audio_engine.start_monitoring(
+                    device=self._active_input_device,
+                    sample_rate=settings.sample_rate,
+                    bit_depth=settings.bit_depth,
+                    studio_mode=settings.studio_mode,
+                    channels=settings.effective_channels,
+                    input_channel=settings.input_channel,
+                )
+        self._update_playback_buttons_state()
+        self._refresh_vu_meter()
 
     def _on_play_pause_clicked(self, force_new: bool = False) -> None:
         if self.audio_engine.is_recording:
@@ -1422,7 +1944,7 @@ class MainWindow(QMainWindow):
             filepath=selected_path,
             output_device=self._active_output_device,
             on_finished=lambda: QTimer.singleShot(
-                0, self._update_playback_buttons_state
+                0, self._on_playback_finished
             ),
             on_error=lambda err: QTimer.singleShot(
                 0,
@@ -1432,31 +1954,92 @@ class MainWindow(QMainWindow):
             ),
         )
         self._update_playback_buttons_state()
+        self._refresh_vu_meter()
 
     def _on_stop_playback_clicked(self) -> None:
         self.audio_engine.stop_playback()
-        self._update_playback_buttons_state()
+        self._on_playback_finished()
+
+    def _on_seek_playback_relative(self, delta_sec: float) -> None:
+        if not self.audio_engine.is_playing:
+            return
+        target = self.audio_engine.play_position_sec + float(delta_sec)
+        if self.audio_engine.seek_playback(target):
+            self._update_playing_clip_row()
+            self._update_playback_buttons_state()
 
     def _update_playback_buttons_state(self, paused: Optional[bool] = None) -> None:
         is_rec = self.audio_engine.is_recording
-        has_selection = self._get_selected_recording_path() is not None
+        selected_path = self._get_selected_recording_path()
+        has_selection = selected_path is not None
         is_playing = self.audio_engine.is_playing
         is_paused = self.audio_engine.is_paused if paused is None else paused
+        playing_path = self.audio_engine.playing_filepath if is_playing else None
+        selected_is_playing = bool(
+            is_playing and selected_path is not None and playing_path == selected_path
+        )
 
+        self.rename_take_btn.setEnabled(not is_rec and has_selection)
         self.play_btn.setEnabled(not is_rec and has_selection)
         self.stop_play_btn.setEnabled(not is_rec and is_playing)
+        self.stop_play_btn.setStyleSheet(
+            build_stop_playback_button_style(bool(not is_rec and is_playing), self._scale)
+        )
 
-        if is_playing:
+        if selected_is_playing:
             if is_paused:
                 self.play_btn.setText("▶ Resume")
+                self.play_btn.setStyleSheet(
+                    build_playback_button_style("paused", self._scale)
+                )
             else:
                 self.play_btn.setText("❚❚ Pause")
-        else:
-            self.play_btn.setText("▶ Play / Pause")
-            if not is_rec:
-                self.playback_status_label.setText(
-                    f"{len(self._project_recordings)} take(s)"
+                self.play_btn.setStyleSheet(
+                    build_playback_button_style("playing", self._scale)
                 )
+        else:
+            self.play_btn.setText("▶ Play")
+            self.play_btn.setStyleSheet(
+                build_playback_button_style("ready", self._scale)
+            )
+
+        self._update_playing_clip_row(paused_override=is_paused)
+
+        if is_playing:
+            pos_str = format_playback_time(self.audio_engine.play_position_sec)
+            dur_str = format_playback_time(self.audio_engine.play_duration_sec)
+            prod_connected = (
+                self.remote_producer_server.is_running
+                and self.remote_producer_server.connected_client_count > 0
+            )
+            if is_paused:
+                self.playback_status_label.setText(
+                    f"❚❚ Paused  [{pos_str} / {dur_str}]"
+                )
+                self.playback_status_label.setStyleSheet(
+                    "color: #FFDF5D; font-family: monospace; font-weight: bold;"
+                )
+            elif prod_connected:
+                self.playback_status_label.setText(
+                    f"▶ Reviewing w/ Producer  [{pos_str} / {dur_str}]"
+                )
+                self.playback_status_label.setStyleSheet(
+                    "color: #79C0FF; font-family: monospace; font-weight: bold;"
+                )
+            else:
+                self.playback_status_label.setText(
+                    f"▶ Playing  [{pos_str} / {dur_str}]"
+                )
+                self.playback_status_label.setStyleSheet(
+                    "color: #79C0FF; font-family: monospace; font-weight: bold;"
+                )
+        elif not is_rec:
+            self.playback_status_label.setText(
+                f"{len(self._project_recordings)} take(s)"
+            )
+            self.playback_status_label.setStyleSheet(
+                "color: #8B949E; font-family: monospace;"
+            )
 
     def _on_manual_refresh(self) -> None:
         self.config_manager._ensure_storage_mounted(force=True)
@@ -1543,19 +2126,25 @@ class MainWindow(QMainWindow):
             if now_mono - self._last_storage_refresh_monotonic >= 0.5:
                 self._refresh_storage_status()
         elif self.audio_engine.is_playing:
-            pos = self.audio_engine.play_position_sec
-            dur = self.audio_engine.play_duration_sec
-            p_m, p_s = divmod(int(pos), 60)
-            d_m, d_s = divmod(int(dur), 60)
-            fname = (
-                self.audio_engine.playing_filepath.name
-                if self.audio_engine.playing_filepath
-                else ""
+            self._update_playing_clip_row()
+            pos_str = format_playback_time(self.audio_engine.play_position_sec)
+            dur_str = format_playback_time(self.audio_engine.play_duration_sec)
+            prod_connected = (
+                self.remote_producer_server.is_running
+                and self.remote_producer_server.connected_client_count > 0
             )
-            state_str = "PAUSED" if self.audio_engine.is_paused else "PLAYING"
-            self.playback_status_label.setText(
-                f"{state_str}: {fname}  [{p_m:02d}:{p_s:02d} / {d_m:02d}:{d_s:02d}]"
-            )
+            if self.audio_engine.is_paused:
+                self.playback_status_label.setText(
+                    f"❚❚ Paused  [{pos_str} / {dur_str}]"
+                )
+            elif prod_connected:
+                self.playback_status_label.setText(
+                    f"▶ Reviewing w/ Producer  [{pos_str} / {dur_str}]"
+                )
+            else:
+                self.playback_status_label.setText(
+                    f"▶ Playing  [{pos_str} / {dur_str}]"
+                )
 
     def _on_background_tick(self) -> None:
         self.ip_bar_label.setText(get_primary_ip_display())
@@ -1600,6 +2189,14 @@ class MainWindow(QMainWindow):
         if key == Qt.Key.Key_M:
             self._on_toggle_studio_mode()
             return
+        if key in (Qt.Key.Key_N, Qt.Key.Key_F4):
+            if not self.audio_engine.is_recording:
+                self._on_rename_recording_clicked()
+            return
+        if key == Qt.Key.Key_Delete:
+            if not self.audio_engine.is_recording:
+                self._on_delete_recording_clicked()
+            return
         if key == Qt.Key.Key_P:
             if self.audio_engine.is_recording:
                 self._on_pause_record_button_clicked()
@@ -1609,6 +2206,14 @@ class MainWindow(QMainWindow):
         if key == Qt.Key.Key_S:
             self._on_stop_playback_clicked()
             return
+        if key == Qt.Key.Key_Left:
+            if self.audio_engine.is_playing:
+                self._on_seek_playback_relative(-3.0)
+                return
+        if key == Qt.Key.Key_Right:
+            if self.audio_engine.is_playing:
+                self._on_seek_playback_relative(3.0)
+                return
         if key == Qt.Key.Key_F1:
             self._open_help_dialog()
             return
@@ -1623,6 +2228,10 @@ class MainWindow(QMainWindow):
             return
         if key == Qt.Key.Key_F5:
             self._on_manual_refresh()
+            return
+        if key == Qt.Key.Key_F6:
+            if not self.audio_engine.is_recording:
+                self._open_file_manager_dialog()
             return
         if key == Qt.Key.Key_F11:
             if self.isFullScreen():

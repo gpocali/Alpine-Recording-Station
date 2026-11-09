@@ -850,6 +850,7 @@ class AudioEngine:
         self._play_position_sec: float = 0.0
         self._play_duration_sec: float = 0.0
         self._playing_filepath: Optional[Path] = None
+        self._seek_target_sec: Optional[float] = None
 
         # Remote Producer bidirectional audio & privacy/cough state
         self._live_listeners_lock = threading.Lock()
@@ -1113,8 +1114,9 @@ class AudioEngine:
 
     def get_vu_readings(self) -> VuMeterReadings:
         """Return a snapshot of current VU meter levels (linear & dBFS) and maintained Peak Hold."""
-        active = self.is_recording or self.is_monitoring
-        muted = self.is_mic_muted
+        is_play_active = self.is_playing and not self.is_paused
+        active = self.is_recording or self.is_monitoring or is_play_active
+        muted = self.is_mic_muted and not self.is_playing
         now = time.monotonic()
 
         with self._meter_lock:
@@ -1186,8 +1188,10 @@ class AudioEngine:
         mic_col = input_frames[:, mic_ch_idx]
         return np.column_stack((mic_col, mic_col))
 
-    def _update_meter_from_block(self, metered_block: np.ndarray) -> None:
-        """Update smoothed VU levels and Peak Hold from an input audio block."""
+    def _update_meter_from_block(
+        self, metered_block: np.ndarray, is_playback: bool = False
+    ) -> None:
+        """Update smoothed VU levels and Peak Hold from an input or playback audio block."""
         if metered_block.size == 0:
             return
         if metered_block.ndim == 1:
@@ -1197,7 +1201,7 @@ class AudioEngine:
         if num_frames == 0 or num_ch == 0:
             return
 
-        if self.is_mic_muted:
+        if self.is_mic_muted and not is_playback:
             with self._meter_lock:
                 if self._meter_channels != num_ch or len(self._channel_peaks) != num_ch:
                     self._meter_channels = num_ch
@@ -2538,6 +2542,7 @@ class AudioEngine:
             self._is_paused = False
             self._playing_filepath = filepath
             self._play_position_sec = 0.0
+            self._seek_target_sec = None
 
             self._play_thread = threading.Thread(
                 target=self._playback_worker,
@@ -2546,13 +2551,27 @@ class AudioEngine:
             )
             self._play_thread.start()
 
+    def seek_playback(self, position_sec: float) -> bool:
+        """Seek to a target position (in seconds) within the currently playing WAV file."""
+        with self._play_lock:
+            if not self._is_playing:
+                return False
+            dur = max(0.0, float(self._play_duration_sec))
+            clamped = max(0.0, min(dur, float(position_sec))) if dur > 0.0 else max(0.0, float(position_sec))
+            self._seek_target_sec = clamped
+            self._play_position_sec = clamped
+            return True
+
     def toggle_pause_playback(self) -> bool:
         """Toggle pause state during reference playback. Returns new paused state."""
         with self._play_lock:
             if not self._is_playing:
                 return False
             self._is_paused = not self._is_paused
-            return self._is_paused
+            paused = self._is_paused
+        if paused:
+            self._clear_live_meter_levels()
+        return paused
 
     def stop_playback(self) -> None:
         """Stop active reference playback."""
@@ -2561,6 +2580,7 @@ class AudioEngine:
                 return
             self._stop_play_event.set()
             self._is_paused = False
+            self._seek_target_sec = None
             thread = self._play_thread
 
         if thread is not None and thread.is_alive():
@@ -2571,8 +2591,53 @@ class AudioEngine:
             self._is_paused = False
             self._play_position_sec = 0.0
             self._playing_filepath = None
+            self._seek_target_sec = None
 
+        self._clear_live_meter_levels()
         self._resume_monitoring_if_configured()
+
+    @staticmethod
+    def _downmix_playback_to_mono(playback_block: np.ndarray) -> np.ndarray:
+        """Convert a 1ch or 2ch float64 playback block into a 1D mono stream for the Remote Producer.
+
+        Preserves unity gain for Studio Mode takes (where Left=VO and Right=Talkback are
+        mutually exclusive) as well as mono or dual-mono stereo recordings.
+        """
+        if playback_block.size == 0:
+            return np.zeros(0, dtype=np.float64)
+        if playback_block.ndim == 1 or playback_block.shape[1] == 1:
+            return playback_block.reshape(-1).astype(np.float64, copy=False)
+        ch0 = playback_block[:, 0]
+        ch1 = playback_block[:, 1]
+        max0 = float(np.max(np.abs(ch0)))
+        max1 = float(np.max(np.abs(ch1)))
+        if max0 <= 1e-5:
+            return ch1.copy()
+        if max1 <= 1e-5:
+            return ch0.copy()
+        if np.allclose(ch0, ch1, atol=1e-4):
+            return ch0.copy()
+        return np.clip((ch0 + ch1) * 0.5, -1.0, 1.0)
+
+    def _dispatch_playback_block(
+        self, playback_block: np.ndarray, sample_rate: int
+    ) -> None:
+        """Update VU meters and stream reference playback audio to connected Remote Producers."""
+        if playback_block.size == 0:
+            return
+        self._update_meter_from_block(playback_block, is_playback=True)
+        with self._live_listeners_lock:
+            listeners = list(self._live_audio_listeners)
+        if not listeners:
+            return
+        mono = self._downmix_playback_to_mono(playback_block)
+        if mono.size == 0:
+            return
+        for cb in listeners:
+            try:
+                cb(mono, sample_rate, False)
+            except Exception as exc:
+                logger.debug("Playback audio listener error: %s", exc)
 
     def _playback_worker(
         self,
@@ -2602,6 +2667,10 @@ class AudioEngine:
             with self._play_lock:
                 self._is_playing = False
                 self._is_paused = False
+                self._play_position_sec = 0.0
+                self._playing_filepath = None
+                self._seek_target_sec = None
+            self._clear_live_meter_levels()
             self._resume_monitoring_if_configured()
             if on_finished:
                 on_finished()
@@ -2613,12 +2682,28 @@ class AudioEngine:
         cursor = 0
 
         while cursor < total_frames and not self._stop_play_event.is_set():
+            with self._play_lock:
+                seek_sec = self._seek_target_sec
+                self._seek_target_sec = None
+            if seek_sec is not None:
+                cursor = max(0, min(total_frames, int(round(seek_sec * sample_rate))))
+                self._play_position_sec = (cursor / sample_rate) if sample_rate > 0 else 0.0
+                if cursor >= total_frames:
+                    break
+
             if self._is_paused:
                 self._stop_play_event.wait(0.05)
                 continue
-            cursor = min(total_frames, cursor + chunk_frames)
-            self._play_position_sec = cursor / sample_rate
-            self._stop_play_event.wait(chunk_sec)
+
+            t0 = time.monotonic()
+            end = min(total_frames, cursor + chunk_frames)
+            block_float = frames[cursor:end]
+            cursor = end
+            self._play_position_sec = (cursor / sample_rate) if sample_rate > 0 else 0.0
+            self._dispatch_playback_block(block_float, sample_rate)
+            elapsed = time.monotonic() - t0
+            sleep_for = max(0.001, chunk_sec - elapsed)
+            self._stop_play_event.wait(sleep_for)
 
     def _playback_alsa_loop(
         self,
@@ -2671,6 +2756,7 @@ class AudioEngine:
 
         lib.snd_pcm_prepare(pcm)
 
+        orig_frames = frames
         if frames.shape[1] == 1 and out_ch == 2:
             frames = np.column_stack((frames[:, 0], frames[:, 0]))
         elif frames.shape[1] >= 2 and out_ch == 1:
@@ -2680,11 +2766,23 @@ class AudioEngine:
         total_frames = pcm16.shape[0]
         chunk_frames = max(256, sample_rate // 25)
         cursor = 0
+        next_write_mono = time.monotonic() - 0.08
 
         try:
             while cursor < total_frames and not self._stop_play_event.is_set():
+                with self._play_lock:
+                    seek_sec = self._seek_target_sec
+                    self._seek_target_sec = None
+                if seek_sec is not None:
+                    cursor = max(0, min(total_frames, int(round(seek_sec * sample_rate))))
+                    self._play_position_sec = (cursor / sample_rate) if sample_rate > 0 else 0.0
+                    next_write_mono = time.monotonic() - 0.08
+                    if cursor >= total_frames:
+                        break
+
                 if self._is_paused:
                     self._stop_play_event.wait(0.05)
+                    next_write_mono = time.monotonic() - 0.08
                     continue
 
                 end = min(total_frames, cursor + chunk_frames)
@@ -2694,8 +2792,22 @@ class AudioEngine:
                 if written < 0:
                     lib.snd_pcm_recover(pcm, int(written), 1)
                     continue
-                cursor += int(written)
-                self._play_position_sec = cursor / sample_rate
+                if written == 0:
+                    continue
+                actual_end = min(total_frames, cursor + int(written))
+                block_float = orig_frames[cursor:actual_end]
+                cursor = actual_end
+                self._play_position_sec = (cursor / sample_rate) if sample_rate > 0 else 0.0
+                self._dispatch_playback_block(block_float, sample_rate)
+
+                chunk_sec = int(written) / float(max(8000, sample_rate))
+                now_m = time.monotonic()
+                if next_write_mono < now_m - 0.08:
+                    next_write_mono = now_m - 0.08
+                next_write_mono += chunk_sec
+                sleep_sec = next_write_mono - time.monotonic()
+                if sleep_sec > 0.001:
+                    self._stop_play_event.wait(min(chunk_sec, sleep_sec))
 
             if not self._stop_play_event.is_set():
                 lib.snd_pcm_drain(pcm)

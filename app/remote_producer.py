@@ -479,6 +479,8 @@ class RemoteProducerServer:
         flags = 0x01 if is_muted else 0x00
         if self.audio_engine.talkback_active:
             flags |= 0x02
+        if self.audio_engine.is_playing:
+            flags |= 0x04
         header = struct.pack("<BBH", FRAME_TALENT_AUDIO, flags, STREAM_SAMPLE_RATE // 100)
         packet = header + pcm_int16.tobytes()
 
@@ -502,6 +504,8 @@ class RemoteProducerServer:
                 state_code = "PAUSED"
             else:
                 state_code = "RECORDING"
+        elif self.audio_engine.is_playing:
+            state_code = "PLAYBACK_PAUSED" if self.audio_engine.is_paused else "PLAYING"
         elif self.audio_engine.is_monitoring:
             state_code = "MONITORING"
         else:
@@ -509,6 +513,13 @@ class RemoteProducerServer:
 
         rec_path = self.audio_engine.current_recording_path
         active_take = extra.get("active_take_name", rec_path.name if rec_path else "")
+
+        play_path = self.audio_engine.playing_filepath
+        playing_take_name = str(extra.get("playing_take_name", play_path.name if play_path else ""))
+        is_playing = bool(self.audio_engine.is_playing)
+        is_play_paused = bool(self.audio_engine.is_paused)
+        play_position_sec = round(float(self.audio_engine.play_position_sec), 2)
+        play_duration_sec = round(float(self.audio_engine.play_duration_sec), 2)
 
         if "storage_remaining" not in extra:
             try:
@@ -529,7 +540,24 @@ class RemoteProducerServer:
         if not vu.active or vu.peak_hold_level <= 1e-5:
             self._tb_peak_hold_db = -60.0
 
-        if settings.studio_mode:
+        if is_playing:
+            eff_ch = 2 if settings.studio_mode else max(1, min(2, int(settings.effective_channels)))
+            raw_peaks = list(vu.channel_peaks[:eff_ch]) if vu.channel_peaks else [vu.peak_level]
+            raw_rms = list(vu.channel_rms[:eff_ch]) if vu.channel_rms else [vu.rms_level]
+            raw_holds = list(vu.channel_peak_holds[:eff_ch]) if vu.channel_peak_holds else [vu.peak_hold_level]
+            while len(raw_peaks) < eff_ch:
+                raw_peaks.append(raw_peaks[0] if raw_peaks else 0.0)
+            while len(raw_rms) < eff_ch:
+                raw_rms.append(raw_rms[0] if raw_rms else 0.0)
+            while len(raw_holds) < eff_ch:
+                raw_holds.append(raw_holds[0] if raw_holds else 0.0)
+            ch_peaks_db = [round(float(linear_to_dbfs(x)), 1) for x in raw_peaks]
+            ch_rms_db = [round(float(linear_to_dbfs(x)), 1) for x in raw_rms]
+            ch_holds_db = [round(float(linear_to_dbfs(x)), 1) for x in raw_holds]
+            overall_peak_db = round(float(vu.peak_db), 1)
+            overall_rms_db = round(float(vu.rms_db), 1)
+            overall_hold_db = round(float(vu.peak_hold_db), 1)
+        elif settings.studio_mode:
             # Channel 0: VO (L) — Talent VO Track (muted during Talkback or when Talent Mic is muted/cough-muted)
             if not tb_active and talent_live:
                 vo_peak_db = round(float(linear_to_dbfs(vu.peak_level)), 1)
@@ -598,6 +626,11 @@ class RemoteProducerServer:
             "state": state_code,
             "is_recording": bool(self.audio_engine.is_recording),
             "is_record_paused": bool(self.audio_engine.is_record_paused),
+            "is_playing": is_playing,
+            "is_play_paused": is_play_paused,
+            "play_position_sec": play_position_sec,
+            "play_duration_sec": play_duration_sec,
+            "playing_take_name": playing_take_name,
             "elapsed_seconds": round(float(self.audio_engine.elapsed_seconds), 2),
             "studio_mode": bool(settings.studio_mode),
             "sample_rate": int(settings.sample_rate),
@@ -624,7 +657,7 @@ class RemoteProducerServer:
                 "rms_db": overall_rms_db,
                 "peak_db": overall_peak_db,
                 "peak_hold_db": overall_hold_db,
-                "clipped": bool(vu.clipped and talent_live),
+                "clipped": bool(vu.clipped and (talent_live or is_playing)),
                 "channel_peaks": ch_peaks_db,
                 "channel_rms": ch_rms_db,
                 "channel_peak_holds": ch_holds_db,
@@ -1279,6 +1312,10 @@ body {{
   background: #1E170B;
   border-color: var(--accent-talkback);
 }}
+.studio-deck.deck-playing {{
+  background: #0E1B2B;
+  border-color: var(--brand-color);
+}}
 .deck-top {{
   display: flex;
   align-items: center;
@@ -1314,6 +1351,11 @@ body {{
   border-color: #F0883E;
   color: #FFDF5D;
 }}
+.state-banner.banner-playing {{
+  background: #0D2744;
+  border-color: #58A6FF;
+  color: #79C0FF;
+}}
 .timer-display {{
   font-family: "DejaVu Sans Mono", "Consolas", monospace;
   font-size: 44px;
@@ -1326,6 +1368,9 @@ body {{
 }}
 .timer-display.timer-paused {{
   color: #F2CC60;
+}}
+.timer-display.timer-playing {{
+  color: #79C0FF;
 }}
 .deck-sub-row {{
   margin-top: 8px;
@@ -2274,7 +2319,11 @@ input[type="range"].brand-slider {{
         (msg.sample_rate || 48000) + " Hz / " + (msg.bit_depth || 24) + "-bit";
     }}
 
-    timerDisplay.textContent = formatElapsed(msg.elapsed_seconds);
+    if (msg.is_playing) {{
+      timerDisplay.textContent = formatElapsed(msg.play_position_sec) + " / " + formatElapsed(msg.play_duration_sec);
+    }} else {{
+      timerDisplay.textContent = formatElapsed(msg.elapsed_seconds);
+    }}
 
     if (msg.talkback_active) {{
       studioDeck.className = "studio-deck deck-talkback";
@@ -2296,6 +2345,18 @@ input[type="range"].brand-slider {{
       stateBanner.className = "state-banner banner-rec";
       stateBanner.textContent = "● RECORDING IN PROGRESS";
       timerDisplay.className = "timer-display timer-rec";
+    }} else if (msg.is_playing && msg.is_play_paused) {{
+      studioDeck.className = "studio-deck deck-paused";
+      stateBanner.className = "state-banner banner-paused";
+      const playClip = msg.playing_take_name ? (": " + msg.playing_take_name) : "";
+      stateBanner.textContent = "❚❚ PLAYBACK PAUSED" + playClip;
+      timerDisplay.className = "timer-display timer-paused";
+    }} else if (msg.is_playing) {{
+      studioDeck.className = "studio-deck deck-playing";
+      stateBanner.className = "state-banner banner-playing";
+      const playClip = msg.playing_take_name ? (": " + msg.playing_take_name) : "";
+      stateBanner.textContent = "▶ PLAYING RECORDED TAKE" + playClip;
+      timerDisplay.className = "timer-display timer-playing";
     }} else {{
       studioDeck.className = "studio-deck";
       stateBanner.className = "state-banner";
@@ -2303,7 +2364,10 @@ input[type="range"].brand-slider {{
       timerDisplay.className = "timer-display";
     }}
 
-    if (msg.talent_mic_live) {{
+    if (msg.is_playing) {{
+      talentFeedBadge.textContent = "▶ Reference Playback Stream: LIVE";
+      talentFeedBadge.className = "pill-live";
+    }} else if (msg.talent_mic_live) {{
       talentFeedBadge.textContent = "◉ Talent Mic Feed: LIVE";
       talentFeedBadge.className = "pill-live";
     }} else if (msg.talent_cough_muted) {{
@@ -2314,7 +2378,9 @@ input[type="range"].brand-slider {{
       talentFeedBadge.className = "pill-muted";
     }}
 
-    const activeTake = msg.active_take_name ? (" (" + msg.active_take_name + ")") : "";
+    const activeTake = msg.active_take_name
+      ? (" (" + msg.active_take_name + ")")
+      : (msg.playing_take_name ? (" (Reviewing: " + msg.playing_take_name + ")") : "");
     takeSummary.textContent = "Session Takes: " + (msg.take_count || 0) + activeTake;
     storageSummary.textContent = "Storage Remaining: " + (msg.storage_remaining || "--");
 
@@ -2353,8 +2419,8 @@ input[type="range"].brand-slider {{
     src.buffer = audioBuf;
     src.connect(monitorGainNode);
     const now = audioCtx.currentTime;
-    if (nextPlayTime < now || nextPlayTime > now + 0.18) {{
-      nextPlayTime = now + 0.02;
+    if (nextPlayTime < now || nextPlayTime > now + 0.35) {{
+      nextPlayTime = now + 0.025;
     }}
     src.start(nextPlayTime);
     nextPlayTime += audioBuf.duration;

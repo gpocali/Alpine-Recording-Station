@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_STORAGE_DIR = "/storage"
 DEFAULT_ETC_CONFIG_DIR = "/etc/alpine-recorder"
 
+PROTECTED_STORAGE_DIRS: frozenset[str] = frozenset({
+    ".alpine-recorder",
+    "lost+found",
+    "ssl",
+})
+
 STORAGE_WARN_USED_PERCENT: float = 80.0
 STORAGE_CRITICAL_USED_PERCENT: float = 90.0
 STORAGE_WARN_REMAINING_SEC: float = 1800.0      # 30 minutes
@@ -197,6 +203,15 @@ class RecordingEntry:
     sample_rate: int = 0
     channels: int = 0
     bit_depth: int = 0
+    project_name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.project_name and self.filepath is not None:
+            parent_name = self.filepath.parent.name
+            if parent_name and parent_name not in ("", "storage", "/"):
+                self.project_name = parent_name
+            else:
+                self.project_name = "Root"
 
     @property
     def formatted_duration(self) -> str:
@@ -214,6 +229,39 @@ class RecordingEntry:
             return f"{mb:.1f} MB"
         kb = self.size_bytes / 1024
         return f"{kb:.1f} KB"
+
+    @property
+    def formatted_modified(self) -> str:
+        try:
+            dt = datetime.datetime.fromtimestamp(self.modified_time).astimezone()
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return ""
+
+
+@dataclass
+class ProjectFolderSummary:
+    """Metadata summary for a project directory inside /storage."""
+
+    project_name: str
+    folder_path: Path
+    recording_count: int = 0
+    other_file_count: int = 0
+    total_size_bytes: int = 0
+    latest_modified_time: float = 0.0
+    is_active_project: bool = False
+
+    @property
+    def total_item_count(self) -> int:
+        return self.recording_count + self.other_file_count
+
+    @property
+    def is_empty(self) -> bool:
+        return self.recording_count == 0 and self.other_file_count == 0
+
+    @property
+    def formatted_size(self) -> str:
+        return format_storage_bytes(self.total_size_bytes)
 
 
 def compute_wav_byte_rate(
@@ -745,49 +793,588 @@ class ConfigManager:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def get_project_dir(self, project_name: Optional[str] = None) -> Path:
+        """Return the project subfolder path inside /storage for the given or active project."""
+        prefix_clean = sanitize_project_name(
+            project_name if project_name is not None else self.settings.project_name
+        )
+        return self.storage_dir / prefix_clean
+
+    def ensure_project_dir(self, project_name: Optional[str] = None) -> Path:
+        """Ensure the project subfolder exists inside /storage with proper Samba permissions."""
+        proj_dir = self.get_project_dir(project_name)
+        try:
+            proj_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not create project directory %s: %s", proj_dir, exc)
+        self.enforce_storage_permissions()
+        return proj_dir
+
+    def rename_recording(
+        self, filepath: Path | str, new_name: str
+    ) -> Tuple[bool, str, Optional[Path]]:
+        """Rename a completed WAV recording within its project folder.
+
+        Args:
+            filepath: Existing path to the WAV file.
+            new_name: Desired new filename (with or without .wav extension).
+
+        Returns:
+            Tuple of (success, message, new_filepath).
+        """
+        src_path = Path(filepath)
+        if not src_path.is_file():
+            return (False, f"Recording file not found: {src_path.name}", None)
+
+        raw_name = (new_name or "").strip()
+        if raw_name.lower().endswith(".wav"):
+            raw_name = raw_name[:-4].strip()
+
+        # Sanitize characters invalid in Linux or Windows/Samba filenames
+        cleaned_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name)
+        cleaned_stem = re.sub(r"\s+", "_", cleaned_stem).strip("._")
+        if not cleaned_stem:
+            return (False, "Please enter a valid recording filename.", None)
+
+        target_filename = f"{cleaned_stem}.wav"
+        dst_path = src_path.parent / target_filename
+
+        if dst_path == src_path:
+            return (True, f"Recording name unchanged ({target_filename}).", src_path)
+
+        if dst_path.exists():
+            return (
+                False,
+                f"A file named '{target_filename}' already exists in {src_path.parent.name}/.",
+                None,
+            )
+
+        try:
+            src_path.rename(dst_path)
+            self.enforce_storage_permissions()
+            return (True, f"Renamed to {target_filename}", dst_path)
+        except OSError as exc:
+            logger.warning("Failed to rename %s to %s: %s", src_path, dst_path, exc)
+            return (False, f"Could not rename file: {exc}", None)
+
     def list_project_recordings(
         self, project_name: Optional[str] = None
     ) -> List[RecordingEntry]:
-        """List all finished WAV files in /storage matching the project name prefix."""
+        """List all finished WAV files in the project's subfolder (/storage/<ProjectName>/).
+
+        Also includes any legacy WAV files directly in /storage matching <ProjectName>_*.wav.
+        """
         self.enforce_storage_permissions()
         prefix_clean = sanitize_project_name(
             project_name if project_name is not None else self.settings.project_name
         )
         expected_prefix = f"{prefix_clean}_"
+        proj_dir = self.storage_dir / prefix_clean
 
         entries: List[RecordingEntry] = []
-        if not self.storage_dir.is_dir():
-            return entries
+        seen_paths: set[Path] = set()
 
-        for item in self.storage_dir.iterdir():
-            if not item.is_file():
-                continue
-            if not item.name.lower().endswith(".wav"):
-                continue
-            if not item.name.startswith(expected_prefix):
-                continue
-
+        # 1. Scan project subfolder (/storage/<ProjectName>/) for all WAV files (including renamed ones)
+        if proj_dir.is_dir():
             try:
-                st = item.stat()
-                duration, sr, ch, bits = self._probe_wav_header(item, st.st_size)
-                entries.append(
-                    RecordingEntry(
-                        filepath=item,
-                        filename=item.name,
-                        size_bytes=st.st_size,
-                        modified_time=st.st_mtime,
-                        duration_seconds=duration,
-                        sample_rate=sr,
-                        channels=ch,
-                        bit_depth=bits,
-                    )
-                )
+                for item in proj_dir.iterdir():
+                    if not item.is_file():
+                        continue
+                    if not item.name.lower().endswith(".wav"):
+                        continue
+                    try:
+                        st = item.stat()
+                        duration, sr, ch, bits = self._probe_wav_header(item, st.st_size)
+                        entries.append(
+                            RecordingEntry(
+                                filepath=item,
+                                filename=item.name,
+                                size_bytes=st.st_size,
+                                modified_time=st.st_mtime,
+                                duration_seconds=duration,
+                                sample_rate=sr,
+                                channels=ch,
+                                bit_depth=bits,
+                            )
+                        )
+                        seen_paths.add(item.resolve())
+                    except OSError:
+                        continue
             except OSError:
-                continue
+                pass
+
+        # 2. Also include any legacy root-level WAV files in /storage matching <ProjectName>_*.wav
+        if self.storage_dir.is_dir():
+            try:
+                for item in self.storage_dir.iterdir():
+                    if not item.is_file():
+                        continue
+                    if not item.name.lower().endswith(".wav"):
+                        continue
+                    if not item.name.startswith(expected_prefix):
+                        continue
+                    try:
+                        resolved = item.resolve()
+                        if resolved in seen_paths:
+                            continue
+                        st = item.stat()
+                        duration, sr, ch, bits = self._probe_wav_header(item, st.st_size)
+                        entries.append(
+                            RecordingEntry(
+                                filepath=item,
+                                filename=item.name,
+                                size_bytes=st.st_size,
+                                modified_time=st.st_mtime,
+                                duration_seconds=duration,
+                                sample_rate=sr,
+                                channels=ch,
+                                bit_depth=bits,
+                            )
+                        )
+                        seen_paths.add(resolved)
+                    except OSError:
+                        continue
+            except OSError:
+                pass
 
         # Newest recordings first
         entries.sort(key=lambda e: e.modified_time, reverse=True)
         return entries
+
+    @staticmethod
+    def is_protected_storage_name(name: str) -> bool:
+        """Return True if a folder/file name inside /storage is reserved for system use."""
+        cleaned = (name or "").strip()
+        if not cleaned or cleaned.startswith(".") or cleaned in PROTECTED_STORAGE_DIRS:
+            return True
+        return False
+
+    def _is_valid_user_path_in_storage(self, target: Path) -> bool:
+        """Verify target path is strictly inside /storage and not inside a protected system directory."""
+        try:
+            storage_resolved = self.storage_dir.resolve()
+            target_resolved = target.resolve()
+            rel = target_resolved.relative_to(storage_resolved)
+        except Exception:
+            return False
+        parts = rel.parts
+        if not parts:
+            return False
+        if self.is_protected_storage_name(parts[0]):
+            return False
+        return True
+
+    def list_project_folders(self) -> List[ProjectFolderSummary]:
+        """List all project directories in /storage with recording counts and total disk usage."""
+        self.enforce_storage_permissions()
+        active_clean = sanitize_project_name(self.settings.project_name)
+        summaries: List[ProjectFolderSummary] = []
+
+        if not self.storage_dir.is_dir():
+            return summaries
+
+        try:
+            for entry in self.storage_dir.iterdir():
+                try:
+                    if entry.is_symlink() or not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                if self.is_protected_storage_name(entry.name):
+                    continue
+
+                rec_count = 0
+                other_count = 0
+                total_bytes = 0
+                latest_mtime = 0.0
+                try:
+                    latest_mtime = entry.stat().st_mtime
+                except OSError:
+                    pass
+
+                stack: List[Path] = [entry]
+                while stack:
+                    curr = stack.pop()
+                    try:
+                        with os.scandir(curr) as it:
+                            for sub in it:
+                                try:
+                                    if sub.is_symlink():
+                                        continue
+                                    if sub.is_dir(follow_symlinks=False):
+                                        stack.append(Path(sub.path))
+                                    elif sub.is_file(follow_symlinks=False):
+                                        st = sub.stat(follow_symlinks=False)
+                                        total_bytes += max(0, int(st.st_size))
+                                        if st.st_mtime > latest_mtime:
+                                            latest_mtime = st.st_mtime
+                                        if sub.name.lower().endswith(".wav"):
+                                            rec_count += 1
+                                        else:
+                                            other_count += 1
+                                except OSError:
+                                    continue
+                    except OSError:
+                        continue
+
+                summaries.append(
+                    ProjectFolderSummary(
+                        project_name=entry.name,
+                        folder_path=entry,
+                        recording_count=rec_count,
+                        other_file_count=other_count,
+                        total_size_bytes=total_bytes,
+                        latest_modified_time=latest_mtime,
+                        is_active_project=(entry.name == active_clean),
+                    )
+                )
+        except OSError:
+            pass
+
+        summaries.sort(
+            key=lambda s: (not s.is_active_project, s.project_name.lower())
+        )
+        return summaries
+
+    def list_all_recordings(
+        self, project_filter: Optional[str] = None
+    ) -> List[RecordingEntry]:
+        """List completed WAV recordings across all project folders in /storage (or filtered by project)."""
+        self.enforce_storage_permissions()
+        entries: List[RecordingEntry] = []
+        seen_paths: set[Path] = set()
+
+        if not self.storage_dir.is_dir():
+            return entries
+
+        filter_clean = (project_filter or "").strip()
+        if filter_clean in ("", "*"):
+            filter_clean = ""
+
+        # 1. Scan all non-protected project subfolders in /storage
+        try:
+            for proj_dir in self.storage_dir.iterdir():
+                try:
+                    if proj_dir.is_symlink() or not proj_dir.is_dir():
+                        continue
+                except OSError:
+                    continue
+                if self.is_protected_storage_name(proj_dir.name):
+                    continue
+                if filter_clean and proj_dir.name != filter_clean:
+                    continue
+
+                try:
+                    for item in proj_dir.iterdir():
+                        if not item.is_file() or item.is_symlink():
+                            continue
+                        if not item.name.lower().endswith(".wav"):
+                            continue
+                        try:
+                            resolved = item.resolve()
+                            if resolved in seen_paths:
+                                continue
+                            st = item.stat()
+                            duration, sr, ch, bits = self._probe_wav_header(
+                                item, st.st_size
+                            )
+                            entries.append(
+                                RecordingEntry(
+                                    filepath=item,
+                                    filename=item.name,
+                                    size_bytes=st.st_size,
+                                    modified_time=st.st_mtime,
+                                    duration_seconds=duration,
+                                    sample_rate=sr,
+                                    channels=ch,
+                                    bit_depth=bits,
+                                    project_name=proj_dir.name,
+                                )
+                            )
+                            seen_paths.add(resolved)
+                        except OSError:
+                            continue
+                except OSError:
+                    continue
+        except OSError:
+            pass
+
+        # 2. Also include any root-level WAV files directly in /storage
+        if not filter_clean or filter_clean == "Root":
+            try:
+                for item in self.storage_dir.iterdir():
+                    if not item.is_file() or item.is_symlink():
+                        continue
+                    if not item.name.lower().endswith(".wav"):
+                        continue
+                    try:
+                        resolved = item.resolve()
+                        if resolved in seen_paths:
+                            continue
+                        st = item.stat()
+                        duration, sr, ch, bits = self._probe_wav_header(
+                            item, st.st_size
+                        )
+                        entries.append(
+                            RecordingEntry(
+                                filepath=item,
+                                filename=item.name,
+                                size_bytes=st.st_size,
+                                modified_time=st.st_mtime,
+                                duration_seconds=duration,
+                                sample_rate=sr,
+                                channels=ch,
+                                bit_depth=bits,
+                                project_name="Root",
+                            )
+                        )
+                        seen_paths.add(resolved)
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+
+        entries.sort(key=lambda e: e.modified_time, reverse=True)
+        return entries
+
+    def delete_recording(
+        self, filepath: Path | str
+    ) -> Tuple[bool, str, int]:
+        """Delete a single WAV recording file inside /storage and return (ok, message, freed_bytes)."""
+        src_path = Path(filepath)
+        if not src_path.exists() or not src_path.is_file():
+            return (False, f"Recording file not found: {src_path.name}", 0)
+
+        if not self._is_valid_user_path_in_storage(src_path):
+            return (
+                False,
+                "Cannot delete files outside of /storage project directories.",
+                0,
+            )
+
+        try:
+            freed_bytes = max(0, int(src_path.stat().st_size))
+        except OSError:
+            freed_bytes = 0
+
+        try:
+            try:
+                os.chmod(src_path, 0o666)
+            except OSError:
+                pass
+            src_path.unlink()
+            return (
+                True,
+                f"Deleted '{src_path.name}' ({format_storage_bytes(freed_bytes)} freed).",
+                freed_bytes,
+            )
+        except OSError as exc:
+            logger.warning("Failed to delete recording %s: %s", src_path, exc)
+            return (False, f"Could not delete file: {exc}", 0)
+
+    def _resolve_user_project_dir(
+        self, project_name_or_path: Path | str
+    ) -> Tuple[Optional[Path], str]:
+        """Resolve and validate a project directory path inside /storage."""
+        if isinstance(project_name_or_path, Path):
+            candidate = project_name_or_path
+        else:
+            raw = str(project_name_or_path or "").strip()
+            if not raw:
+                return (None, "No project folder specified.")
+            p_obj = Path(raw)
+            if p_obj.is_absolute():
+                candidate = p_obj
+            else:
+                if "/" in raw or "\\" in raw or raw in (".", ".."):
+                    return (None, f"Invalid project folder name: {raw}")
+                candidate = self.storage_dir / raw
+
+        if self.is_protected_storage_name(candidate.name):
+            return (
+                None,
+                f"Folder '{candidate.name}' is a protected system directory and cannot be modified.",
+            )
+
+        if not candidate.exists() or not candidate.is_dir():
+            return (None, f"Project folder not found: {candidate.name}")
+
+        if not self._is_valid_user_path_in_storage(candidate):
+            return (
+                None,
+                "Project folder must be located directly inside /storage.",
+            )
+
+        try:
+            if candidate.resolve().parent != self.storage_dir.resolve():
+                return (
+                    None,
+                    "Target must be a top-level project folder inside /storage.",
+                )
+        except OSError:
+            return (None, "Could not resolve project folder path.")
+
+        return (candidate, "")
+
+    @staticmethod
+    def _measure_dir_contents(dir_path: Path) -> Tuple[int, int]:
+        """Return (total_files, total_bytes) recursively inside dir_path."""
+        file_count = 0
+        byte_count = 0
+        stack: List[Path] = [dir_path]
+        while stack:
+            curr = stack.pop()
+            try:
+                with os.scandir(curr) as it:
+                    for sub in it:
+                        try:
+                            if sub.is_symlink():
+                                continue
+                            if sub.is_dir(follow_symlinks=False):
+                                stack.append(Path(sub.path))
+                            elif sub.is_file(follow_symlinks=False):
+                                st = sub.stat(follow_symlinks=False)
+                                file_count += 1
+                                byte_count += max(0, int(st.st_size))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return (file_count, byte_count)
+
+    @staticmethod
+    def _chmod_writable_recursive(root_path: Path) -> None:
+        """Ensure all files/dirs under root_path are writable before removal."""
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            dp = Path(dirpath)
+            try:
+                os.chmod(dp, 0o777)
+            except OSError:
+                pass
+            for dname in dirnames:
+                try:
+                    os.chmod(dp / dname, 0o777)
+                except OSError:
+                    pass
+            for fname in filenames:
+                try:
+                    os.chmod(dp / fname, 0o666)
+                except OSError:
+                    pass
+
+    def cleanup_empty_project_folders(self) -> Tuple[bool, str, int]:
+        """Remove all empty project folders (containing 0 files and 0 subdirectories) in /storage."""
+        removed_names: List[str] = []
+        if not self.storage_dir.is_dir():
+            return (True, "No empty project folders to clean up.", 0)
+
+        for summary in self.list_project_folders():
+            if not summary.is_empty:
+                continue
+            folder = summary.folder_path
+            try:
+                # Only remove if directory has no entries at all
+                if any(folder.iterdir()):
+                    continue
+                try:
+                    os.chmod(folder, 0o777)
+                except OSError:
+                    pass
+                folder.rmdir()
+                removed_names.append(summary.project_name)
+            except OSError:
+                continue
+
+        count = len(removed_names)
+        if count == 0:
+            return (True, "No empty project folders found.", 0)
+        joined = ", ".join(f"{n}/" for n in removed_names)
+        return (
+            True,
+            f"Cleaned up {count} empty project folder(s): {joined}",
+            count,
+        )
+
+    def cleanup_project_folder(
+        self,
+        project_name_or_path: Path | str,
+        confirm_recursive: bool = False,
+    ) -> Tuple[bool, str, int]:
+        """Delete all recordings and files inside a project folder while keeping the folder itself.
+
+        Requires confirm_recursive=True as a safety guard against accidental recursive cleanup.
+        Returns (success, message, freed_bytes).
+        """
+        proj_dir, err = self._resolve_user_project_dir(project_name_or_path)
+        if proj_dir is None:
+            return (False, err, 0)
+
+        if not confirm_recursive:
+            return (
+                False,
+                "Extra confirmation is required before cleaning up all files in a project folder.",
+                0,
+            )
+
+        file_count, freed_bytes = self._measure_dir_contents(proj_dir)
+        if file_count == 0:
+            return (
+                True,
+                f"Project folder '{proj_dir.name}/' is already empty (0 B freed).",
+                0,
+            )
+
+        self._chmod_writable_recursive(proj_dir)
+        try:
+            for item in list(proj_dir.iterdir()):
+                if item.is_symlink() or item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item)
+            self.enforce_storage_permissions()
+            return (
+                True,
+                f"Cleaned up '{proj_dir.name}/' — deleted {file_count} file(s) ({format_storage_bytes(freed_bytes)} freed).",
+                freed_bytes,
+            )
+        except OSError as exc:
+            logger.warning("Failed to clean up project folder %s: %s", proj_dir, exc)
+            return (False, f"Could not clean up project folder: {exc}", 0)
+
+    def delete_project_folder(
+        self,
+        project_name_or_path: Path | str,
+        confirm_recursive: bool = False,
+    ) -> Tuple[bool, str, int]:
+        """Recursively delete a project folder and all of its contents from /storage.
+
+        Requires confirm_recursive=True as a safety guard against accidental recursive deletion.
+        Returns (success, message, freed_bytes).
+        """
+        proj_dir, err = self._resolve_user_project_dir(project_name_or_path)
+        if proj_dir is None:
+            return (False, err, 0)
+
+        if not confirm_recursive:
+            return (
+                False,
+                "Extra recursive deletion confirmation is required before deleting a project folder.",
+                0,
+            )
+
+        file_count, freed_bytes = self._measure_dir_contents(proj_dir)
+        self._chmod_writable_recursive(proj_dir)
+        try:
+            shutil.rmtree(proj_dir)
+            self.enforce_storage_permissions()
+            return (
+                True,
+                f"Deleted project folder '{proj_dir.name}/' and {file_count} file(s) ({format_storage_bytes(freed_bytes)} freed).",
+                freed_bytes,
+            )
+        except OSError as exc:
+            logger.warning("Failed to delete project folder %s: %s", proj_dir, exc)
+            return (False, f"Could not delete project folder: {exc}", 0)
 
     def get_storage_status(
         self,

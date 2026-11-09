@@ -513,3 +513,136 @@ def build_studio_clock_badge_style(scale: float = 1.0) -> str:
         f"font-family: monospace; font-weight: bold; font-size: {font_px}px;"
     )
 
+
+def build_playback_button_style(state: str, scale: float = 1.0) -> str:
+    """Return stylesheet for the recordings list Play / Pause / Resume control button."""
+    font_px = max(11, int(round(13 * scale)))
+    pad_v = max(4, int(round(6 * scale)))
+    pad_h = max(10, int(round(14 * scale)))
+    radius = max(4, int(round(6 * scale)))
+
+    if state == "playing":
+        return f"""
+        QPushButton {{
+            background-color: #0D2744;
+            color: #79C0FF;
+            border: 2px solid #58A6FF;
+            border-radius: {radius}px;
+            padding: {pad_v}px {pad_h}px;
+            font-size: {font_px}px;
+            font-weight: bold;
+        }}
+        QPushButton:hover {{
+            background-color: #13365C;
+            border-color: #79C0FF;
+        }}
+        QPushButton:pressed {{
+            background-color: #091B30;
+        }}
+        QPushButton:disabled {{
+            background-color: #161B22;
+            color: #484F58;
+            border-color: #21262D;
+        }}
+        """
+
+    if state == "paused":
+        return f"""
+        QPushButton {{
+            background-color: #341A04;
+            color: #FFDF5D;
+            border: 2px solid #D29922;
+            border-radius: {radius}px;
+            padding: {pad_v}px {pad_h}px;
+            font-size: {font_px}px;
+            font-weight: bold;
+        }}
+        QPushButton:hover {{
+            background-color: #4A2506;
+            border-color: #F0B72F;
+        }}
+        QPushButton:pressed {{
+            background-color: #261202;
+        }}
+        QPushButton:disabled {{
+            background-color: #161B22;
+            color: #484F58;
+            border-color: #21262D;
+        }}
+        """
+
+    return f"""
+    QPushButton {{
+        background-color: #1F242C;
+        color: #E6EDF3;
+        border: 1px solid #30363D;
+        border-radius: {radius}px;
+        padding: {pad_v}px {pad_h}px;
+        font-size: {font_px}px;
+        font-weight: 600;
+    }}
+    QPushButton:hover {{
+        background-color: #292F3A;
+        border-color: #58A6FF;
+    }}
+    QPushButton:pressed {{
+        background-color: #161B22;
+    }}
+    QPushButton:disabled {{
+        background-color: #161B22;
+        color: #484F58;
+        border-color: #21262D;
+    }}
+    """
+
+
+def build_stop_playback_button_style(active: bool, scale: float = 1.0) -> str:
+    """Return stylesheet for the recordings list Stop playback button."""
+    font_px = max(11, int(round(13 * scale)))
+    pad_v = max(4, int(round(6 * scale)))
+    pad_h = max(10, int(round(14 * scale)))
+    radius = max(4, int(round(6 * scale)))
+
+    if active:
+        return f"""
+        QPushButton {{
+            background-color: #3D1114;
+            color: #FFA198;
+            border: 2px solid #F85149;
+            border-radius: {radius}px;
+            padding: {pad_v}px {pad_h}px;
+            font-size: {font_px}px;
+            font-weight: bold;
+        }}
+        QPushButton:hover {{
+            background-color: #54171C;
+            border-color: #FF7B72;
+        }}
+        QPushButton:pressed {{
+            background-color: #2B0B0E;
+        }}
+        QPushButton:disabled {{
+            background-color: #161B22;
+            color: #484F58;
+            border-color: #21262D;
+        }}
+        """
+
+    return f"""
+    QPushButton {{
+        background-color: #1F242C;
+        color: #E6EDF3;
+        border: 1px solid #30363D;
+        border-radius: {radius}px;
+        padding: {pad_v}px {pad_h}px;
+        font-size: {font_px}px;
+        font-weight: 600;
+    }}
+    QPushButton:disabled {{
+        background-color: #161B22;
+        color: #484F58;
+        border-color: #21262D;
+    }}
+    """
+
+
