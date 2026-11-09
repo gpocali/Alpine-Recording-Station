@@ -499,3 +499,17 @@ def build_system_resource_badge_style(level: str, scale: float = 1.0) -> str:
         f"border-radius: {radius}px; padding: {pad_v}px {pad_h}px; "
         f"font-family: monospace; font-weight: 600; font-size: {font_px}px;"
     )
+
+
+def build_studio_clock_badge_style(scale: float = 1.0) -> str:
+    """Return stylesheet for the compact studio clock badge in the status strip."""
+    font_px = max(12, int(round(15 * scale)))
+    pad_v = max(2, int(round(3 * scale)))
+    pad_h = max(10, int(round(14 * scale)))
+    radius = max(5, int(round(6 * scale)))
+    return (
+        f"background-color: #161B22; color: #F0F6FC; border: 1px solid #30363D; "
+        f"border-radius: {radius}px; padding: {pad_v}px {pad_h}px; "
+        f"font-family: monospace; font-weight: bold; font-size: {font_px}px;"
+    )
+

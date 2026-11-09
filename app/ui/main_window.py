@@ -32,6 +32,7 @@ from app.audio_engine import AudioDeviceCapabilities, AudioEngine
 from app.config_manager import (
     ConfigManager,
     RecordingEntry,
+    format_clock_display,
     generate_recording_filename,
     sanitize_project_name,
 )
@@ -49,6 +50,7 @@ from app.ui.styles import (
     build_main_stylesheet,
     build_pause_record_button_style,
     build_record_button_style,
+    build_studio_clock_badge_style,
     build_system_resource_badge_style,
     build_talkback_button_style,
     compute_scale_factor,
@@ -377,7 +379,9 @@ class HelpDialog(QDialog):
                 "Mono track or Studio Mode Left/Right tracks.<br>"
                 "• <b>Talkback Tone Frequency && Durations:</b> Customize the marker tone pitch (330 Hz to 1000 Hz) "
                 "and independent Press (default 1.0s) and Release (default 0.5s) durations.<br>"
-                "• <b>On-Screen Keyboard:</b> Enables or disables the pop-up touch keyboard for text fields."
+                "• <b>On-Screen Keyboard:</b> Enables or disables the pop-up touch keyboard for text fields.<br>"
+                "• <b>Studio Clock Display:</b> Choose 12-hour (AM/PM, default) or 24-hour clock format and "
+                "select your preferred regional date format (or hide the date)."
             ),
             self._build_section_card(
                 "SAMBA NETWORK SHARE ADMINISTRATION",
@@ -477,6 +481,7 @@ class MainWindow(QMainWindow):
         self._pause_blink_phase = True
         self._last_storage_refresh_monotonic: float = 0.0
         self._last_resource_refresh_monotonic: float = 0.0
+        self._last_clock_text: str = ""
         self.resource_monitor = SystemResourceMonitor()
         self._last_resource_status = SystemResourceStatus()
 
@@ -556,12 +561,21 @@ class MainWindow(QMainWindow):
 
         self.main_layout.addWidget(top_frame)
 
-        # 2. Hardware & Format Status Strip
+        # 2. Hardware, Studio Clock & Format Status Strip
         status_row = QHBoxLayout()
         status_row.setContentsMargins(4, 0, 4, 0)
+        status_row.setSpacing(12)
         self.hw_status_label = QLabel()
         self.hw_status_label.setStyleSheet("color: #58A6FF; font-weight: 600;")
         status_row.addWidget(self.hw_status_label, stretch=1)
+
+        self.clock_label = QLabel()
+        self.clock_label.setObjectName("StudioClockBadge")
+        self.clock_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.clock_label.setToolTip(
+            "Current local studio date and time (configure 12h/24h time and regional date format in Settings [F2])"
+        )
+        status_row.addWidget(self.clock_label)
 
         self.format_badge_label = QLabel()
         self.format_badge_label.setAlignment(
@@ -570,7 +584,7 @@ class MainWindow(QMainWindow):
         self.format_badge_label.setStyleSheet(
             "color: #8B949E; font-family: monospace; font-weight: bold;"
         )
-        status_row.addWidget(self.format_badge_label)
+        status_row.addWidget(self.format_badge_label, stretch=1)
         self.main_layout.addLayout(status_row)
 
         # 3. Center Studio Deck: Elapsed Time Counter + Record/Pause/Stop + Talkback Button
@@ -752,6 +766,7 @@ class MainWindow(QMainWindow):
         self.main_layout.addWidget(self.bottom_bar_frame)
 
         self._update_filename_preview()
+        self._refresh_clock_display(force=True)
         self._refresh_system_resources()
 
     # -------------------------------------------------------------------------
@@ -796,6 +811,7 @@ class MainWindow(QMainWindow):
 
         self.vu_meter.apply_scale(self._scale)
         self.storage_monitor.apply_scale(self._scale)
+        self.clock_label.setStyleSheet(build_studio_clock_badge_style(self._scale))
         self.sys_resource_label.setStyleSheet(
             build_system_resource_badge_style(self._last_resource_status.level, self._scale)
         )
@@ -1115,6 +1131,17 @@ class MainWindow(QMainWindow):
             blink_on=self._pause_blink_phase,
         )
         self._last_storage_refresh_monotonic = time.monotonic()
+
+    def _refresh_clock_display(self, force: bool = False) -> None:
+        """Update the compact studio clock in the status strip using configured time and date formats."""
+        settings = self.config_manager.settings
+        text = format_clock_display(
+            time_format=getattr(settings, "clock_time_format", "12h"),
+            date_format=getattr(settings, "clock_date_format", "YYYY-MM-DD"),
+        )
+        if force or text != self._last_clock_text:
+            self._last_clock_text = text
+            self.clock_label.setText(text)
 
     def _refresh_system_resources(self) -> None:
         """Sample live system CPU and RAM usage and update the bottom bar indicator."""
@@ -1436,6 +1463,7 @@ class MainWindow(QMainWindow):
         self._sync_hardware_state(force_probe=True)
         self._refresh_recordings_list()
         self.ip_bar_label.setText(get_primary_ip_display())
+        self._refresh_clock_display(force=True)
         self._refresh_system_resources()
 
     def _open_help_dialog(self) -> None:
@@ -1456,6 +1484,7 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self._sync_hardware_state()
             self._refresh_recordings_list()
+            self._refresh_clock_display(force=True)
         elif getattr(dlg, "exit_to_console_requested", False):
             self.close()
 
@@ -1466,6 +1495,7 @@ class MainWindow(QMainWindow):
         is_rec = self.audio_engine.is_recording
         is_rec_paused = self.audio_engine.is_record_paused
         self._refresh_vu_meter()
+        self._refresh_clock_display()
 
         # Detect asynchronous changes from Remote Producer (talkback, client connection, or mute state)
         tb_now = self.audio_engine.talkback_active

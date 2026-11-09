@@ -47,6 +47,78 @@ TALKBACK_TONE_DURATION_OPTIONS: tuple[float, ...] = (
     3.0,
 )
 
+CLOCK_TIME_FORMAT_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("12h", "12-Hour (e.g. 08:05:30 PM — Default)"),
+    ("24h", "24-Hour (e.g. 20:05:30)"),
+)
+
+CLOCK_DATE_FORMAT_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("YYYY-MM-DD", "YYYY-MM-DD (ISO / International — e.g. 2026-11-08)"),
+    ("MM/DD/YYYY", "MM/DD/YYYY (Month/Day/Year — e.g. 11/08/2026)"),
+    ("DD/MM/YYYY", "DD/MM/YYYY (Day/Month/Year — e.g. 08/11/2026)"),
+    ("DD.MM.YYYY", "DD.MM.YYYY (Day.Month.Year — e.g. 08.11.2026)"),
+    ("DD MMM YYYY", "DD MMM YYYY (e.g. 08 Nov 2026)"),
+    ("MMM DD, YYYY", "MMM DD, YYYY (e.g. Nov 08, 2026)"),
+    ("none", "Time Only (Hide Date)"),
+)
+
+_MONTH_ABBR: tuple[str, ...] = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+
+
+def format_clock_display(
+    time_format: str = "12h",
+    date_format: str = "YYYY-MM-DD",
+    dt: Optional[datetime.datetime] = None,
+) -> str:
+    """Format current local date and time for the studio clock according to user settings."""
+    if dt is None:
+        dt = datetime.datetime.now().astimezone()
+    elif dt.tzinfo is None:
+        dt = dt.astimezone()
+
+    tf = str(time_format or "12h").strip().lower()
+    if tf == "24h":
+        time_str = f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+    else:
+        hour_12 = dt.hour % 12 or 12
+        ampm = "AM" if dt.hour < 12 else "PM"
+        time_str = f"{hour_12:02d}:{dt.minute:02d}:{dt.second:02d} {ampm}"
+
+    df = str(date_format if date_format is not None else "YYYY-MM-DD").strip()
+    if df.lower() == "none" or not df:
+        date_str = ""
+    elif df == "MM/DD/YYYY":
+        date_str = f"{dt.month:02d}/{dt.day:02d}/{dt.year:04d}"
+    elif df == "DD/MM/YYYY":
+        date_str = f"{dt.day:02d}/{dt.month:02d}/{dt.year:04d}"
+    elif df == "DD.MM.YYYY":
+        date_str = f"{dt.day:02d}.{dt.month:02d}.{dt.year:04d}"
+    elif df == "DD MMM YYYY":
+        m_abbr = _MONTH_ABBR[max(0, min(11, dt.month - 1))]
+        date_str = f"{dt.day:02d} {m_abbr} {dt.year:04d}"
+    elif df == "MMM DD, YYYY":
+        m_abbr = _MONTH_ABBR[max(0, min(11, dt.month - 1))]
+        date_str = f"{m_abbr} {dt.day:02d}, {dt.year:04d}"
+    else:
+        date_str = f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
+
+    if date_str:
+        return f"{date_str}  •  {time_str}"
+    return time_str
+
 
 def sanitize_project_name(name: str) -> str:
     """Sanitize a project name so it is safe for filenames on Linux and Windows/Samba.
@@ -92,6 +164,8 @@ class RecorderSettings:
     studio_mode: bool = False  # True = Studio Mode (Stereo output, L=Mic, R=Talkback+Tone)
     project_name: str = "Session"
     on_screen_keyboard: bool = True  # True = Show touch on-screen keyboard for text inputs
+    clock_time_format: str = "12h"  # '12h' (Default) or '24h'
+    clock_date_format: str = "YYYY-MM-DD"  # Regionally agnostic date format or 'none'
     talkback_tone_hz: float = 1000.0
     talkback_tone_duration_sec: float = 1.0
     talkback_release_tone_duration_sec: float = 0.5

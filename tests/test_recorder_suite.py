@@ -26,6 +26,7 @@ from app.audio_engine import (
 from app.config_manager import (
     ConfigManager,
     compute_wav_byte_rate,
+    format_clock_display,
     format_remaining_hms,
     format_remaining_time,
     format_storage_bytes,
@@ -347,6 +348,72 @@ class TestConfigAndProjectFiltering(unittest.TestCase):
             self.assertEqual(cm2.settings.talkback_tone_duration_sec, 1.5)
             self.assertEqual(cm2.settings.talkback_release_tone_duration_sec, 0.75)
             self.assertFalse(cm2.settings.on_screen_keyboard)
+            self.assertEqual(cm2.settings.clock_time_format, "12h")
+            self.assertEqual(cm2.settings.clock_date_format, "YYYY-MM-DD")
+
+            cm2.settings.clock_time_format = "24h"
+            cm2.settings.clock_date_format = "DD/MM/YYYY"
+            cm2.save()
+
+            cm3 = ConfigManager(storage_dir=str(storage), etc_config_dir=str(etc))
+            self.assertEqual(cm3.settings.clock_time_format, "24h")
+            self.assertEqual(cm3.settings.clock_date_format, "DD/MM/YYYY")
+
+    def test_studio_clock_time_and_regional_date_formatting(self) -> None:
+        tz = datetime.timezone(datetime.timedelta(hours=-5), name="EST")
+        dt_pm = datetime.datetime(2026, 11, 8, 20, 5, 30, tzinfo=tz)
+        dt_midnight = datetime.datetime(2026, 1, 15, 0, 9, 4, tzinfo=tz)
+        dt_noon = datetime.datetime(2026, 7, 4, 12, 0, 0, tzinfo=tz)
+
+        # Default: 12-hour with YYYY-MM-DD
+        self.assertEqual(
+            format_clock_display(dt=dt_pm),
+            "2026-11-08  •  08:05:30 PM",
+        )
+        self.assertEqual(
+            format_clock_display(time_format="12h", date_format="YYYY-MM-DD", dt=dt_midnight),
+            "2026-01-15  •  12:09:04 AM",
+        )
+        self.assertEqual(
+            format_clock_display(time_format="12h", date_format="YYYY-MM-DD", dt=dt_noon),
+            "2026-07-04  •  12:00:00 PM",
+        )
+
+        # 24-hour option
+        self.assertEqual(
+            format_clock_display(time_format="24h", date_format="YYYY-MM-DD", dt=dt_pm),
+            "2026-11-08  •  20:05:30",
+        )
+        self.assertEqual(
+            format_clock_display(time_format="24h", date_format="YYYY-MM-DD", dt=dt_midnight),
+            "2026-01-15  •  00:09:04",
+        )
+
+        # Regional date formats
+        self.assertEqual(
+            format_clock_display(time_format="12h", date_format="MM/DD/YYYY", dt=dt_pm),
+            "11/08/2026  •  08:05:30 PM",
+        )
+        self.assertEqual(
+            format_clock_display(time_format="24h", date_format="DD/MM/YYYY", dt=dt_pm),
+            "08/11/2026  •  20:05:30",
+        )
+        self.assertEqual(
+            format_clock_display(time_format="24h", date_format="DD.MM.YYYY", dt=dt_pm),
+            "08.11.2026  •  20:05:30",
+        )
+        self.assertEqual(
+            format_clock_display(time_format="12h", date_format="DD MMM YYYY", dt=dt_pm),
+            "08 Nov 2026  •  08:05:30 PM",
+        )
+        self.assertEqual(
+            format_clock_display(time_format="12h", date_format="MMM DD, YYYY", dt=dt_pm),
+            "Nov 08, 2026  •  08:05:30 PM",
+        )
+        self.assertEqual(
+            format_clock_display(time_format="12h", date_format="none", dt=dt_pm),
+            "08:05:30 PM",
+        )
 
     def test_recursive_storage_permission_masking(self) -> None:
         import os
@@ -918,6 +985,8 @@ class TestUiGlyphsAndButtonMnemonics(unittest.TestCase):
             try:
                 self.assertFalse(hasattr(win, "mode_toggle_btn"))
                 self.assertTrue(hasattr(win, "project_prefix_btn"))
+                self.assertTrue(hasattr(win, "clock_label"))
+                self.assertTrue(len(win.clock_label.text()) > 0)
                 self.assertTrue(hasattr(win, "sys_resource_label"))
                 self.assertIn("CPU:", win.sys_resource_label.text())
                 self.assertIn("RAM:", win.sys_resource_label.text())

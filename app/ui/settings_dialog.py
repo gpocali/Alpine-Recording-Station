@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import (
 
 from app.audio_engine import AudioDeviceCapabilities, AudioEngine
 from app.config_manager import (
+    CLOCK_DATE_FORMAT_OPTIONS,
+    CLOCK_TIME_FORMAT_OPTIONS,
     TALKBACK_TONE_DURATION_OPTIONS,
     TALKBACK_TONE_FREQ_OPTIONS,
     ConfigManager,
@@ -277,6 +279,34 @@ class SettingsDialog(QDialog):
         self.osk_combo.currentIndexChanged.connect(self._on_osk_setting_changed)
         form.addRow("On-Screen Keyboard:", self.osk_combo)
 
+        clock_row = QHBoxLayout()
+        clock_row.setContentsMargins(0, 0, 0, 0)
+        clock_row.setSpacing(10)
+
+        time_fmt_lbl = QLabel("Time:")
+        clock_row.addWidget(time_fmt_lbl)
+
+        self.clock_time_format_combo = QComboBox()
+        for fmt_key, fmt_label in CLOCK_TIME_FORMAT_OPTIONS:
+            self.clock_time_format_combo.addItem(fmt_label, fmt_key)
+        self.clock_time_format_combo.setToolTip(
+            "Select 12-hour (AM/PM, Default) or 24-hour clock format for the Studio UI"
+        )
+        clock_row.addWidget(self.clock_time_format_combo, stretch=1)
+
+        date_fmt_lbl = QLabel("Date:")
+        clock_row.addWidget(date_fmt_lbl)
+
+        self.clock_date_format_combo = QComboBox()
+        for dfmt_key, dfmt_label in CLOCK_DATE_FORMAT_OPTIONS:
+            self.clock_date_format_combo.addItem(dfmt_label, dfmt_key)
+        self.clock_date_format_combo.setToolTip(
+            "Select regional date format shown next to the Studio Clock (or hide date)"
+        )
+        clock_row.addWidget(self.clock_date_format_combo, stretch=1)
+
+        form.addRow("Studio Clock Display:", clock_row)
+
         layout.addLayout(form)
 
         self.mode_hint_label = QLabel()
@@ -458,6 +488,16 @@ class SettingsDialog(QDialog):
         osk_idx = self.osk_combo.findData(bool(settings.on_screen_keyboard))
         self.osk_combo.setCurrentIndex(osk_idx if osk_idx >= 0 else 0)
         self.samba_osk_btn.setVisible(self._is_osk_enabled())
+
+        tf_idx = self.clock_time_format_combo.findData(
+            str(getattr(settings, "clock_time_format", "12h") or "12h")
+        )
+        self.clock_time_format_combo.setCurrentIndex(tf_idx if tf_idx >= 0 else 0)
+
+        df_idx = self.clock_date_format_combo.findData(
+            str(getattr(settings, "clock_date_format", "YYYY-MM-DD") or "YYYY-MM-DD")
+        )
+        self.clock_date_format_combo.setCurrentIndex(df_idx if df_idx >= 0 else 0)
 
         # Populate bit depth & sample rate for active input device
         self._update_capabilities_for_current_device(use_saved_values=True)
@@ -738,6 +778,10 @@ class SettingsDialog(QDialog):
             else 0.5
         )
         s.on_screen_keyboard = self._is_osk_enabled()
+        s.clock_time_format = str(self.clock_time_format_combo.currentData() or "12h")
+        s.clock_date_format = str(
+            self.clock_date_format_combo.currentData() or "YYYY-MM-DD"
+        )
 
         if dev_id:
             s.known_device_defaults[dev_id] = {
