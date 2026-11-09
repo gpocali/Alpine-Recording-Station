@@ -2373,5 +2373,262 @@ class TestStorageFileManagerAndRecursiveDeletion(unittest.TestCase):
                 app.processEvents()
 
 
+class TestSayoDevice1x4PLedController(unittest.TestCase):
+    """Tests for SayoDevice 1x4P (VID 0x8089) HID RGB & EV_LED status synchronization."""
+
+    def test_sayodevice_discovery_packet_framing_and_main_window_sync(self) -> None:
+        from app.sayodevice_led import (
+            COLOR_MIC_LIVE,
+            COLOR_MUTE_BLINK_OFF,
+            COLOR_MUTE_BLINK_ON,
+            COLOR_MUTE_TB_OVERRIDE,
+            COLOR_OFF,
+            COLOR_PAUSE_ARMED,
+            COLOR_PAUSE_BLINK_OFF,
+            COLOR_PAUSE_BLINK_ON,
+            COLOR_PLAYBACK_ACTIVE,
+            COLOR_RECORD_ACTIVE,
+            COLOR_RECORD_PAUSED,
+            COLOR_RECORD_READY,
+            COLOR_TALKBACK_ACTIVE,
+            COLOR_TALKBACK_READY,
+            EV_LED,
+            EV_SYN,
+            INPUT_EVENT_STRUCT,
+            LED_CAPSL,
+            LED_COMPOSE,
+            LED_KANA,
+            LED_NUML,
+            LED_SCROLLL,
+            SayoDeviceLedController,
+            SayoStudioState,
+            build_linux_ev_led_events,
+            build_sayo_v1_led_key_packet,
+            build_sayo_v2_led_packet,
+            compute_sayo_v2_checksum,
+            parse_hid_report_descriptor,
+        )
+
+        # 1. Verify HID Report Descriptor parser extracts Usage Pages (0xFF00, 0xFF11, 0xFF12) and Report IDs (0x02, 0x21, 0x22)
+        sample_desc = bytes([
+            0x06, 0x11, 0xFF,  # Usage Page (0xFF11)
+            0x09, 0x01,        # Usage (0x01)
+            0xA1, 0x01,        # Collection (Application)
+            0x85, 0x21,        # Report ID (0x21)
+            0x06, 0x00, 0xFF,  # Usage Page (0xFF00)
+            0x85, 0x02,        # Report ID (0x02)
+            0xC0,              # End Collection
+        ])
+        ups, rids = parse_hid_report_descriptor(sample_desc)
+        self.assertEqual(ups, (0xFF11, 0xFF00))
+        self.assertEqual(rids, (0x21, 0x02))
+
+        # 2. Verify Sayo Protocol v1 64-byte RGB frame & checksum (never sends 0x04 save-to-flash)
+        pkt_v1 = build_sayo_v1_led_key_packet(2, 255, 110, 0)
+        self.assertEqual(len(pkt_v1), 64)
+        self.assertEqual(pkt_v1[0], 0x02)
+        self.assertEqual(pkt_v1[1], 0x07)  # RGB command, NOT 0x04 save
+        data_len = pkt_v1[2]
+        self.assertEqual(pkt_v1[3 : 3 + data_len], bytes([0x01, 2, 255, 110, 0]))
+        expected_chk = sum(pkt_v1[: 3 + data_len]) & 0xFF
+        self.assertEqual(pkt_v1[3 + data_len], expected_chk)
+
+        # 3. Verify Sayo Protocol v2 64-byte & 1024-byte `hid_packet_v2_t` framing and 16-bit word checksum
+        colors = (COLOR_RECORD_ACTIVE, COLOR_PAUSE_ARMED, COLOR_TALKBACK_ACTIVE, COLOR_MIC_LIVE)
+        pkt_v2_64 = build_sayo_v2_led_packet(colors, report_id=0x21, cmd_id=0x10)
+        self.assertEqual(len(pkt_v2_64), 64)
+        self.assertEqual(pkt_v2_64[0], 0x21)
+        self.assertEqual(pkt_v2_64[1], 0x03)
+        stored_chk = struct.unpack_from("<H", pkt_v2_64, 2)[0]
+        self.assertEqual(stored_chk, compute_sayo_v2_checksum(pkt_v2_64))
+
+        pkt_v2_1024 = build_sayo_v2_led_packet(colors, report_id=0x22, cmd_id=0x11)
+        self.assertEqual(len(pkt_v2_1024), 1024)
+        self.assertEqual(pkt_v2_1024[0], 0x22)
+        stored_chk_1024 = struct.unpack_from("<H", pkt_v2_1024, 2)[0]
+        self.assertEqual(stored_chk_1024, compute_sayo_v2_checksum(pkt_v2_1024))
+
+        # 4. Verify Linux EV_LED event packing (5 EV_LED events + 1 EV_SYN = 6 structs)
+        ev_bytes = build_linux_ev_led_events((True, False, True, False), timestamp=1700000000.5)
+        self.assertEqual(len(ev_bytes), INPUT_EVENT_STRUCT.size * 6)
+        unpacked = [
+            INPUT_EVENT_STRUCT.unpack_from(ev_bytes, i * INPUT_EVENT_STRUCT.size)
+            for i in range(6)
+        ]
+        self.assertEqual((unpacked[0][2], unpacked[0][3], unpacked[0][4]), (EV_LED, LED_NUML, 1))
+        self.assertEqual((unpacked[1][2], unpacked[1][3], unpacked[1][4]), (EV_LED, LED_CAPSL, 0))
+        self.assertEqual((unpacked[2][2], unpacked[2][3], unpacked[2][4]), (EV_LED, LED_SCROLLL, 1))
+        self.assertEqual((unpacked[3][2], unpacked[3][3], unpacked[3][4]), (EV_LED, LED_COMPOSE, 0))
+        self.assertEqual((unpacked[4][2], unpacked[4][3], unpacked[4][4]), (EV_LED, LED_KANA, 0))
+        self.assertEqual((unpacked[5][2], unpacked[5][3], unpacked[5][4]), (EV_SYN, 0, 0))
+
+        # 5. Verify 4-button color & indicator state machine across all studio states
+        st_ready = SayoStudioState(has_device=True)
+        self.assertEqual(
+            st_ready.compute_button_colors(),
+            (COLOR_RECORD_READY, COLOR_OFF, COLOR_TALKBACK_READY, COLOR_MIC_LIVE),
+        )
+        self.assertEqual(st_ready.compute_indicator_bits(), (False, False, False, False))
+
+        st_rec = SayoStudioState(has_device=True, is_recording=True)
+        self.assertEqual(
+            st_rec.compute_button_colors(),
+            (COLOR_RECORD_ACTIVE, COLOR_PAUSE_ARMED, COLOR_TALKBACK_READY, COLOR_MIC_LIVE),
+        )
+        self.assertEqual(st_rec.compute_indicator_bits(), (True, False, False, False))
+
+        st_paused_on = SayoStudioState(
+            has_device=True, is_recording=True, is_record_paused=True, blink_on=True
+        )
+        st_paused_off = SayoStudioState(
+            has_device=True, is_recording=True, is_record_paused=True, blink_on=False
+        )
+        self.assertEqual(
+            st_paused_on.compute_button_colors(),
+            (COLOR_RECORD_PAUSED, COLOR_PAUSE_BLINK_ON, COLOR_OFF, COLOR_MIC_LIVE),
+        )
+        self.assertEqual(
+            st_paused_off.compute_button_colors(),
+            (COLOR_RECORD_PAUSED, COLOR_PAUSE_BLINK_OFF, COLOR_OFF, COLOR_MIC_LIVE),
+        )
+        self.assertEqual(st_paused_on.compute_indicator_bits(), (False, True, False, False))
+        self.assertEqual(st_paused_off.compute_indicator_bits(), (False, False, False, False))
+
+        st_tb_and_mute = SayoStudioState(
+            has_device=True,
+            is_recording=True,
+            talkback_active=True,
+            is_mic_muted=True,
+            is_talkback_mute_override=True,
+            blink_on=True,
+        )
+        self.assertEqual(
+            st_tb_and_mute.compute_button_colors(),
+            (COLOR_RECORD_ACTIVE, COLOR_PAUSE_ARMED, COLOR_TALKBACK_ACTIVE, COLOR_MUTE_TB_OVERRIDE),
+        )
+
+        st_muted_on = SayoStudioState(has_device=True, is_mic_muted=True, blink_on=True)
+        st_muted_off = SayoStudioState(has_device=True, is_mic_muted=True, blink_on=False)
+        self.assertEqual(st_muted_on.compute_button_colors()[3], COLOR_MUTE_BLINK_ON)
+        self.assertEqual(st_muted_off.compute_button_colors()[3], COLOR_MUTE_BLINK_OFF)
+        self.assertEqual(st_muted_on.compute_indicator_bits(), (False, False, False, True))
+        self.assertEqual(st_muted_off.compute_indicator_bits(), (False, False, False, False))
+
+        st_play = SayoStudioState(has_device=True, is_playing=True, is_playback_paused=False)
+        self.assertEqual(st_play.compute_button_colors()[1], COLOR_PLAYBACK_ACTIVE)
+
+        # 6. End-to-end mocked sysfs discovery & MainWindow live state synchronization
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sys_hidraw = root / "sys_hidraw"
+            dev_hidraw = root / "dev"
+            sys_input = root / "sys_input"
+            dev_input = root / "dev_input"
+            dev_hidraw.mkdir(parents=True)
+            dev_input.mkdir(parents=True)
+
+            # Create mocked SayoDevice 1x4P vendor hidraw node (VID 8089, PID 0009)
+            h_dir = sys_hidraw / "hidraw2" / "device"
+            h_dir.mkdir(parents=True)
+            (h_dir / "uevent").write_text(
+                "DRIVER=hid-generic\nHID_ID=0003:00008089:00000009\nHID_NAME=SayoDevice 1x4P\n",
+                encoding="utf-8",
+            )
+            (h_dir / "report_descriptor").write_bytes(sample_desc)
+            (dev_hidraw / "hidraw2").write_bytes(b"")
+
+            # Create mocked SayoDevice 1x4P input event node supporting EV_LED (bit 0x11 -> 0x20000)
+            e_dir = sys_input / "event5" / "device"
+            (e_dir / "id").mkdir(parents=True)
+            (e_dir / "capabilities").mkdir(parents=True)
+            (e_dir / "id" / "vendor").write_text("8089\n", encoding="utf-8")
+            (e_dir / "id" / "product").write_text("0009\n", encoding="utf-8")
+            (e_dir / "name").write_text("SayoDevice 1x4P Keyboard\n", encoding="utf-8")
+            (e_dir / "capabilities" / "ev").write_text("120013\n", encoding="utf-8")
+            (dev_input / "event5").write_bytes(b"")
+
+            writes: list[tuple[Path, bytes]] = []
+            ctrl = SayoDeviceLedController(
+                sysfs_hidraw_root=sys_hidraw,
+                dev_hidraw_root=dev_hidraw,
+                sysfs_input_root=sys_input,
+                dev_input_root=dev_input,
+                background_worker=False,
+                write_fn=lambda p, data: writes.append((p, data)),
+            )
+            self.assertTrue(ctrl.is_connected)
+            self.assertIn("SayoDevice 1x4P", ctrl.device_summary)
+
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PyQt6.QtWidgets import QApplication
+            from app.ui.main_window import MainWindow
+
+            app = QApplication.instance() or QApplication([])
+            cm = ConfigManager(
+                storage_dir=root / "storage",
+                etc_config_dir=root / "etc",
+                commit_fn=lambda: True,
+            )
+            cm.load()
+            ae = AudioEngine(simulate_audio=True)
+            sm = SambaManager(commit_fn=lambda: True)
+            win = MainWindow(
+                config_manager=cm,
+                audio_engine=ae,
+                samba_manager=sm,
+                fullscreen=False,
+                sayo_led_controller=ctrl,
+            )
+            try:
+                # Initial ready state pushed to SayoDevice
+                self.assertGreater(len(writes), 0)
+                self.assertEqual(
+                    ctrl._last_pushed_colors,
+                    (COLOR_RECORD_READY, COLOR_OFF, COLOR_TALKBACK_READY, COLOR_MIC_LIVE),
+                )
+
+                # Start recording -> Button 0 turns Red, Button 1 turns Armed Amber
+                win._on_record_button_clicked()
+                self.assertTrue(ae.is_recording)
+                self.assertEqual(
+                    ctrl._last_pushed_colors,
+                    (COLOR_RECORD_ACTIVE, COLOR_PAUSE_ARMED, COLOR_TALKBACK_READY, COLOR_MIC_LIVE),
+                )
+                self.assertEqual(ctrl._last_pushed_indicators, (True, False, False, False))
+
+                # Hold Talkback during recording -> Button 2 turns Bright Orange
+                win._on_talkback_pressed()
+                self.assertEqual(ctrl._last_pushed_colors[2], COLOR_TALKBACK_ACTIVE)
+                self.assertEqual(ctrl._last_pushed_indicators, (True, False, True, False))
+                win._on_talkback_released()
+                self.assertEqual(ctrl._last_pushed_colors[2], COLOR_TALKBACK_READY)
+
+                # Pause recording -> Button 0 turns Amber-Red, Button 1 flashes Gold
+                win._on_pause_record_button_clicked()
+                self.assertTrue(ae.is_record_paused)
+                self.assertEqual(
+                    ctrl._last_pushed_colors,
+                    (COLOR_RECORD_PAUSED, COLOR_PAUSE_BLINK_ON, COLOR_OFF, COLOR_MIC_LIVE),
+                )
+
+                # Stop recording -> returns to Ready Green
+                win._on_record_button_clicked()
+                self.assertFalse(ae.is_recording)
+                self.assertEqual(ctrl._last_pushed_colors[0], COLOR_RECORD_READY)
+
+                # Hold Cough Mute -> Button 3 turns Flashing Red
+                win._on_cough_privacy_pressed()
+                self.assertEqual(ctrl._last_pushed_colors[3], COLOR_MUTE_BLINK_ON)
+                self.assertEqual(ctrl._last_pushed_indicators[3], True)
+            finally:
+                win.close()
+                app.processEvents()
+                # Closing MainWindow turns all SayoDevice LEDs off
+                self.assertEqual(
+                    ctrl._last_pushed_colors,
+                    (COLOR_OFF, COLOR_OFF, COLOR_OFF, COLOR_OFF),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

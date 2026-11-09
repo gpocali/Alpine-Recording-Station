@@ -248,6 +248,16 @@ run_doctor() {
         log_warn "/proc/asound/cards not present (is snd-usb-audio loaded?)."
     fi
 
+    # 5b. Check optional SayoDevice 1x4P USB Macro Pad (VID 0x8089)
+    if command -v python3 >/dev/null 2>&1; then
+        if PYTHONPATH="${APP_DIR}" python3 -m app.sayodevice_led >/dev/null 2>&1; then
+            log_ok "SayoDevice 1x4P USB macro pad detected (run 'alpine-recorder sayo-test' to cycle LEDs):"
+            PYTHONPATH="${APP_DIR}" python3 -m app.sayodevice_led 2>/dev/null | sed 's/^/       /'
+        else
+            log_info "Optional SayoDevice 1x4P macro pad (VID 0x8089) not currently plugged in."
+        fi
+    fi
+
     # 6. Check /storage directory, mount status, and persistent APK cache
     mkdir -p /storage 2>/dev/null || true
     if ! mountpoint -q /storage 2>/dev/null; then
@@ -494,6 +504,9 @@ case "$cmd" in
     doctor|diagnose)
         run_doctor
         ;;
+    sayo-test|sayo)
+        PYTHONPATH="${APP_DIR}" /usr/bin/python3 -m app.sayodevice_led --test
+        ;;
     fix-packages|restore-packages)
         ensure_runtime_packages
         ;;
@@ -512,7 +525,8 @@ case "$cmd" in
         echo "  enable           Enable automatic post-boot startup via OpenRC"
         echo "  disable          Disable automatic post-boot startup (manual mode for troubleshooting)"
         echo "  logs             Show recent application and Xorg log output"
-        echo "  doctor           Run system, X11, PyQt6, ALSA, and /storage diagnostics"
+        echo "  doctor           Run system, X11, PyQt6, ALSA, SayoDevice, and /storage diagnostics"
+        echo "  sayo-test        Probe SayoDevice 1x4P (VID 0x8089) and run a 4-button LED test cycle"
         echo "  fix-packages     Restore and cache missing X11/PyQt6 packages across diskless reboots"
         echo "  recover          Emergency recovery: stop Xorg, restore tty1 login, switch to tty1"
         ;;

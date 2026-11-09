@@ -54,6 +54,7 @@ from app.network_info import (
 )
 from app.remote_producer import RemoteProducerServer
 from app.samba_manager import SambaManager
+from app.sayodevice_led import SayoDeviceLedController
 from app.ui.file_manager_dialog import (
     DeleteFileConfirmDialog,
     StorageFileManagerDialog,
@@ -751,6 +752,16 @@ class HelpDialog(QDialog):
                 "Mute Toggle is active, the button displays <b>Muted</b>, flashes bright red, and the "
                 "VU meter goes silent to confirm no microphone input is being taken."
             ),
+            self._build_section_card(
+                "SAYODEVICE 1x4P HARDWARE PUNCH PAD & LED SYNC",
+                "Automatically detects a USB <b>SayoDevice 1x4P</b> (VID <code>0x8089</code>) macro pad "
+                "mapped to <code>[R]</code>, <code>[P]</code>, <code>[T]</code>, and <code>[B]</code> and "
+                "synchronizes its 4 button LEDs in real time with the software state:<br>"
+                "• <b>Button 1 [R — Record / Stop]:</b> Green (Ready), Bright Red (Recording), Amber-Red (Paused), Off (No Interface).<br>"
+                "• <b>Button 2 [P — Pause / Play]:</b> Flashing Gold (Paused), Warm Dim (Armed while Recording), Blue (Playing Take), Off (Idle).<br>"
+                "• <b>Button 3 [T — Talkback]:</b> Bright Orange (Talkback Active), Dim Teal (Ready), Off (Disabled).<br>"
+                "• <b>Button 4 [B — Cough / Mute]:</b> Flashing Red (Muted), Cyan (Talkback Unmute Override), Green (Mic Live)."
+            ),
         ])
         tabs.addTab(tab_controls, "Studio Controls")
 
@@ -905,12 +916,18 @@ class MainWindow(QMainWindow):
         fullscreen: bool = True,
         remote_producer_server: Optional[RemoteProducerServer] = None,
         ssl_manager: Optional[object] = None,
+        sayo_led_controller: Optional[SayoDeviceLedController] = None,
     ) -> None:
         super().__init__()
         self.config_manager = config_manager
         self.audio_engine = audio_engine
         self.samba_manager = samba_manager
         self._fullscreen_requested = fullscreen
+        self.sayo_led_controller = (
+            sayo_led_controller
+            if sayo_led_controller is not None
+            else SayoDeviceLedController()
+        )
 
         # Sync initial Talent Mic Send (Privacy / Cough) state from saved settings
         self.audio_engine.set_talent_mic_send_enabled(
@@ -1650,6 +1667,25 @@ class MainWindow(QMainWindow):
         self._refresh_vu_meter()
         self._refresh_storage_status()
         self._update_playback_buttons_state()
+        self._sync_sayodevice_leds()
+
+    def _sync_sayodevice_leds(self) -> None:
+        """Synchronize the 4 button LEDs on a connected SayoDevice 1x4P with the live studio state."""
+        is_mute_active = bool(
+            self.audio_engine.talent_cough_muted
+            or not self.audio_engine.talent_mic_send_enabled
+        )
+        self.sayo_led_controller.update_state(
+            has_device=(self._active_input_device is not None),
+            is_recording=self.audio_engine.is_recording,
+            is_record_paused=self.audio_engine.is_record_paused,
+            talkback_active=self.audio_engine.talkback_active,
+            is_mic_muted=is_mute_active,
+            is_talkback_mute_override=self.audio_engine.is_talkback_mute_override,
+            is_playing=self.audio_engine.is_playing,
+            is_playback_paused=self.audio_engine.is_paused,
+            blink_on=self._pause_blink_phase,
+        )
 
     def _refresh_vu_meter(self) -> None:
         readings = self.audio_engine.get_vu_readings()
@@ -2350,14 +2386,17 @@ class MainWindow(QMainWindow):
             self.playback_status_label.setStyleSheet(
                 "color: #8B949E; font-family: monospace;"
             )
+        self._sync_sayodevice_leds()
 
     def _on_manual_refresh(self) -> None:
         self.config_manager._ensure_storage_mounted(force=True)
+        self.sayo_led_controller.rescan_devices()
         self._sync_hardware_state(force_probe=True)
         self._refresh_recordings_list()
         self.ip_bar_label.setText(get_primary_ip_display())
         self._refresh_clock_display(force=True)
         self._refresh_system_resources()
+        self._sync_sayodevice_leds()
 
     def _open_help_dialog(self) -> None:
         dlg = HelpDialog(parent=self)
@@ -2467,8 +2506,11 @@ class MainWindow(QMainWindow):
         self._update_filename_preview()
         self.config_manager.enforce_storage_permissions()
         self._refresh_storage_status()
+        self.sayo_led_controller.rescan_devices()
         if not self.audio_engine.is_recording and not self.audio_engine.is_playing:
             self._sync_hardware_state()
+        else:
+            self._sync_sayodevice_leds()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
@@ -2577,6 +2619,7 @@ class MainWindow(QMainWindow):
         super().keyReleaseEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.sayo_led_controller.close()
         self.remote_producer_server.stop()
         self.audio_engine.stop_monitoring()
         self.audio_engine.stop_recording()

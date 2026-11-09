@@ -54,6 +54,14 @@ An optimized **Alpine Linux** kiosk configuration and fullscreen studio applicat
   - Built-in responsive touch keyboard for strictly touchscreen kiosk deployments—pops up automatically when tapping the **Project Prefix** field, **Samba Share Administration** username/password fields, or any other text input (plus dedicated `⌨` launch buttons).
   - Includes full QWERTY, numeric, and symbol layers (`?123`), `Shift`, `Caps Lock`, cursor movement, `Clear`, password visibility toggle (`👁 Show` / `🙈 Hide`), and `Next Field ⇥` navigation across multi-field forms.
   - Can be **enabled or disabled in Settings** (`Audio & Recording Settings` → `On-Screen Keyboard`, or via `./install.sh --disable-osk` / `--no-osk`) when a physical hardware keyboard is attached.
+- **SayoDevice 1x4P Hardware Punch Pad & Real-Time LED Status Sync**:
+  - Automatically detects a USB **SayoDevice 1x4P** (or compatible `VID 0x8089` 4-key macro pad) mapped to `R` (Record/Stop), `P` (Pause/Resume), `T` (Talkback), and `B` (Cough/Privacy Mute).
+  - Synchronizes the 4 hardware button LEDs in real time with the live software status using both direct volatile-RAM USB HID RGB packets (`/dev/hidraw*`, Protocol v1 `0x02`/`0x07` and Protocol v2 `0x21`/`0x22` `0x10`/`0x11` without wearing out flash memory) and isolated hardware `EV_LED` indicator events (`/dev/input/event*` `LED_NUML`, `LED_CAPSL`, `LED_SCROLLL`, `LED_COMPOSE`/`LED_KANA` without affecting main keyboard Caps/Num Lock):
+    - **Key 1 (`R` — Record / Stop)**: `Green` (Ready), `Bright Red` (Recording), `Amber-Red` (Paused), `Off` (No Audio Interface).
+    - **Key 2 (`P` — Pause / Resume / Play)**: `Flashing Gold` (Recording Paused), `Warm Dim` (Armed while Recording), `Blue` (Playing Reference Take), `Off` (Idle).
+    - **Key 3 (`T` — Talkback)**: `Bright Orange` (Talkback Active — local or remote producer), `Dim Teal` (Available), `Off` (Disabled).
+    - **Key 4 (`B` — Cough / Mute)**: `Flashing Red` (Mic Muted), `Cyan` (Talkback Unmute Override), `Green` (Mic Live).
+  - Includes automatic 4-second USB hotplug detection and a CLI LED test cycle (`alpine-recorder sayo-test`).
 - **Post-Boot OpenRC Service on VT7 & Independent `tty1` Console Recovery**:
   - Launches **after** the system boot process completes via a dedicated OpenRC service (`/etc/init.d/alpine-recorder`) on **`VT7`** (`Ctrl+Alt+F7`), leaving **`tty1`–`tty6`** (`Ctrl+Alt+F1`) untouched as standard Linux login consoles for troubleshooting and recovery.
   - Includes crash-loop protection: if Xorg or display drivers fail to initialize, the service stops retrying and logs detailed diagnostics to `/var/log/alpine-recorder.log` and `/var/log/alpine-recorder-xorg.log` without interfering with console login.
@@ -137,7 +145,8 @@ If you previously installed an older revision that used `/etc/inittab` autologin
 Once logged in on `tty1` (`Ctrl+Alt+F1`) or over SSH, use `alpine-recorder` to manage and troubleshoot the kiosk:
 
 ```sh
-alpine-recorder doctor        # Check display nodes (/dev/dri, /dev/fb), Xorg, PyQt6, ALSA & /storage
+alpine-recorder doctor        # Check display nodes (/dev/dri, /dev/fb), Xorg, PyQt6, ALSA, SayoDevice & /storage
+alpine-recorder sayo-test     # Probe SayoDevice 1x4P (VID 0x8089) and run a 4-button LED test cycle
 alpine-recorder fix-packages  # Restore and cache missing X11/PyQt6 packages across diskless reboots
 alpine-recorder logs          # View recent errors from /var/log/alpine-recorder.log and Xorg logs
 alpine-recorder status        # Check OpenRC service status, running PIDs, and recent logs
@@ -167,6 +176,7 @@ alpine-recorder recover       # Emergency recovery: stop Xorg, clean tty1 config
 - [`app/qr_code.py`](app/qr_code.py) — Pure-Python ISO/IEC 18004 QR Code matrix and SVG generator for session invite links.
 - [`app/ssl_manager.py`](app/ssl_manager.py) — Default X.509 v3 self-signed certificate generator and `/storage/ssl` issued-certificate importer.
 - [`app/remote_producer.py`](app/remote_producer.py) — HTTPS + RFC 6455 WebSocket server, session-bound authenticator, and stripped-down Guided VO Remote Producer web console.
+- [`app/sayodevice_led.py`](app/sayodevice_led.py) — Hotplug-aware USB HID (`/dev/hidraw*`) & Linux `EV_LED` (`/dev/input/event*`) status LED controller for the SayoDevice 1x4P macro pad.
 - [`app/ui/main_window.py`](app/ui/main_window.py) — Responsive fullscreen PyQt6 studio interface.
 - [`app/ui/file_manager_dialog.py`](app/ui/file_manager_dialog.py) — Fullscreen Storage File Manager across all projects with file playback/renaming/deletion, 2-step confirmed recursive project cleanup/deletion, and live drive utilization.
 - [`app/ui/remote_producer_dialog.py`](app/ui/remote_producer_dialog.py) — Remote Producer session setup, QR code display, passcode rotation, and SSL certificate dialog.

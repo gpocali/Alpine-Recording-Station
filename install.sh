@@ -197,12 +197,25 @@ allowed_users=anybody
 needs_root_rights=yes
 EOF
 
-# Ensure kernel module snd-usb-audio loads at boot and ALSA mixer state dir exists
-mkdir -p /etc/modules-load.d /var/lib/alsa
+# Ensure kernel module snd-usb-audio and USB HID modules load at boot and ALSA mixer state dir exists
+mkdir -p /etc/modules-load.d /var/lib/alsa /etc/udev/rules.d
 if [ ! -f /etc/modules-load.d/usb-audio.conf ]; then
     echo "snd-usb-audio" > /etc/modules-load.d/usb-audio.conf
 fi
+if [ ! -f /etc/modules-load.d/usb-hid.conf ]; then
+    printf "usbhid\nhid-generic\n" > /etc/modules-load.d/usb-hid.conf
+fi
 modprobe snd-usb-audio 2>/dev/null || true
+modprobe usbhid 2>/dev/null || true
+modprobe hid-generic 2>/dev/null || true
+
+# Allow direct /dev/hidraw* and /dev/input/event* LED control on SayoDevice (VID 0x8089) macro pads
+cat << 'EOF' > /etc/udev/rules.d/99-sayodevice.rules
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="8089", MODE="0666", GROUP="input"
+SUBSYSTEM=="input", ATTRS{idVendor}=="8089", MODE="0666", GROUP="input"
+EOF
+udevadm control --reload-rules 2>/dev/null || true
+udevadm trigger 2>/dev/null || true
 
 # -----------------------------------------------------------------------------
 # 4. Prepare Persistent /storage Directory & Boot Permission Enforcement
@@ -267,6 +280,7 @@ if command -v python3 >/dev/null 2>&1; then
         "${APP_DEST}/app/qr_code.py" \
         "${APP_DEST}/app/ssl_manager.py" \
         "${APP_DEST}/app/remote_producer.py" \
+        "${APP_DEST}/app/sayodevice_led.py" \
         "${APP_DEST}/app/ui/main_window.py" \
         "${APP_DEST}/app/ui/file_manager_dialog.py" \
         "${APP_DEST}/app/ui/remote_producer_dialog.py" \
@@ -411,11 +425,13 @@ if command -v lbu >/dev/null 2>&1; then
     lbu include "${APP_DEST}/app/qr_code.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/ssl_manager.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/remote_producer.py" 2>/dev/null || true
+    lbu include "${APP_DEST}/app/sayodevice_led.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/ui/file_manager_dialog.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/ui/remote_producer_dialog.py" 2>/dev/null || true
     lbu include "${ETC_CONFIG_DIR}" 2>/dev/null || true
     lbu include "${ETC_CONFIG_DIR}/ssl" 2>/dev/null || true
     lbu include /etc/modules-load.d 2>/dev/null || true
+    lbu include /etc/udev/rules.d/99-sayodevice.rules 2>/dev/null || true
     lbu include /etc/X11/Xwrapper.config 2>/dev/null || true
     lbu include /var/lib/alsa 2>/dev/null || true
     lbu include /etc/samba 2>/dev/null || true
