@@ -333,7 +333,7 @@ log_ok "Application code updated in ${APP_DEST}."
 # -----------------------------------------------------------------------------
 mkdir -p /etc/samba /var/log/samba /var/lib/samba/private
 
-if [ ! -f /etc/samba/smb.conf ] || ! grep -q "\[storage\]" /etc/samba/smb.conf || ! grep -q "force directory mode = 2777" /etc/samba/smb.conf || [ "${FORCE_CONFIG}" -eq 1 ]; then
+if [ ! -f /etc/samba/smb.conf ] || ! grep -q "\[storage\]" /etc/samba/smb.conf || ! grep -q "force directory mode = 2777" /etc/samba/smb.conf || ! grep -q "smb2 leases = no" /etc/samba/smb.conf || ! grep -q "oplocks = no" /etc/samba/smb.conf || [ "${FORCE_CONFIG}" -eq 1 ]; then
     if [ -f /etc/samba/smb.conf ] && [ ! -f /etc/samba/smb.conf.orig ]; then
         cp /etc/samba/smb.conf /etc/samba/smb.conf.orig
     fi

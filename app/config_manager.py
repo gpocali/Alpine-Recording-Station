@@ -793,6 +793,23 @@ class ConfigManager:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    @staticmethod
+    def _fsync_directory(dir_path: Path) -> None:
+        """Flush directory entry metadata to disk on POSIX filesystems so Samba reflects changes immediately."""
+        if os.name != "posix" or not hasattr(os, "fsync"):
+            return
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            fd = os.open(str(dir_path), flags)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
     def get_project_dir(self, project_name: Optional[str] = None) -> Path:
         """Return the project subfolder path inside /storage for the given or active project."""
         prefix_clean = sanitize_project_name(
@@ -808,6 +825,8 @@ class ConfigManager:
         except OSError as exc:
             logger.warning("Could not create project directory %s: %s", proj_dir, exc)
         self.enforce_storage_permissions()
+        self._fsync_directory(proj_dir)
+        self._fsync_directory(self.storage_dir)
         return proj_dir
 
     def rename_recording(
@@ -852,6 +871,7 @@ class ConfigManager:
         try:
             src_path.rename(dst_path)
             self.enforce_storage_permissions()
+            self._fsync_directory(dst_path.parent)
             return (True, f"Renamed to {target_filename}", dst_path)
         except OSError as exc:
             logger.warning("Failed to rename %s to %s: %s", src_path, dst_path, exc)
@@ -1162,7 +1182,9 @@ class ConfigManager:
                 os.chmod(src_path, 0o666)
             except OSError:
                 pass
+            parent_dir = src_path.parent
             src_path.unlink()
+            self._fsync_directory(parent_dir)
             return (
                 True,
                 f"Deleted '{src_path.name}' ({format_storage_bytes(freed_bytes)} freed).",
@@ -1288,6 +1310,7 @@ class ConfigManager:
         count = len(removed_names)
         if count == 0:
             return (True, "No empty project folders found.", 0)
+        self._fsync_directory(self.storage_dir)
         joined = ", ".join(f"{n}/" for n in removed_names)
         return (
             True,
@@ -1332,6 +1355,8 @@ class ConfigManager:
                 elif item.is_dir():
                     shutil.rmtree(item)
             self.enforce_storage_permissions()
+            self._fsync_directory(proj_dir)
+            self._fsync_directory(self.storage_dir)
             return (
                 True,
                 f"Cleaned up '{proj_dir.name}/' — deleted {file_count} file(s) ({format_storage_bytes(freed_bytes)} freed).",
@@ -1367,6 +1392,7 @@ class ConfigManager:
         try:
             shutil.rmtree(proj_dir)
             self.enforce_storage_permissions()
+            self._fsync_directory(self.storage_dir)
             return (
                 True,
                 f"Deleted project folder '{proj_dir.name}/' and {file_count} file(s) ({format_storage_bytes(freed_bytes)} freed).",

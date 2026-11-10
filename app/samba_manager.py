@@ -4,15 +4,103 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from app.config_manager import ConfigManager
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SMB_CONF_PATH = Path("/etc/samba/smb.conf")
+
+GLOBAL_UNCACHED_DIRECTIVES: Tuple[Tuple[str, str], ...] = (
+    ("smb2 leases", "no"),
+    ("kernel oplocks", "no"),
+    ("stat cache", "no"),
+    ("change notify", "yes"),
+    ("kernel change notify", "yes"),
+)
+
+STORAGE_UNCACHED_DIRECTIVES: Tuple[Tuple[str, str], ...] = (
+    ("oplocks", "no"),
+    ("level2 oplocks", "no"),
+    ("strict locking", "no"),
+    ("strict sync", "yes"),
+    ("sync always", "yes"),
+    ("use mmap", "no"),
+)
+
+
+def ensure_smb_conf_uncached_text(conf_text: str) -> Tuple[str, bool]:
+    """Ensure [global] and [storage] sections in smb.conf disable SMB leasing/oplock/stat caching."""
+    lines = conf_text.splitlines()
+    section_Targets: Dict[str, Dict[str, str]] = {
+        "global": dict(GLOBAL_UNCACHED_DIRECTIVES),
+        "storage": dict(STORAGE_UNCACHED_DIRECTIVES),
+    }
+    found_in_section: Dict[str, set[str]] = {
+        "global": set(),
+        "storage": set(),
+    }
+
+    current_sec = ""
+    out_lines: List[str] = []
+    changed = False
+
+    def _flush_missing_for_section(sec_name: str) -> None:
+        nonlocal changed
+        if sec_name not in section_Targets:
+            return
+        # Strip trailing blank lines momentarily so appended keys sit cleanly inside the section
+        trailing_blanks: List[str] = []
+        while out_lines and not out_lines[-1].strip():
+            trailing_blanks.append(out_lines.pop())
+        for key, val in section_Targets[sec_name].items():
+            if key not in found_in_section[sec_name]:
+                out_lines.append(f"   {key} = {val}")
+                found_in_section[sec_name].add(key)
+                changed = True
+        while trailing_blanks:
+            out_lines.append(trailing_blanks.pop())
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            _flush_missing_for_section(current_sec)
+            current_sec = stripped[1:-1].strip().lower()
+            out_lines.append(raw_line)
+            continue
+
+        if (
+            current_sec in section_Targets
+            and stripped
+            and not stripped.startswith("#")
+            and not stripped.startswith(";")
+            and "=" in stripped
+        ):
+            k_part, v_part = stripped.split("=", 1)
+            norm_key = " ".join(k_part.strip().lower().split())
+            norm_val = v_part.strip().lower()
+            target_map = section_Targets[current_sec]
+            if norm_key in target_map:
+                expected_val = target_map[norm_key]
+                found_in_section[current_sec].add(norm_key)
+                if norm_val != expected_val.lower():
+                    out_lines.append(f"   {norm_key} = {expected_val}")
+                    changed = True
+                else:
+                    out_lines.append(raw_line)
+                continue
+
+        out_lines.append(raw_line)
+
+    _flush_missing_for_section(current_sec)
+    result = "\n".join(out_lines) + ("\n" if conf_text.endswith("\n") or out_lines else "")
+    return result, changed
 
 RESERVED_USERNAMES = {
     "root",
@@ -50,8 +138,13 @@ USERNAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,30}$")
 class SambaManager:
     """Administrates Samba share users and passwords on Alpine Linux."""
 
-    def __init__(self, config_manager: ConfigManager) -> None:
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        smb_conf_path: Optional[Path] = None,
+    ) -> None:
         self.config_manager = config_manager
+        self.smb_conf_path = Path(smb_conf_path) if smb_conf_path is not None else DEFAULT_SMB_CONF_PATH
         self.users_registry_path = (
             self.config_manager.etc_config_dir / "samba_users.json"
         )
@@ -60,9 +153,63 @@ class SambaManager:
         self.adduser_bin = shutil.which("adduser")
         self.deluser_bin = shutil.which("deluser")
 
+        if os.name == "posix" and self.smb_conf_path.is_file():
+            self.ensure_uncached_smb_conf()
+
     @property
     def is_system_samba_available(self) -> bool:
         return bool(self.pdbedit_bin and self.smbpasswd_bin)
+
+    def ensure_uncached_smb_conf(
+        self,
+        smb_conf_path: Optional[Path] = None,
+        reload_service: bool = True,
+    ) -> bool:
+        """Ensure smb.conf has real-time uncached share directives and reload Samba if updated."""
+        target_path = Path(smb_conf_path) if smb_conf_path is not None else self.smb_conf_path
+        if not target_path.is_file():
+            return False
+        try:
+            raw_text = target_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+
+        if "[storage]" not in raw_text.lower():
+            return False
+
+        updated_text, changed = ensure_smb_conf_uncached_text(raw_text)
+        if not changed:
+            return False
+
+        try:
+            target_path.write_text(updated_text, encoding="utf-8")
+        except OSError as exc:
+            logger.debug("Could not update %s for uncached Samba share: %s", target_path, exc)
+            return False
+
+        if reload_service and os.name == "posix":
+            smbcontrol_bin = shutil.which("smbcontrol")
+            rc_service_bin = shutil.which("rc-service")
+            try:
+                if smbcontrol_bin:
+                    subprocess.run(
+                        [smbcontrol_bin, "all", "reload-config"],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                if rc_service_bin:
+                    subprocess.run(
+                        [rc_service_bin, "samba", "reload"],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+            except Exception as exc:
+                logger.debug("Samba reload skipped: %s", exc)
+            self.config_manager.trigger_lbu_commit_async()
+
+        return True
 
     @staticmethod
     def validate_username(username: str) -> Tuple[bool, str]:

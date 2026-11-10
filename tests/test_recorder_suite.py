@@ -508,6 +508,37 @@ class TestSambaManager(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(sm.list_users(), [])
 
+            # Verify automatic smb.conf anti-caching upgrade
+            legacy_smb_conf = base / "smb.conf"
+            legacy_smb_conf.write_text(
+                "[global]\n"
+                "   workgroup = WORKGROUP\n"
+                "   smb2 leases = yes\n\n"
+                "[storage]\n"
+                "   path = /storage\n"
+                "   writable = yes\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                sm.ensure_uncached_smb_conf(legacy_smb_conf, reload_service=False)
+            )
+            upgraded_text = legacy_smb_conf.read_text(encoding="utf-8")
+            self.assertIn("smb2 leases = no", upgraded_text)
+            self.assertIn("kernel oplocks = no", upgraded_text)
+            self.assertIn("stat cache = no", upgraded_text)
+            self.assertIn("change notify = yes", upgraded_text)
+            self.assertIn("kernel change notify = yes", upgraded_text)
+            self.assertIn("oplocks = no", upgraded_text)
+            self.assertIn("level2 oplocks = no", upgraded_text)
+            self.assertIn("strict locking = no", upgraded_text)
+            self.assertIn("strict sync = yes", upgraded_text)
+            self.assertIn("sync always = yes", upgraded_text)
+            self.assertIn("use mmap = no", upgraded_text)
+            # Second run should be idempotent (no changes needed)
+            self.assertFalse(
+                sm.ensure_uncached_smb_conf(legacy_smb_conf, reload_service=False)
+            )
+
 
 class TestVuMeterAndPeakHold(unittest.TestCase):
     def test_dbfs_conversions_and_peak_hold_maintenance(self) -> None:
@@ -679,6 +710,18 @@ class TestPostBootServiceAndRecoveryConfig(unittest.TestCase):
         self.assertIn("force directory mode = 2777", smb_text)
         self.assertIn("nt acl support = no", smb_text)
         self.assertIn("map readonly = no", smb_text)
+        self.assertIn("smb2 leases = no", smb_text)
+        self.assertIn("kernel oplocks = no", smb_text)
+        self.assertIn("stat cache = no", smb_text)
+        self.assertIn("change notify = yes", smb_text)
+        self.assertIn("kernel change notify = yes", smb_text)
+        self.assertIn("oplocks = no", smb_text)
+        self.assertIn("level2 oplocks = no", smb_text)
+        self.assertIn("strict locking = no", smb_text)
+        self.assertIn("strict sync = yes", smb_text)
+        self.assertIn("sync always = yes", smb_text)
+        self.assertIn("use mmap = no", smb_text)
+        self.assertIn("smb2 leases = no", install_text)
 
 
 class TestComboBoxDropdownStyles(unittest.TestCase):

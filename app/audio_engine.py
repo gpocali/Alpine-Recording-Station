@@ -463,11 +463,29 @@ class StudioTalkbackProcessor:
         return out
 
 
+def _fsync_directory(dir_path: Path) -> None:
+    """Flush directory entry metadata to disk on POSIX filesystems so Samba reflects changes immediately."""
+    if os.name != "posix" or not hasattr(os, "fsync"):
+        return
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        fd = os.open(str(dir_path), flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 class WavFileWriter:
     """Streaming RIFF WAVE writer supporting 16-bit, 24-bit, and 32-bit linear PCM.
 
     Supports closing the WAV file on pause (flushing valid RIFF/WAVE headers to prevent
     corruption) and reopening the exact same file in append mode ('r+b') on resume.
+    Flushes and fsyncs headers and directory entries so Samba clients see real-time drive state.
     """
 
     def __init__(
@@ -497,15 +515,27 @@ class WavFileWriter:
         else:
             self._file = self.filepath.open("wb+")
             self._write_header(0)
+            self._file.flush()
+            self._fsync_file()
             try:
                 os.chmod(self.filepath, 0o666)
             except OSError:
                 pass
+            _fsync_directory(self.filepath.parent)
 
     @property
     def is_open(self) -> bool:
         """Return True if the underlying OS file handle is currently open."""
         return self._file is not None and not self._file.closed
+
+    def _fsync_file(self) -> None:
+        """Force the OS kernel to flush file data and metadata (size/mtime) to the underlying drive."""
+        if not self.is_open or not hasattr(os, "fsync"):
+            return
+        try:
+            os.fsync(self._file.fileno())
+        except OSError:
+            pass
 
     def reopen(self) -> None:
         """Reopen an existing closed WAV file in 'r+b' mode so new frames append seamlessly."""
@@ -530,15 +560,20 @@ class WavFileWriter:
             )
             self._write_header(self.data_bytes_written)
             self._file.seek(0, os.SEEK_END)
+            self._file.flush()
+            self._fsync_file()
         else:
             self._file = self.filepath.open("wb+")
             self.data_bytes_written = 0
             self.frames_written = 0
             self._write_header(0)
+            self._file.flush()
+            self._fsync_file()
         try:
             os.chmod(self.filepath, 0o666)
         except OSError:
             pass
+        _fsync_directory(self.filepath.parent)
 
     def _write_header(self, data_size: int) -> None:
         if not self.is_open:
@@ -587,25 +622,30 @@ class WavFileWriter:
 
         self._file.seek(0, os.SEEK_END)
         self._file.write(raw_bytes)
+        self._file.flush()
         self.data_bytes_written += len(raw_bytes)
         self.frames_written += num_frames
 
-    def flush_header(self) -> None:
-        """Update RIFF and data chunk sizes on disk."""
+    def flush_header(self, sync_disk: bool = True) -> None:
+        """Update RIFF and data chunk sizes on disk and sync OS buffers."""
         if self.is_open:
             self._write_header(self.data_bytes_written)
+            self._file.seek(0, os.SEEK_END)
             self._file.flush()
+            if sync_disk:
+                self._fsync_file()
 
     def close(self) -> None:
         if self.is_open:
             try:
-                self.flush_header()
+                self.flush_header(sync_disk=True)
             finally:
                 self._file.close()
             try:
                 os.chmod(self.filepath, 0o666)
             except OSError:
                 pass
+            _fsync_directory(self.filepath.parent)
 
 
 def read_wav_as_float64(filepath: Path) -> Tuple[np.ndarray, int, int, int]:

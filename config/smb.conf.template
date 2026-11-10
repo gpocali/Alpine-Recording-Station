@@ -11,6 +11,11 @@
    log file = /var/log/samba/log.%m
    max log size = 50
    dns proxy = no
+   smb2 leases = no
+   kernel oplocks = no
+   stat cache = no
+   change notify = yes
+   kernel change notify = yes
 
 [storage]
    comment = Alpine Recording Station WAV Storage
@@ -33,5 +38,11 @@
    map readonly = no
    store dos attributes = no
    dos filemode = yes
+   oplocks = no
+   level2 oplocks = no
+   strict locking = no
+   strict sync = yes
+   sync always = yes
+   use mmap = no
    veto files = /.alpine-recorder/lost+found/
    delete veto files = no
