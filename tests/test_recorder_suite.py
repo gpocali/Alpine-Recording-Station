@@ -2403,10 +2403,14 @@ class TestSayoDevice1x4PLedController(unittest.TestCase):
             SayoDeviceLedController,
             SayoStudioState,
             build_linux_ev_led_events,
+            build_sayo_o2_handshake_packet,
             build_sayo_v1_led_key_packet,
+            build_sayo_v1_led_read_packet,
             build_sayo_v2_led_packet,
             compute_sayo_v2_checksum,
             parse_hid_report_descriptor,
+            parse_sayo_o2_handshake_response,
+            parse_sayo_v1_led_response,
         )
 
         # 1. Verify HID Report Descriptor parser extracts Usage Pages (0xFF00, 0xFF11, 0xFF12) and Report IDs (0x02, 0x21, 0x22)
@@ -2423,15 +2427,54 @@ class TestSayoDevice1x4PLedController(unittest.TestCase):
         self.assertEqual(ups, (0xFF11, 0xFF00))
         self.assertEqual(rids, (0x21, 0x02))
 
-        # 2. Verify Sayo Protocol v1 64-byte RGB frame & checksum (never sends 0x04 save-to-flash)
+        # 2. Verify Sayobot/Sayo_CLI O2Protocol::Lighting (Report ID 0x02, cmd 0x07, data_len 9) frame & checksum
         pkt_v1 = build_sayo_v1_led_key_packet(2, 255, 110, 0)
         self.assertEqual(len(pkt_v1), 64)
         self.assertEqual(pkt_v1[0], 0x02)
-        self.assertEqual(pkt_v1[1], 0x07)  # RGB command, NOT 0x04 save
+        self.assertEqual(pkt_v1[1], 0x07)  # O2Protocol::Lighting command, NOT 0x04 save
         data_len = pkt_v1[2]
-        self.assertEqual(pkt_v1[3 : 3 + data_len], bytes([0x01, 2, 255, 110, 0]))
+        self.assertEqual(data_len, 9)
+        # Payload matches o2_hid_data.format.data.lamp:
+        # [pattern=1, number=2, type=1 (Static RGB), event=0 (Always on), lamp_cmd_len=0, col_r=255, col_g=110, col_b=0, interval=1]
+        self.assertEqual(
+            pkt_v1[3 : 3 + data_len],
+            bytes([0x01, 2, 0x01, 0x00, 0x00, 255, 110, 0, 0x01]),
+        )
         expected_chk = sum(pkt_v1[: 3 + data_len]) & 0xFF
         self.assertEqual(pkt_v1[3 + data_len], expected_chk)
+
+        # Verify turning off an LED slot sets lamp.type = 0x00 (Off) and col = (0, 0, 0)
+        pkt_v1_off = build_sayo_v1_led_key_packet(0, 0, 0, 0)
+        self.assertEqual(
+            pkt_v1_off[3:12],
+            bytes([0x01, 0, 0x00, 0x00, 0x00, 0, 0, 0, 0x01]),
+        )
+
+        # Verify O2Protocol::Lighting("read") packet and EpIn response parser
+        pkt_read = build_sayo_v1_led_read_packet(3)
+        self.assertEqual(pkt_read[:6], bytes([0x02, 0x07, 0x02, 0x00, 3, (0x02 + 0x07 + 0x02 + 3) & 0xFF]))
+        parsed_slot = parse_sayo_v1_led_response(
+            bytes([0x02, 0x00, 0x09, 0x01, 3, 0x01, 0x00, 0x00, 255, 110, 0, 0x01]).ljust(64, b"\x00")
+        )
+        self.assertIsNotNone(parsed_slot)
+        if parsed_slot is not None:
+            self.assertEqual(parsed_slot.number, 3)
+            self.assertEqual(parsed_slot.code, 1)
+            self.assertEqual(parsed_slot.event, 0)
+            self.assertEqual(parsed_slot.hex_color, "#FF6E00")
+
+        # Verify O2Protocol::SearchDrivers handshake packet and response parser
+        pkt_hs = build_sayo_o2_handshake_packet(timestamp=1700000000.0)
+        self.assertEqual(pkt_hs[:3], bytes([0x02, 0x00, 0x04]))
+        self.assertEqual(pkt_hs[7], sum(pkt_hs[:7]) & 0xFF)
+        parsed_info = parse_sayo_o2_handshake_response(
+            bytes([0x02, 0x00, 0x04, 0x01, 0x05, 0x00, 0x02]).ljust(64, b"\x00")
+        )
+        self.assertIsNotNone(parsed_info)
+        if parsed_info is not None:
+            self.assertEqual(parsed_info.mode, "app")
+            self.assertEqual(parsed_info.version, 0x0105)
+            self.assertEqual(parsed_info.model_code, 2)
 
         # 3. Verify Sayo Protocol v2 64-byte & 1024-byte `hid_packet_v2_t` framing and 16-bit word checksum
         colors = (COLOR_RECORD_ACTIVE, COLOR_PAUSE_ARMED, COLOR_TALKBACK_ACTIVE, COLOR_MIC_LIVE)
