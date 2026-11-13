@@ -255,6 +255,7 @@ class RemoteProducerServer:
         config_manager: ConfigManager,
         ssl_manager: Optional[SslCertificateManager] = None,
         status_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+        on_project_name_changed: Optional[Callable[[str], None]] = None,
         host: str = "0.0.0.0",
         port: Optional[int] = None,
     ):
@@ -266,6 +267,7 @@ class RemoteProducerServer:
             drop_dir=Path(config_manager.storage_dir) / "ssl",
         )
         self.status_provider = status_provider
+        self.on_project_name_changed = on_project_name_changed
         self.host = host
         self._configured_port = (
             port if port is not None else int(getattr(config_manager.settings, "remote_producer_port", 8443))
@@ -671,6 +673,9 @@ class RemoteProducerServer:
             "talent_mic_live": talent_live,
             "talent_mic_send_enabled": bool(self.audio_engine.talent_mic_send_enabled),
             "talent_cough_muted": bool(self.audio_engine.talent_cough_muted),
+            "allow_project_rename": bool(
+                getattr(settings, "remote_producer_allow_project_rename", False)
+            ),
             "connected_producers": int(self.connected_client_count),
             "take_count": int(extra.get("take_count", 0)),
             "active_take_name": str(active_take),
@@ -753,8 +758,8 @@ class RemoteProducerServer:
             except Exception:
                 pass
 
-    def _on_engine_talkback_state_changed(self) -> None:
-        """Immediately push updated status snapshot to connected producers when Talkback state changes."""
+    def broadcast_state_snapshot(self) -> None:
+        """Immediately push an updated status snapshot to all connected producers."""
         with self._clients_lock:
             clients = [c for c in self._clients.values() if not c.closed]
         if not clients:
@@ -768,6 +773,31 @@ class RemoteProducerServer:
                 client.send_text(snap_msg)
             except Exception:
                 pass
+
+    def update_project_name(self, new_name: str) -> Tuple[bool, str]:
+        """Update the active project name on behalf of an authenticated remote producer."""
+        if not bool(getattr(self.config_manager.settings, "remote_producer_allow_project_rename", False)):
+            return (False, "Project name editing is disabled in studio settings.")
+        if self.audio_engine.is_recording or self.audio_engine.is_record_paused:
+            return (False, "Cannot change project name while recording is in progress.")
+        cleaned = (new_name or "").strip()
+        if not cleaned:
+            return (False, "Please enter a valid project name.")
+
+        self.config_manager.settings.project_name = cleaned
+        self.config_manager.save(commit_lbu=True)
+        self.config_manager.ensure_project_dir(cleaned)
+        if self.on_project_name_changed is not None:
+            try:
+                self.on_project_name_changed(cleaned)
+            except Exception as exc:
+                logger.warning("on_project_name_changed callback failed: %s", exc)
+        self.broadcast_state_snapshot()
+        return (True, cleaned)
+
+    def _on_engine_talkback_state_changed(self) -> None:
+        """Immediately push updated status snapshot to connected producers when Talkback state changes."""
+        self.broadcast_state_snapshot()
 
     # ------------------------------------------------------------------
     # HTTP & Authentication Handlers
@@ -1076,6 +1106,19 @@ class RemoteProducerServer:
         elif mtype == "listen_state":
             ws_conn.listen_enabled = bool(msg.get("enabled", True))
 
+        elif mtype == "set_project_name":
+            ok, detail = self.update_project_name(str(msg.get("project_name", "")))
+            ws_conn.send_text(
+                json.dumps(
+                    {
+                        "type": "project_rename_result",
+                        "ok": ok,
+                        "project_name": detail if ok else (self.config_manager.settings.project_name or "Session"),
+                        "error": "" if ok else detail,
+                    }
+                )
+            )
+
         elif mtype == "ping":
             ws_conn.send_text(json.dumps({"type": "pong", "ts": msg.get("ts", 0)}))
 
@@ -1228,6 +1271,56 @@ body {{
 .btn-subtle:hover {{
   background: #292E36;
   border-color: #58A6FF;
+}}
+.btn-subtle:disabled {{
+  opacity: 0.45;
+  cursor: not-allowed;
+}}
+.project-edit-bar {{
+  background: var(--bg-card);
+  border: 1px solid #388BFD;
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+}}
+.project-edit-row {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}}
+.project-edit-row label {{
+  font-size: 12px;
+  font-weight: 700;
+  color: #C9D1D9;
+  letter-spacing: 0.4px;
+}}
+.project-edit-row .text-input {{
+  flex: 1 1 220px;
+  padding: 8px 10px;
+  font-size: 14px;
+}}
+.btn-save-inline {{
+  background: #1F6FEB;
+  border: 1px solid #388BFD;
+  color: #FFFFFF;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}}
+.btn-save-inline:disabled {{
+  opacity: 0.45;
+  cursor: not-allowed;
+}}
+.project-edit-feedback {{
+  font-size: 12px;
+  color: #FFA198;
+  display: none;
 }}
 /* Main Container */
 .main-wrap {{
@@ -1585,6 +1678,7 @@ input[type="range"].brand-slider {{
   <div class="header-meta">
     <span class="badge" id="hdr-session">Session: {safe_session}</span>
     <span class="badge" id="hdr-project">Project: {safe_project}</span>
+    <button type="button" class="btn-subtle" id="btn-edit-project" style="display:none;" title="Update active Project Name">✎ Project</button>
     <span class="badge badge-conn-warn" id="hdr-conn">● Connecting...</span>
     <button type="button" class="btn-subtle" id="btn-logout" style="display:none;">Sign Out</button>
   </div>
@@ -1638,6 +1732,17 @@ input[type="range"].brand-slider {{
 
   <!-- STRIPPED-DOWN PRODUCER CONSOLE VIEW -->
   <section id="console-view" style="display:none;">
+    <!-- Optional Remote Project Rename Bar (shown only when enabled in studio settings) -->
+    <div class="project-edit-bar" id="project-edit-bar">
+      <div class="project-edit-row">
+        <label for="project-name-input">PROJECT NAME</label>
+        <input type="text" id="project-name-input" class="text-input" placeholder="Enter Project Name..." maxlength="120">
+        <button type="button" class="btn-save-inline" id="btn-save-project">Save Project</button>
+        <button type="button" class="btn-subtle" id="btn-cancel-project">Cancel</button>
+      </div>
+      <div class="project-edit-feedback" id="project-edit-feedback" role="alert"></div>
+    </div>
+
     <!-- Studio Deck Readout -->
     <div class="studio-deck" id="studio-deck">
       <div class="deck-top">
@@ -1761,6 +1866,8 @@ input[type="range"].brand-slider {{
   let latestToneHz = 1000.0;
   let latestPressToneSec = 1.0;
   let latestReleaseToneSec = 0.5;
+  let latestProjectName = "{safe_project}";
+  let latestAllowProjectRename = false;
   let lastObservedLocalTbActive = null;
   let activeToneOsc = null;
   let activeToneGain = null;
@@ -1776,6 +1883,12 @@ input[type="range"].brand-slider {{
   const hdrConn = document.getElementById("hdr-conn");
   const hdrSession = document.getElementById("hdr-session");
   const hdrProject = document.getElementById("hdr-project");
+  const btnEditProject = document.getElementById("btn-edit-project");
+  const projectEditBar = document.getElementById("project-edit-bar");
+  const projectNameInput = document.getElementById("project-name-input");
+  const btnSaveProject = document.getElementById("btn-save-project");
+  const btnCancelProject = document.getElementById("btn-cancel-project");
+  const projectEditFeedback = document.getElementById("project-edit-feedback");
 
   const studioDeck = document.getElementById("studio-deck");
   const stateBanner = document.getElementById("state-banner");
@@ -2178,8 +2291,56 @@ input[type="range"].brand-slider {{
 
   window.addEventListener("keyup", function(ev) {{
     if (!isAuthenticated) return;
+    const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : "";
+    if (tag === "input" || tag === "textarea") return;
     if (ev.code === "KeyT" || ev.code === "Space") {{
       handleTalkbackRelease();
+    }}
+  }});
+
+  function openProjectEditBar() {{
+    if (!latestAllowProjectRename || latestIsRecording) return;
+    projectEditFeedback.style.display = "none";
+    projectEditFeedback.textContent = "";
+    projectNameInput.value = latestProjectName || "";
+    projectEditBar.style.display = "flex";
+    projectNameInput.focus();
+    projectNameInput.select();
+  }}
+
+  function closeProjectEditBar() {{
+    projectEditBar.style.display = "none";
+    projectEditFeedback.style.display = "none";
+    projectEditFeedback.textContent = "";
+  }}
+
+  function submitProjectRename() {{
+    if (!latestAllowProjectRename || latestIsRecording) return;
+    const nextName = (projectNameInput.value || "").trim();
+    if (!nextName) {{
+      projectEditFeedback.textContent = "Please enter a valid project name.";
+      projectEditFeedback.style.display = "block";
+      return;
+    }}
+    sendJson({{ type: "set_project_name", project_name: nextName }});
+  }}
+
+  btnEditProject.addEventListener("click", function() {{
+    if (projectEditBar.style.display === "flex") {{
+      closeProjectEditBar();
+    }} else {{
+      openProjectEditBar();
+    }}
+  }});
+  btnCancelProject.addEventListener("click", closeProjectEditBar);
+  btnSaveProject.addEventListener("click", submitProjectRename);
+  projectNameInput.addEventListener("keydown", function(ev) {{
+    if (ev.key === "Enter") {{
+      ev.preventDefault();
+      submitProjectRename();
+    }} else if (ev.key === "Escape") {{
+      ev.preventDefault();
+      closeProjectEditBar();
     }}
   }});
 
@@ -2278,6 +2439,17 @@ input[type="range"].brand-slider {{
       refreshMicAndTalkbackUi();
       return;
     }}
+    if (msg.type === "project_rename_result") {{
+      if (msg.ok) {{
+        latestProjectName = msg.project_name || latestProjectName;
+        hdrProject.textContent = "Project: " + (latestProjectName || "Default");
+        closeProjectEditBar();
+      }} else {{
+        projectEditFeedback.textContent = msg.error || "Could not update project name.";
+        projectEditFeedback.style.display = "block";
+      }}
+      return;
+    }}
     if (msg.type !== "state") {{
       return;
     }}
@@ -2308,7 +2480,18 @@ input[type="range"].brand-slider {{
     refreshMicAndTalkbackUi();
 
     hdrSession.textContent = "Session: " + (msg.session_id || "--");
-    hdrProject.textContent = "Project: " + (msg.project_name || "Default");
+    latestProjectName = msg.project_name || "Default";
+    hdrProject.textContent = "Project: " + latestProjectName;
+    latestAllowProjectRename = Boolean(msg.allow_project_rename);
+    btnEditProject.style.display = latestAllowProjectRename ? "inline-block" : "none";
+    btnEditProject.disabled = latestIsRecording || latestIsRecordPaused;
+    btnEditProject.title = (latestIsRecording || latestIsRecordPaused)
+      ? "Project name cannot be changed while recording"
+      : "Update active Project Name";
+    btnSaveProject.disabled = latestIsRecording || latestIsRecordPaused;
+    if (!latestAllowProjectRename && projectEditBar.style.display === "flex") {{
+      closeProjectEditBar();
+    }}
 
     latestStudioMode = Boolean(msg.studio_mode);
     latestChannels = Number(msg.channels || 2);

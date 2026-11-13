@@ -403,7 +403,7 @@ class ProjectPrefixDialog(QDialog):
         self.osk_controller.register_line_edit(
             self.prefix_edit,
             title="Project Name",
-            hint="Stored in subfolder: <ProjectName>/<ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav",
+            hint="Stored in subfolder: <ProjectName>/<ProjectName>_Take001_yyyy-mm-dd_HH.MM.SS_TZ.wav",
         )
         self.osk_controller.attach_to_container(self)
         self._update_preview(self.prefix_edit.text())
@@ -480,7 +480,8 @@ class ProjectPrefixDialog(QDialog):
 
     def _update_preview(self, text: str) -> None:
         folder = sanitize_project_name(text)
-        sample = generate_recording_filename(text)
+        take_num = self.config_manager.get_next_take_number(text)
+        sample = generate_recording_filename(text, take_number=take_num)
         self.preview_label.setText(f"Next: {folder}/{sample}")
 
 
@@ -937,12 +938,14 @@ class MainWindow(QMainWindow):
         if remote_producer_server is not None:
             self.remote_producer_server = remote_producer_server
             self.remote_producer_server.status_provider = self._build_remote_producer_extra_status
+            self.remote_producer_server.on_project_name_changed = self._on_remote_project_name_changed_threadsafe
         else:
             self.remote_producer_server = RemoteProducerServer(
                 audio_engine=self.audio_engine,
                 config_manager=self.config_manager,
                 ssl_manager=ssl_manager,  # type: ignore[arg-type]
                 status_provider=self._build_remote_producer_extra_status,
+                on_project_name_changed=self._on_remote_project_name_changed_threadsafe,
             )
             if getattr(self.config_manager.settings, "remote_producer_enabled", False):
                 self.remote_producer_server.start(
@@ -1769,7 +1772,8 @@ class MainWindow(QMainWindow):
 
         settings = self.config_manager.settings
         proj_dir = self.config_manager.ensure_project_dir(settings.project_name)
-        filename = generate_recording_filename(settings.project_name)
+        take_num = self.config_manager.get_next_take_number(settings.project_name)
+        filename = generate_recording_filename(settings.project_name, take_number=take_num)
         output_path = proj_dir / filename
 
         self.audio_engine.start_recording(
@@ -1916,6 +1920,15 @@ class MainWindow(QMainWindow):
         self.config_manager.ensure_project_dir(new_text)
         self._update_filename_preview()
         self._refresh_recordings_list()
+        self.remote_producer_server.broadcast_state_snapshot()
+
+    def _on_remote_project_name_changed_threadsafe(self, _new_name: str) -> None:
+        QTimer.singleShot(0, self._handle_remote_project_name_changed_ui)
+
+    def _handle_remote_project_name_changed_ui(self) -> None:
+        self._update_project_name_label()
+        self._update_filename_preview()
+        self._refresh_recordings_list()
 
     def _on_rename_recording_clicked(self) -> None:
         if self.audio_engine.is_recording:
@@ -2008,8 +2021,12 @@ class MainWindow(QMainWindow):
                 "border: none; color: #FF6B7A; font-family: monospace; font-weight: bold;"
             )
             return
-        sample_name = generate_recording_filename(
+        take_num = self.config_manager.get_next_take_number(
             self.config_manager.settings.project_name
+        )
+        sample_name = generate_recording_filename(
+            self.config_manager.settings.project_name,
+            take_number=take_num,
         )
         self.filename_preview_label.setText(f"Next: {folder}/{sample_name}")
         self.filename_preview_label.setStyleSheet(

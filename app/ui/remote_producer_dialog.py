@@ -288,7 +288,7 @@ class RemoteProducerDialog(QDialog):
         p_layout.setContentsMargins(14, 12, 14, 12)
         p_layout.setSpacing(8)
 
-        p_hdr = QLabel("2. TALENT MIC PRIVACY && COUGH CONTROL")
+        p_hdr = QLabel("2. TALENT MIC PRIVACY && PRODUCER PERMISSIONS")
         p_hdr.setObjectName("SectionHeader")
         p_layout.addWidget(p_hdr)
 
@@ -298,6 +298,19 @@ class RemoteProducerDialog(QDialog):
         self.chk_send_talent_mic.setChecked(bool(self.audio_engine.talent_mic_send_enabled))
         self.chk_send_talent_mic.toggled.connect(self._on_toggle_talent_mic_send)
         p_layout.addWidget(self.chk_send_talent_mic)
+
+        self.chk_allow_project_rename = QCheckBox(
+            "Allow Remote Producer to Update Project Name"
+        )
+        self.chk_allow_project_rename.setChecked(
+            bool(getattr(self.config_manager.settings, "remote_producer_allow_project_rename", False))
+        )
+        self.chk_allow_project_rename.setToolTip(
+            "When enabled, authenticated remote producers can change or switch the active "
+            "Project Name from the web console (when not recording)."
+        )
+        self.chk_allow_project_rename.toggled.connect(self._on_toggle_allow_project_rename)
+        p_layout.addWidget(self.chk_allow_project_rename)
 
         self.lbl_privacy_status = QLabel("")
         self.lbl_privacy_status.setWordWrap(True)
@@ -515,6 +528,19 @@ class RemoteProducerDialog(QDialog):
         self.config_manager.settings.remote_producer_send_talent_mic = bool(checked)
         self.config_manager.save(commit_lbu=True)
         self._refresh_live_status()
+
+    def _on_toggle_allow_project_rename(self, checked: bool) -> None:
+        self.config_manager.settings.remote_producer_allow_project_rename = bool(checked)
+        self.config_manager.save(commit_lbu=True)
+        self.remote_server.broadcast_state_snapshot()
+        if checked:
+            self.feedback_label.setText(
+                "✓ Remote Producer can now update the active Project Name when idle."
+            )
+        else:
+            self.feedback_label.setText(
+                "Remote Producer Project Name editing disabled."
+            )
 
     def _on_import_drop_ssl(self) -> None:
         ok, msg = self.remote_server.ssl_manager.import_from_drop_dir()

@@ -140,10 +140,49 @@ def sanitize_project_name(name: str) -> str:
     return cleaned if cleaned else "Project"
 
 
+_TAKE_NUMBER_RE = re.compile(
+    r"(?:^|[_\-\s])take[_\-\s]*(\d+)(?:[_\-\s.]|$)", re.IGNORECASE
+)
+
+
+def extract_take_number(
+    filename: str, project_name: Optional[str] = None
+) -> Optional[int]:
+    """Extract an integer take number from a recording filename, if present.
+
+    If ``project_name`` is provided, a matching ``<ProjectName>_`` prefix is
+    stripped before searching so project names such as ``Take2`` are not
+    mistaken for a take number.
+    """
+    stem = (filename or "").strip()
+    if stem.lower().endswith(".wav"):
+        stem = stem[:-4]
+    if not stem:
+        return None
+
+    target = stem
+    if project_name is not None:
+        prefix_clean = sanitize_project_name(project_name)
+        expected_prefix = f"{prefix_clean}_"
+        if target.startswith(expected_prefix):
+            target = target[len(expected_prefix):]
+
+    match = _TAKE_NUMBER_RE.search(target)
+    if not match:
+        return None
+    try:
+        val = int(match.group(1))
+        return val if val > 0 else None
+    except ValueError:
+        return None
+
+
 def generate_recording_filename(
-    project_name: str, dt: Optional[datetime.datetime] = None
+    project_name: str,
+    dt: Optional[datetime.datetime] = None,
+    take_number: Optional[int] = None,
 ) -> str:
-    """Generate a WAV filename with format: <ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav."""
+    """Generate a WAV filename with format: <ProjectName>[_TakeNNN]_yyyy-mm-dd_HH.MM.SS_TZ.wav."""
     prefix = sanitize_project_name(project_name)
     if dt is None:
         dt = datetime.datetime.now().astimezone()
@@ -154,6 +193,8 @@ def generate_recording_filename(
     # Clean TZ name for Windows/Samba safety (e.g. 'UTC+00:00' -> 'UTC+0000')
     tz_name = re.sub(r'[<>:"/\\|?*\s]', "", tz_name) or "LOCAL"
     timestamp = dt.strftime("%Y-%m-%d_%H.%M.%S")
+    if take_number is not None and int(take_number) > 0:
+        return f"{prefix}_Take{int(take_number):03d}_{timestamp}_{tz_name}.wav"
     return f"{prefix}_{timestamp}_{tz_name}.wav"
 
 
@@ -178,6 +219,7 @@ class RecorderSettings:
     remote_producer_enabled: bool = False
     remote_producer_port: int = 8443
     remote_producer_send_talent_mic: bool = True
+    remote_producer_allow_project_rename: bool = False
     ssl_cert_path: str = ""
     ssl_key_path: str = ""
     storage_dir: str = DEFAULT_STORAGE_DIR
@@ -816,6 +858,36 @@ class ConfigManager:
             project_name if project_name is not None else self.settings.project_name
         )
         return self.storage_dir / prefix_clean
+
+    def get_next_take_number(self, project_name: Optional[str] = None) -> int:
+        """Return the next 1-based take number for the given or active project.
+
+        Starts at 1 for a new/empty project folder. When resuming an existing
+        project folder, returns ``highest_existing_take + 1``.
+        """
+        proj_label = (
+            project_name if project_name is not None else self.settings.project_name
+        )
+        proj_dir = self.get_project_dir(proj_label)
+        if not proj_dir.is_dir():
+            return 1
+
+        max_take = 0
+        try:
+            for item in proj_dir.iterdir():
+                try:
+                    if item.is_symlink() or not item.is_file():
+                        continue
+                except OSError:
+                    continue
+                if not item.name.lower().endswith(".wav"):
+                    continue
+                take_num = extract_take_number(item.name, project_name=proj_label)
+                if take_num is not None and take_num > max_take:
+                    max_take = take_num
+        except OSError:
+            pass
+        return max_take + 1
 
     def ensure_project_dir(self, project_name: Optional[str] = None) -> Path:
         """Ensure the project subfolder exists inside /storage with proper Samba permissions."""

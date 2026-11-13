@@ -2716,5 +2716,96 @@ class TestSayoDevice1x4PLedController(unittest.TestCase):
                 )
 
 
+class TestTakeNumberingAndRemoteProjectRename(unittest.TestCase):
+    def test_take_numbering_starts_at_one_and_resumes_from_highest(self) -> None:
+        from app.config_manager import extract_take_number
+
+        tz = datetime.timezone(datetime.timedelta(hours=-5), name="EST")
+        dt = datetime.datetime(2026, 11, 13, 10, 0, 0, tzinfo=tz)
+        fname1 = generate_recording_filename("Chapter One", dt=dt, take_number=1)
+        self.assertEqual(fname1, "Chapter_One_Take001_2026-11-13_10.00.00_EST.wav")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc"))
+
+            # New project starts at take 1
+            self.assertEqual(cm.get_next_take_number("Chapter One"), 1)
+            proj_dir = cm.ensure_project_dir("Chapter One")
+            self.assertEqual(cm.get_next_take_number("Chapter One"), 1)
+
+            # Create Take001 and Take002
+            (proj_dir / generate_recording_filename("Chapter One", dt=dt, take_number=1)).write_bytes(b"RIFF")
+            self.assertEqual(cm.get_next_take_number("Chapter One"), 2)
+            (proj_dir / generate_recording_filename("Chapter One", dt=dt, take_number=2)).write_bytes(b"RIFF")
+            self.assertEqual(cm.get_next_take_number("Chapter One"), 3)
+
+            # Gap (e.g. Take005 present after Take003/004 deleted) -> resumes at 6
+            (proj_dir / generate_recording_filename("Chapter One", dt=dt, take_number=5)).write_bytes(b"RIFF")
+            self.assertEqual(cm.get_next_take_number("Chapter One"), 6)
+
+            # Renamed file with Take009 -> resumes at 10
+            (proj_dir / "Pickup_Take009.wav").write_bytes(b"RIFF")
+            self.assertEqual(cm.get_next_take_number("Chapter One"), 10)
+
+            # Project name containing 'Take2' should not falsely count as take 2
+            take2_dir = cm.ensure_project_dir("Take2")
+            (take2_dir / "Take2_2026-11-13_10.00.00_EST.wav").write_bytes(b"RIFF")
+            self.assertIsNone(extract_take_number("Take2_2026-11-13_10.00.00_EST.wav", project_name="Take2"))
+            self.assertEqual(cm.get_next_take_number("Take2"), 1)
+            (take2_dir / generate_recording_filename("Take2", dt=dt, take_number=1)).write_bytes(b"RIFF")
+            self.assertEqual(cm.get_next_take_number("Take2"), 2)
+
+    def test_remote_producer_project_rename_permission_and_execution(self) -> None:
+        from app.remote_producer import RemoteProducerServer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc"))
+            ae = AudioEngine()
+            changed_events: list[str] = []
+            srv = RemoteProducerServer(
+                audio_engine=ae,
+                config_manager=cm,
+                on_project_name_changed=lambda name: changed_events.append(name),
+            )
+
+            # Disabled by default
+            self.assertFalse(cm.settings.remote_producer_allow_project_rename)
+            self.assertFalse(srv.build_status_snapshot()["allow_project_rename"])
+            ok, msg = srv.update_project_name("Spot_B")
+            self.assertFalse(ok)
+            self.assertIn("disabled", msg.lower())
+            self.assertEqual(cm.settings.project_name, "Session")
+            self.assertEqual(changed_events, [])
+
+            # Enable in settings
+            cm.settings.remote_producer_allow_project_rename = True
+            cm.save()
+            self.assertTrue(srv.build_status_snapshot()["allow_project_rename"])
+
+            # Empty name rejected
+            ok_empty, _ = srv.update_project_name("   ")
+            self.assertFalse(ok_empty)
+
+            # Valid rename succeeds
+            ok_rename, detail = srv.update_project_name("Spot_B")
+            self.assertTrue(ok_rename)
+            self.assertEqual(detail, "Spot_B")
+            self.assertEqual(cm.settings.project_name, "Spot_B")
+            self.assertTrue((base / "storage" / "Spot_B").is_dir())
+            self.assertEqual(changed_events, ["Spot_B"])
+
+            # Blocked while recording is active
+            ae._recording = True
+            try:
+                ok_rec, rec_msg = srv.update_project_name("Spot_C")
+                self.assertFalse(ok_rec)
+                self.assertIn("recording", rec_msg.lower())
+                self.assertEqual(cm.settings.project_name, "Spot_B")
+            finally:
+                ae._recording = False
+
+
 if __name__ == "__main__":
     unittest.main()
