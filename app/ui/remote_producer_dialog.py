@@ -13,7 +13,7 @@ Provides the local studio talent with:
 from pathlib import Path
 from typing import List, Optional
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QSignalBlocker, Qt, QTimer
 from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QPalette
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -147,6 +147,9 @@ class RemoteProducerDialog(QDialog):
             chk.setPalette(pal)
             chk.setStyleSheet("color: #F0F6FC; font-weight: 600;")
         self.osk_controller.attach_to_container(self)
+        self._displayed_session_id: str = ""
+        self._displayed_running: bool = bool(self.remote_server.is_running)
+        self._displayed_port: int = int(self.remote_server.port)
         self._refresh_all()
 
         self._poll_timer = QTimer(self)
@@ -413,6 +416,7 @@ class RemoteProducerDialog(QDialog):
         )
         self.link_edit.setText(url)
         self.qr_widget.set_url(url)
+        self._displayed_session_id = self.remote_server.session.session_id
         self.lbl_session_id.setText(f"Session ID: {self.remote_server.session.session_id}")
         self.lbl_passcode.setText(
             f"Session Passcode (PIN): {self.remote_server.session.session_passcode}"
@@ -433,6 +437,23 @@ class RemoteProducerDialog(QDialog):
         self.lbl_cert_summary.setText("\n".join(lines))
 
     def _refresh_live_status(self) -> None:
+        running_now = bool(self.remote_server.is_running)
+        port_now = int(self.remote_server.port)
+        sid_now = self.remote_server.session.session_id
+        if (
+            sid_now != self._displayed_session_id
+            or running_now != self._displayed_running
+            or port_now != self._displayed_port
+        ):
+            with QSignalBlocker(self.chk_enable_server):
+                self.chk_enable_server.setChecked(running_now)
+            if not self.spin_port.hasFocus():
+                with QSignalBlocker(self.spin_port):
+                    self.spin_port.setValue(port_now)
+            self._displayed_running = running_now
+            self._displayed_port = port_now
+            self._refresh_qr_and_link()
+
         if self.remote_server.is_running:
             count = self.remote_server.connected_client_count
             if self.audio_engine.remote_talkback_active:

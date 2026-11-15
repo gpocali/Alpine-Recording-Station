@@ -26,6 +26,7 @@ import http.cookies
 import json
 import logging
 import math
+import os
 import secrets
 import socket
 import struct
@@ -44,6 +45,7 @@ from app.audio_engine import AudioEngine, linear_to_dbfs, resample_mono_signal
 from app.config_manager import ConfigManager
 from app.network_info import get_lan_ip_addresses
 from app.qr_code import encode_qr_matrix, qr_matrix_to_svg
+from app.session_cli import SessionControlServer, build_session_urls, resolve_runtime_dir
 from app.ssl_manager import CertificateInfo, SslCertificateManager
 
 logger = logging.getLogger("AlpineRecorder.RemoteProducer")
@@ -258,6 +260,7 @@ class RemoteProducerServer:
         on_project_name_changed: Optional[Callable[[str], None]] = None,
         host: str = "0.0.0.0",
         port: Optional[int] = None,
+        runtime_dir: Optional[Path | str] = None,
     ):
         self.audio_engine = audio_engine
         self.config_manager = config_manager
@@ -273,6 +276,7 @@ class RemoteProducerServer:
             port if port is not None else int(getattr(config_manager.settings, "remote_producer_port", 8443))
         )
 
+        self._session_lock = threading.RLock()
         self.session = ProducerSession()
         self._httpd: Optional[_SecureProducerHTTPServer] = None
         self._server_thread: Optional[threading.Thread] = None
@@ -283,6 +287,15 @@ class RemoteProducerServer:
         self._clients: Dict[str, WebSocketConnection] = {}
         self._cert_info: Optional[CertificateInfo] = None
         self._tb_peak_hold_db: float = -60.0
+        resolved_rt_dir = resolve_runtime_dir(
+            etc_config_dir=self.config_manager.etc_config_dir,
+            runtime_dir=runtime_dir,
+        )
+        self._control_server = SessionControlServer(
+            runtime_dir=resolved_rt_dir,
+            state_provider=self.get_session_info,
+            action_handler=self._handle_control_action,
+        )
         self.audio_engine.register_talkback_unlatch_listener(self._on_engine_talkback_unlatched)
         self.audio_engine.register_talkback_state_listener(self._on_engine_talkback_state_changed)
 
@@ -333,15 +346,127 @@ class RemoteProducerServer:
         url = self.get_session_url(include_invite_token=include_invite_token, host_override=host_override)
         return encode_qr_matrix(url)
 
+    def get_session_info(self, host_override: Optional[str] = None) -> Dict[str, Any]:
+        """Build a live metadata & credential snapshot for the CLI control plane."""
+        with self._session_lock:
+            lan_ips = get_lan_ip_addresses()
+            hosts = list(lan_ips) if lan_ips else ["127.0.0.1"]
+            primary = str(host_override).strip() if host_override else (lan_ips[0] if lan_ips else "127.0.0.1")
+            active_port = int(self.port)
+            sid = self.session.session_id
+            pin = self.session.session_passcode
+            token = self.session.invite_token
+            created_at = float(self.session.created_at)
+            session_url, login_url = build_session_urls(primary, active_port, sid, token)
+            cert_info = self._cert_info
+            return {
+                "pid": os.getpid(),
+                "updated_at": time.time(),
+                "session_created_at": created_at,
+                "server_running": bool(self.is_running),
+                "remote_producer_enabled": bool(
+                    getattr(self.config_manager.settings, "remote_producer_enabled", False)
+                ),
+                "port": active_port,
+                "hosts": hosts,
+                "primary_host": primary,
+                "session_id": sid,
+                "session_passcode": pin,
+                "invite_token": token,
+                "session_url": session_url,
+                "login_url": login_url,
+                "project_name": str(self.config_manager.settings.project_name or "Session"),
+                "connected_clients": int(self.connected_client_count),
+                "talent_mic_live": bool(self.audio_engine.is_talent_mic_live_to_producer),
+                "ssl_mode": cert_info.mode if cert_info is not None else "",
+                "ssl_fingerprint_sha256": cert_info.fingerprint_sha256 if cert_info is not None else "",
+            }
+
+    def start_control_server(self, persistent: bool = True) -> bool:
+        """Start the local loopback control server and sync ``web_session.json``."""
+        return self._control_server.start(persistent=persistent)
+
+    def stop_control_server(self) -> None:
+        """Stop the local loopback control server and clean up ``web_session.json``."""
+        self._control_server.persistent = False
+        self._control_server.stop()
+
+    def shutdown(self) -> None:
+        """Fully shut down both the HTTPS server and the CLI control server."""
+        self._control_server.persistent = False
+        self.stop()
+        self._control_server.stop()
+
+    def _handle_control_action(
+        self, action: str, req: Dict[str, Any]
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        if action == "status":
+            return (True, "Active studio session retrieved.", self.get_session_info())
+
+        if action == "rotate":
+            self.rotate_session()
+            return (True, f"Session rotated to {self.session.session_id}.", self.get_session_info())
+
+        if action == "enable":
+            req_port = req.get("port")
+            if req_port is not None:
+                try:
+                    target_port = int(req_port)
+                except (TypeError, ValueError):
+                    return (False, "Invalid port number.", self.get_session_info())
+                if not (1024 <= target_port <= 65535):
+                    return (False, "Port must be between 1024 and 65535.", self.get_session_info())
+            else:
+                if self._configured_port == 0:
+                    target_port = 0
+                else:
+                    target_port = int(
+                        getattr(self.config_manager.settings, "remote_producer_port", self._configured_port)
+                        or 8443
+                    )
+
+            if bool(req.get("rotate", False)):
+                self.rotate_session()
+
+            if self.is_running and self.port != target_port:
+                self.stop()
+
+            ok = self.start(port=target_port)
+            if ok:
+                self.config_manager.settings.remote_producer_enabled = True
+                self.config_manager.settings.remote_producer_port = int(self.port)
+                self.config_manager.save(commit_lbu=True)
+                return (
+                    True,
+                    f"Remote Producer HTTPS server active on port {self.port}.",
+                    self.get_session_info(),
+                )
+            return (
+                False,
+                f"Could not start Remote Producer HTTPS server on port {target_port}.",
+                self.get_session_info(),
+            )
+
+        if action == "disable":
+            self.config_manager.settings.remote_producer_enabled = False
+            self.config_manager.save(commit_lbu=True)
+            self.stop()
+            return (True, "Remote Producer HTTPS server stopped.", self.get_session_info())
+
+        return (False, f"Unsupported action: {action}", self.get_session_info())
+
     def rotate_session(self) -> ProducerSession:
         """
         Rotate session ID, passcode, and invite token, disconnecting any
         existing remote producer clients and releasing remote talkback.
         """
-        self.session.rotate()
+        with self._session_lock:
+            self.session.rotate()
+            sid = self.session.session_id
         self._disconnect_all_clients()
         self.audio_engine.set_remote_talkback(False, latched=False)
-        logger.info("Rotated remote producer session -> %s", self.session.session_id)
+        self._control_server.sync_state()
+        logger.info("Rotated remote producer session -> %s", sid)
         return self.session
 
     def reload_ssl_certificates(self) -> CertificateInfo:
@@ -353,12 +478,16 @@ class RemoteProducerServer:
             port = self._configured_port
             self.stop()
             self.start(port=port)
+        else:
+            self._control_server.sync_state()
         return self._cert_info
 
     def start(self, port: Optional[int] = None) -> bool:
         if port is not None:
             self._configured_port = int(port)
         if self.is_running:
+            self._control_server.start(persistent=self._control_server.persistent)
+            self._control_server.sync_state()
             return True
 
         try:
@@ -400,6 +529,9 @@ class RemoteProducerServer:
             )
             self._broadcast_thread.start()
 
+            self._control_server.start(persistent=self._control_server.persistent)
+            self._control_server.sync_state()
+
             logger.info(
                 "Remote Producer HTTPS server started on https://%s:%d (session %s)",
                 self.get_primary_host(),
@@ -434,6 +566,15 @@ class RemoteProducerServer:
         if self._server_thread and self._server_thread.is_alive():
             self._server_thread.join(timeout=1.5)
         self._server_thread = None
+
+        if self._broadcast_thread and self._broadcast_thread.is_alive():
+            self._broadcast_thread.join(timeout=0.5)
+        self._broadcast_thread = None
+
+        if self._control_server.persistent:
+            self._control_server.sync_state()
+        else:
+            self._control_server.stop()
 
     def _serve_forever(self) -> None:
         httpd = self._httpd
@@ -717,6 +858,7 @@ class RemoteProducerServer:
                 if client:
                     client.close()
         self._recompute_remote_talkback_state()
+        self._control_server.sync_state()
 
     def _recompute_remote_talkback_state(self) -> None:
         with self._clients_lock:
@@ -793,6 +935,7 @@ class RemoteProducerServer:
             except Exception as exc:
                 logger.warning("on_project_name_changed callback failed: %s", exc)
         self.broadcast_state_snapshot()
+        self._control_server.sync_state()
         return (True, cleaned)
 
     def _on_engine_talkback_state_changed(self) -> None:
@@ -1038,6 +1181,7 @@ class RemoteProducerServer:
         with self._clients_lock:
             self._clients[ws_conn.client_id] = ws_conn
 
+        self._control_server.sync_state()
         logger.info("Remote producer connected (%s, client=%s)", handler.client_address[0], ws_conn.client_id)
 
         try:
@@ -1070,6 +1214,7 @@ class RemoteProducerServer:
                 self._clients.pop(ws_conn.client_id, None)
             ws_conn.close()
             self._recompute_remote_talkback_state()
+            self._control_server.sync_state()
             logger.info("Remote producer disconnected (client=%s)", ws_conn.client_id)
 
     def _handle_ws_json(self, ws_conn: WebSocketConnection, payload: bytes) -> None:

@@ -951,6 +951,7 @@ class MainWindow(QMainWindow):
                 self.remote_producer_server.start(
                     port=int(getattr(self.config_manager.settings, "remote_producer_port", 8443))
                 )
+        self.remote_producer_server.start_control_server(persistent=True)
 
         self.setWindowTitle("Alpine Recording Station")
         self.setMinimumSize(640, 420)
@@ -969,6 +970,8 @@ class MainWindow(QMainWindow):
         self._last_observed_tb_latched = False
         self._last_observed_remote_tb = False
         self._last_observed_producer_count = 0
+        self._last_observed_producer_running = self.remote_producer_server.is_running
+        self._last_observed_producer_port = self.remote_producer_server.port
         self._last_observed_mute_state = False
         self._pause_blink_phase = True
         self._last_storage_refresh_monotonic: float = 0.0
@@ -2451,6 +2454,8 @@ class MainWindow(QMainWindow):
         tb_latched_now = self.audio_engine.talkback_latched
         rem_tb_now = self.audio_engine.remote_talkback_active
         prod_count_now = self.remote_producer_server.connected_client_count
+        prod_running_now = self.remote_producer_server.is_running
+        prod_port_now = self.remote_producer_server.port
         mute_active_now = bool(
             self.audio_engine.talent_cough_muted
             or not self.audio_engine.talent_mic_send_enabled
@@ -2464,6 +2469,8 @@ class MainWindow(QMainWindow):
             or tb_latched_now != self._last_observed_tb_latched
             or rem_tb_now != self._last_observed_remote_tb
             or prod_count_now != self._last_observed_producer_count
+            or prod_running_now != self._last_observed_producer_running
+            or prod_port_now != self._last_observed_producer_port
             or mute_active_now != self._last_observed_mute_state
             or blink_now != self._pause_blink_phase
         ):
@@ -2471,6 +2478,8 @@ class MainWindow(QMainWindow):
             self._last_observed_tb_latched = tb_latched_now
             self._last_observed_remote_tb = rem_tb_now
             self._last_observed_producer_count = prod_count_now
+            self._last_observed_producer_running = prod_running_now
+            self._last_observed_producer_port = prod_port_now
             self._last_observed_mute_state = mute_active_now
             self._pause_blink_phase = blink_now
             self._refresh_transport_styles()
@@ -2637,7 +2646,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.sayo_led_controller.close()
-        self.remote_producer_server.stop()
+        self.remote_producer_server.shutdown()
         self.audio_engine.stop_monitoring()
         self.audio_engine.stop_recording()
         self.audio_engine.stop_playback()

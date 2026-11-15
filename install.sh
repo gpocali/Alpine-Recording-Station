@@ -280,6 +280,7 @@ if command -v python3 >/dev/null 2>&1; then
         "${APP_DEST}/app/qr_code.py" \
         "${APP_DEST}/app/ssl_manager.py" \
         "${APP_DEST}/app/remote_producer.py" \
+        "${APP_DEST}/app/session_cli.py" \
         "${APP_DEST}/app/sayodevice_led.py" \
         "${APP_DEST}/app/ui/main_window.py" \
         "${APP_DEST}/app/ui/file_manager_dialog.py" \
@@ -425,6 +426,7 @@ if command -v lbu >/dev/null 2>&1; then
     lbu include "${APP_DEST}/app/qr_code.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/ssl_manager.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/remote_producer.py" 2>/dev/null || true
+    lbu include "${APP_DEST}/app/session_cli.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/sayodevice_led.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/ui/file_manager_dialog.py" 2>/dev/null || true
     lbu include "${APP_DEST}/app/ui/remote_producer_dialog.py" 2>/dev/null || true
@@ -446,6 +448,8 @@ if command -v lbu >/dev/null 2>&1; then
 
     # Exclude /storage so recorded WAV files are never packed into RAM overlay
     lbu exclude "${STORAGE_DIR}" 2>/dev/null || true
+    # Exclude ephemeral runtime session socket metadata from LBU overlay
+    lbu exclude "${ETC_CONFIG_DIR}/runtime" 2>/dev/null || true
     # Exclude Samba runtime sockets in /var/lib/samba/private/msg.sock to prevent lbu commit errors
     lbu exclude /var/lib/samba/private/msg.sock 2>/dev/null || true
 

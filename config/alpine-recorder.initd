@@ -38,4 +38,7 @@ stop_post() {
     if ! pgrep -x Xorg >/dev/null 2>&1; then
         rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null || true
     fi
+    if ! pgrep -f "python3 -m app.main" >/dev/null 2>&1; then
+        rm -f /run/alpine-recorder/web_session.json 2>/dev/null || true
+    fi
 }

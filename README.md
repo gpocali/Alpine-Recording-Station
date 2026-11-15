@@ -34,6 +34,7 @@ An optimized **Alpine Linux** kiosk configuration and fullscreen studio applicat
   - **Stripped-Down Studio Web UI**: Matches the talent's dark studio theme with a live 60-segment LED VU & Peak Hold meter, elapsed timer, recording/pause/talkback state banner, session take count, and remaining storage time, while intentionally omitting hardware configuration, Samba administration, and transport mutation controls so the talent retains full independent control.
   - **SSL/TLS by Default with Easy Certificate Replacement**: Automatically generates a valid X.509 v3 self-signed certificate (with SANs for `localhost` and LAN IPv4 addresses) out of the box, and supports one-click replacement with CA-issued certificates dropped into `/storage/ssl/` (`server.crt` + `server.key`) over Samba or via custom certificate paths.
   - **Session-Tied Authentication, QR Code & Invite Link**: Generates a unique **Session ID** (`ARS-XXXX`), 6-digit **Session Passcode (PIN)**, scannable **QR Code**, and copyable HTTPS invite link; rotating the session immediately revokes prior tokens, cookies, and active WebSocket connections.
+  - **Headless CLI Session Retrieval & Live Control (`alpine-recorder session`)**: Retrieve the active Session ID, 6-digit PIN, invite token, HTTPS invite/login URLs, and a scannable Unicode terminal QR code directly from SSH or a local console—or enable, disable, and rotate the web session live (`--url`, `--pin`, `--key`, `--json`, `enable`, `disable`, `rotate`) without restarting the kiosk UI.
   - **Bidirectional Mic Privacy & Cough Controls**: Both the local Talent Studio Deck (`◉ MIC TO PRODUCER` / `Hold [B]` Cough Mute) and the Remote Producer web console (`Send Producer Mic` switch defaulting to `OFF (Private)` + `Hold [C]` / `[M]` Cough Mute) provide dedicated privacy and cough controls so neither microphone is ever unexpectedly hot.
 - **Project Subfolders, Fullscreen Storage File Manager & Direct File Management**:
   - Each project stores its recordings inside a dedicated subfolder: `/storage/<ProjectName>/<ProjectName>_yyyy-mm-dd_HH.MM.SS_TZ.wav`.
@@ -150,7 +151,10 @@ alpine-recorder doctor        # Check display nodes (/dev/dri, /dev/fb), Xorg, P
 alpine-recorder sayo-test     # Probe SayoDevice 1x4P (VID 0x8089) and run a 4-button LED test cycle
 alpine-recorder fix-packages  # Restore and cache missing X11/PyQt6 packages across diskless reboots
 alpine-recorder logs          # View recent errors from /var/log/alpine-recorder.log and Xorg logs
-alpine-recorder status        # Check OpenRC service status, running PIDs, and recent logs
+alpine-recorder status        # Check OpenRC service status, running PIDs, web session summary & logs
+alpine-recorder session       # Show current Remote Producer Session ID, PIN, token, URL & terminal QR
+alpine-recorder session --url # Print only the HTTPS auto-login invite URL (also --pin, --key, --id, --json)
+alpine-recorder session enable  # Start the Remote Producer HTTPS server live (or 'disable' / 'rotate')
 alpine-recorder run           # Launch X11 & recorder in the foreground with console error output
 alpine-recorder stop          # Stop the kiosk service and switch back to tty1
 alpine-recorder restart       # Restart the background VT7 kiosk service
@@ -177,6 +181,7 @@ alpine-recorder recover       # Emergency recovery: stop Xorg, clean tty1 config
 - [`app/qr_code.py`](app/qr_code.py) — Pure-Python ISO/IEC 18004 QR Code matrix and SVG generator for session invite links.
 - [`app/ssl_manager.py`](app/ssl_manager.py) — Default X.509 v3 self-signed certificate generator and `/storage/ssl` issued-certificate importer.
 - [`app/remote_producer.py`](app/remote_producer.py) — HTTPS + RFC 6455 WebSocket server, session-bound authenticator, and stripped-down Guided VO Remote Producer web console.
+- [`app/session_cli.py`](app/session_cli.py) — Dependency-light CLI client & loopback control plane (`alpine-recorder session`) for retrieving live session keys, terminal QR codes, and toggling/rotating the web interface over SSH.
 - [`app/sayodevice_led.py`](app/sayodevice_led.py) — Hotplug-aware USB HID (`/dev/hidraw*`) & Linux `EV_LED` (`/dev/input/event*`) status LED controller for the SayoDevice 1x4P macro pad.
 - [`app/ui/main_window.py`](app/ui/main_window.py) — Responsive fullscreen PyQt6 studio interface.
 - [`app/ui/file_manager_dialog.py`](app/ui/file_manager_dialog.py) — Fullscreen Storage File Manager across all projects with file playback/renaming/deletion, 2-step confirmed recursive project cleanup/deletion, and live drive utilization.

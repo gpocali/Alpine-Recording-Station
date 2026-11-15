@@ -5,6 +5,7 @@
 # Usage:
 #   alpine-recorder [run] [--vt N] [-- app_args...]   Launch kiosk in foreground
 #   alpine-recorder start|stop|restart|status         Control OpenRC service
+#   alpine-recorder session [subcommand] [options]    Show/control web session key
 #   alpine-recorder enable|disable                    Enable/disable boot service
 #   alpine-recorder logs                              View Xorg & recorder logs
 #   alpine-recorder doctor                            Run hardware/X11 diagnostics
@@ -424,6 +425,12 @@ show_status() {
     fi
     if pgrep -fa "python3 -m app.main" >/dev/null 2>&1; then
         log_ok "Recorder UI is running: $(pgrep -fa 'python3 -m app.main' | head -n 1)"
+        if command -v python3 >/dev/null 2>&1; then
+            session_summary="$(PYTHONPATH="${APP_DIR}" python3 -m app.session_cli --summary 2>/dev/null || true)"
+            if [ -n "${session_summary}" ]; then
+                log_info "${session_summary}"
+            fi
+        fi
     else
         log_warn "Recorder UI is not running."
     fi
@@ -480,6 +487,10 @@ case "$cmd" in
     status)
         show_status
         ;;
+    session|web-session|session-key)
+        PYTHON_BIN="$(command -v python3 2>/dev/null || echo /usr/bin/python3)"
+        PYTHONPATH="${APP_DIR}" "${PYTHON_BIN}" -m app.session_cli "$@"
+        ;;
     enable)
         if command -v rc-update >/dev/null 2>&1; then
             rc-update add alpine-recorder default
@@ -522,6 +533,8 @@ case "$cmd" in
         echo "  stop             Stop the kiosk service and return to tty1 console"
         echo "  restart          Restart the kiosk service"
         echo "  status           Show service status, running processes, and recent log output"
+        echo "  session          Show or control the Remote Producer web session key/URL/PIN/QR"
+        echo "                   (e.g. 'session [status|enable|disable|rotate|url|pin|key|qr] [--json]')"
         echo "  enable           Enable automatic post-boot startup via OpenRC"
         echo "  disable          Disable automatic post-boot startup (manual mode for troubleshooting)"
         echo "  logs             Show recent application and Xorg log output"

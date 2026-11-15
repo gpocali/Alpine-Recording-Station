@@ -1766,6 +1766,7 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
             "app/qr_code.py",
             "app/ssl_manager.py",
             "app/remote_producer.py",
+            "app/session_cli.py",
             "app/ui/remote_producer_dialog.py",
         ):
             self.assertIn(rel_file, install_sh)
@@ -1779,6 +1780,7 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
         self.assertIn('lbu include "${APP_DEST}/app/qr_code.py"', install_sh)
         self.assertIn('lbu include "${APP_DEST}/app/ssl_manager.py"', install_sh)
         self.assertIn('lbu include "${APP_DEST}/app/remote_producer.py"', install_sh)
+        self.assertIn('lbu include "${APP_DEST}/app/session_cli.py"', install_sh)
         self.assertIn('lbu include "${APP_DEST}/app/ui/remote_producer_dialog.py"', install_sh)
         self.assertIn('lbu include "${ETC_CONFIG_DIR}/ssl"', install_sh)
         self.assertIn("lbu commit", install_sh)
@@ -2021,6 +2023,98 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
             finally:
                 win.close()
                 app.processEvents()
+
+    def test_remote_producer_server_session_cli_end_to_end(self) -> None:
+        import contextlib
+        import io
+        import json
+        from app.remote_producer import RemoteProducerServer
+        from app.session_cli import SESSION_STATE_FILENAME, main as session_cli_main
+
+        def _invoke_cli(argv: list[str]) -> tuple[int, str, str]:
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc = session_cli_main(argv)
+            return rc, out_buf.getvalue(), err_buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = ConfigManager(
+                storage_dir=str(base / "storage"),
+                etc_config_dir=str(base / "etc"),
+            )
+            rt_dir = base / "runtime"
+            engine = AudioEngine(simulate_if_empty=True)
+            server = RemoteProducerServer(
+                audio_engine=engine,
+                config_manager=cfg,
+                host="127.0.0.1",
+                port=0,
+                runtime_dir=rt_dir,
+            )
+            self.assertTrue(server.start_control_server(persistent=True))
+            try:
+                state_file = rt_dir / SESSION_STATE_FILENAME
+                self.assertTrue(state_file.is_file())
+
+                # 1. Status while HTTPS server is disabled
+                rc, out, err = _invoke_cli(["--runtime-dir", str(rt_dir), "--json"])
+                self.assertEqual(rc, 0, err)
+                data0 = json.loads(out)
+                self.assertTrue(data0["ok"])
+                self.assertFalse(data0["server_running"])
+                self.assertEqual(data0["session_id"], server.session.session_id)
+                self.assertEqual(data0["session_passcode"], server.session.session_passcode)
+                self.assertEqual(data0["invite_token"], server.session.invite_token)
+
+                # 2. Enable via CLI (uses ephemeral port=0 configured on server)
+                rc, out, err = _invoke_cli(["--runtime-dir", str(rt_dir), "enable", "--json"])
+                self.assertEqual(rc, 0, err)
+                data1 = json.loads(out)
+                self.assertTrue(data1["ok"])
+                self.assertTrue(data1["server_running"])
+                self.assertTrue(server.is_running)
+                self.assertTrue(cfg.settings.remote_producer_enabled)
+
+                # 3. Rotate via CLI
+                old_sid = server.session.session_id
+                old_pin = server.session.session_passcode
+                old_tok = server.session.invite_token
+                rc, out, err = _invoke_cli(["--runtime-dir", str(rt_dir), "rotate", "--json"])
+                self.assertEqual(rc, 0, err)
+                data2 = json.loads(out)
+                self.assertTrue(data2["ok"])
+                self.assertNotEqual(data2["session_id"], old_sid)
+                self.assertNotEqual(data2["invite_token"], old_tok)
+                self.assertEqual(data2["session_id"], server.session.session_id)
+                self.assertEqual(data2["session_passcode"], server.session.session_passcode)
+                self.assertTrue((data2["session_id"] != old_sid) or (data2["session_passcode"] != old_pin))
+
+                # 4. Single-value queries match rotated session
+                for flag, expected in (
+                    ("--url", server.get_session_url(include_invite_token=True)),
+                    ("--pin", server.session.session_passcode),
+                    ("--key", server.session.invite_token),
+                    ("--id", server.session.session_id),
+                ):
+                    rc, val_out, val_err = _invoke_cli(["--runtime-dir", str(rt_dir), flag])
+                    self.assertEqual(rc, 0, val_err)
+                    self.assertEqual(val_out.strip(), expected)
+
+                # 5. Disable via CLI keeps control server alive while kiosk runs
+                rc, out, err = _invoke_cli(["--runtime-dir", str(rt_dir), "disable", "--json"])
+                self.assertEqual(rc, 0, err)
+                data3 = json.loads(out)
+                self.assertTrue(data3["ok"])
+                self.assertFalse(data3["server_running"])
+                self.assertFalse(server.is_running)
+                self.assertFalse(cfg.settings.remote_producer_enabled)
+                self.assertTrue(state_file.is_file())
+            finally:
+                server.shutdown()
+
+            self.assertFalse((rt_dir / SESSION_STATE_FILENAME).exists())
 
 
 class TestStorageFileManagerAndRecursiveDeletion(unittest.TestCase):
