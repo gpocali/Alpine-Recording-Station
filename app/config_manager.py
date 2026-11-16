@@ -26,6 +26,8 @@ PROTECTED_STORAGE_DIRS: frozenset[str] = frozenset({
     "lost+found",
     "ssl",
 })
+MAX_PROJECT_NAME_LENGTH: int = 96
+_PROTECTED_STORAGE_LOWER: frozenset[str] = frozenset(d.lower() for d in PROTECTED_STORAGE_DIRS)
 
 STORAGE_WARN_USED_PERCENT: float = 80.0
 STORAGE_CRITICAL_USED_PERCENT: float = 90.0
@@ -130,14 +132,26 @@ def sanitize_project_name(name: str) -> str:
     """Sanitize a project name so it is safe for filenames on Linux and Windows/Samba.
 
     Replaces characters invalid in SMB/Windows/POSIX filenames with underscores,
-    and strips leading/trailing whitespace. Defaults to 'Project' if empty.
+    strips leading/trailing whitespace and dots, blocks path traversal or protected
+    system directories, and enforces a safe maximum length. Defaults to 'Project' if empty.
     """
-    cleaned = name.strip()
+    cleaned = (name or "").strip()
+    if (
+        not cleaned
+        or cleaned.startswith(".")
+        or cleaned.lower() in _PROTECTED_STORAGE_LOWER
+    ):
+        return "Project"
     # Replace characters not allowed in Windows/SMB or Linux filenames
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", cleaned)
     # Collapse consecutive spaces into a single underscore or keep clean characters
     cleaned = re.sub(r"\s+", "_", cleaned)
-    return cleaned if cleaned else "Project"
+    # Prevent '.', '..', hidden dot-directories, and trailing dots (invalid in Windows/SMB)
+    cleaned = cleaned.strip(". ")
+    cleaned = cleaned[:MAX_PROJECT_NAME_LENGTH].rstrip(". ")
+    if not cleaned or cleaned in (".", "..") or cleaned.lower() in _PROTECTED_STORAGE_LOWER:
+        return "Project"
+    return cleaned
 
 
 _TAKE_NUMBER_RE = re.compile(
@@ -220,6 +234,10 @@ class RecorderSettings:
     remote_producer_port: int = 8443
     remote_producer_send_talent_mic: bool = True
     remote_producer_allow_project_rename: bool = False
+    remote_producer_max_login_attempts: int = 5
+    remote_producer_lockout_window_sec: int = 300
+    remote_producer_ban_duration_sec: int = 900
+    remote_producer_trusted_proxies: str = "127.0.0.1,::1"
     ssl_cert_path: str = ""
     ssl_key_path: str = ""
     storage_dir: str = DEFAULT_STORAGE_DIR
@@ -1037,7 +1055,12 @@ class ConfigManager:
     def is_protected_storage_name(name: str) -> bool:
         """Return True if a folder/file name inside /storage is reserved for system use."""
         cleaned = (name or "").strip()
-        if not cleaned or cleaned.startswith(".") or cleaned in PROTECTED_STORAGE_DIRS:
+        if (
+            not cleaned
+            or cleaned in (".", "..")
+            or cleaned.startswith(".")
+            or cleaned.lower() in _PROTECTED_STORAGE_LOWER
+        ):
             return True
         return False
 

@@ -42,6 +42,7 @@ class _FakeProducerBackend:
         self.project_name = "StudioDemo"
         self.connected_clients = 2
         self._rotate_seq = 0
+        self.banned_ips = [{"ip": "203.0.113.99", "remaining_seconds": 300, "ban_count": 1}]
         self.control_server = SessionControlServer(
             runtime_dir=runtime_dir,
             state_provider=self.get_state,
@@ -72,6 +73,8 @@ class _FakeProducerBackend:
             "talent_mic_live": True,
             "ssl_mode": "self-signed",
             "ssl_fingerprint_sha256": "AB:CD:EF:12:34:56:78:90:AA:BB:CC:DD",
+            "banned_ip_count": len(self.banned_ips),
+            "banned_ips": list(self.banned_ips),
         }
 
     def handle_action(
@@ -104,6 +107,10 @@ class _FakeProducerBackend:
             self.server_running = False
             self.remote_producer_enabled = False
             return (True, "Remote Producer HTTPS server stopped.", self.get_state())
+        if action == "unban":
+            cleared = len(self.banned_ips)
+            self.banned_ips = []
+            return (True, f"Cleared {cleared} Fail2Ban IP lockout(s).", self.get_state())
         return (False, f"Unsupported action: {action}", self.get_state())
 
 
@@ -213,6 +220,7 @@ class TestSessionCli(unittest.TestCase):
                 self.assertIn("ARS-1A2B", out)
                 self.assertIn("482910", out)
                 self.assertIn("tok_initial_12345", out)
+                self.assertIn("Locked-Out IPs:     1 — 203.0.113.99 (300s)", out)
                 self.assertTrue(any(ch in out for ch in ("█", "▀", "▄")))
 
                 # 6. Summary while active shows URL + session ID, no PIN/token
@@ -265,6 +273,16 @@ class TestSessionCli(unittest.TestCase):
                 self.assertEqual(rot_data["session_id"], "ARS-ROT1")
                 self.assertEqual(rot_data["session_passcode"], "700001")
                 self.assertEqual(rot_data["invite_token"], "tok_rotated_1")
+                self.assertEqual(rot_data["banned_ip_count"], 1)
+
+                # 10b. Unban locked-out IPs live
+                rc, out, err = _run_cli(["--runtime-dir", str(rt_dir), "unban", "--json"])
+                self.assertEqual(rc, 0, err)
+                unban_data = json.loads(out)
+                self.assertTrue(unban_data["ok"])
+                self.assertEqual(unban_data["action"], "unban")
+                self.assertEqual(unban_data["banned_ip_count"], 0)
+                self.assertEqual(len(backend.banned_ips), 0)
 
                 # 11. Disable server live
                 rc, out, err = _run_cli(["--runtime-dir", str(rt_dir), "disable", "--json"])

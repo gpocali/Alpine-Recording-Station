@@ -380,7 +380,7 @@ class SessionControlServer:
                 return
 
             action = str(req.get("action") or "status").lower().strip()
-            if action not in ("status", "enable", "disable", "rotate"):
+            if action not in ("status", "enable", "disable", "rotate", "unban"):
                 self._send_reply(conn, {"ok": False, "error": f"Unsupported action: {action}"})
                 return
 
@@ -551,6 +551,7 @@ _VALID_COMMANDS = (
     "token",
     "id",
     "qr",
+    "unban",
 )
 
 
@@ -564,11 +565,12 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         nargs="?",
         default=None,
         choices=_VALID_COMMANDS,
-        help="Optional subcommand (status, enable, disable, rotate, url, pin, key, id, qr).",
+        help="Optional subcommand (status, enable, disable, rotate, unban, url, pin, key, id, qr).",
     )
     parser.add_argument("--enable", action="store_true", help="Enable and start the HTTPS web server.")
     parser.add_argument("--disable", action="store_true", help="Stop and disable the HTTPS web server.")
     parser.add_argument("--rotate", action="store_true", help="Generate a new Session ID, PIN, and invite token.")
+    parser.add_argument("--unban", action="store_true", help="Clear all temporary Fail2Ban login IP lockouts.")
     parser.add_argument("--port", type=int, default=None, help="HTTPS port when enabling (1024-65535).")
     parser.add_argument("--host", default=None, help="Override IP/hostname shown in session URLs and QR code.")
     parser.add_argument("--url", action="store_true", help="Print only the auto-login invite URL.")
@@ -613,10 +615,13 @@ def _determine_action(args: argparse.Namespace) -> Tuple[str, bool]:
     want_enable = bool(args.enable or cmd in ("enable", "start"))
     want_disable = bool(args.disable or cmd in ("disable", "stop"))
     want_rotate = bool(args.rotate or cmd in ("rotate", "new"))
+    want_unban = bool(args.unban or cmd == "unban")
 
     if want_enable and want_disable:
         raise ValueError("Cannot specify both --enable and --disable together.")
 
+    if want_unban:
+        return ("unban", False)
     if want_enable:
         return ("enable", want_rotate)
     if want_disable:
@@ -666,7 +671,7 @@ def _print_human_session_report(
     print("=============================================================================")
     print(" Alpine Recording Station - Remote Producer Web Session")
     print("=============================================================================")
-    if action in ("enable", "disable", "rotate") and status_msg:
+    if action in ("enable", "disable", "rotate", "unban") and status_msg:
         print(f" Action:             {status_msg}")
 
     if running:
@@ -675,6 +680,18 @@ def _print_human_session_report(
         print(f" Web Server:         DISABLED (configured port {port})")
     print(f" Project:            {project_name}")
     print(f" Connected Clients:  {connected}")
+    banned_list = state.get("banned_ips") or []
+    banned_count = int(state.get("banned_ip_count") if state.get("banned_ip_count") is not None else len(banned_list))
+    if banned_count > 0:
+        formatted = ", ".join(
+            f"{entry.get('ip', '?')} ({int(entry.get('remaining_seconds') or entry.get('retry_after_sec') or 0)}s)"
+            for entry in banned_list[:5]
+            if isinstance(entry, dict)
+        )
+        suffix = f" — {formatted}" if formatted else ""
+        print(f" Locked-Out IPs:     {banned_count}{suffix}")
+    else:
+        print(" Locked-Out IPs:     0")
     print(f" Session ID:         {sid}")
     print(f" Session PIN:        {pin}")
     print(f" Invite Token:       {token}")

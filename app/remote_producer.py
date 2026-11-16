@@ -23,26 +23,30 @@ import base64
 import hashlib
 import hmac
 import http.cookies
+import ipaddress
 import json
 import logging
 import math
 import os
+import re
 import secrets
 import socket
+import ssl
 import struct
 import threading
 import time
 import urllib.parse
+from collections import deque
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from app.audio_engine import AudioEngine, linear_to_dbfs, resample_mono_signal
-from app.config_manager import ConfigManager
+from app.config_manager import MAX_PROJECT_NAME_LENGTH, ConfigManager, sanitize_project_name
 from app.network_info import get_lan_ip_addresses
 from app.qr_code import encode_qr_matrix, qr_matrix_to_svg
 from app.session_cli import SessionControlServer, build_session_urls, resolve_runtime_dir
@@ -52,10 +56,325 @@ logger = logging.getLogger("AlpineRecorder.RemoteProducer")
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 STREAM_SAMPLE_RATE = 24000  # 24 kHz low-latency wideband voice stream
+MAX_HTTP_CONNECTIONS = 32
+MAX_WS_CLIENTS = 10
+MAX_HTTP_POST_BYTES = 16384
+HTTP_SOCKET_TIMEOUT_SEC = 10.0
+WS_IDLE_TIMEOUT_SEC = 35.0
 
 # Binary WebSocket frame headers
 FRAME_TALENT_AUDIO = 0x01     # Server -> Producer: [0x01, flags, sample_rate_div100_le16, int16_pcm...]
 FRAME_PRODUCER_AUDIO = 0x02   # Producer -> Server: [0x02, flags, sample_rate_div100_le16, int16_pcm...]
+
+
+def normalize_ip_str(raw: str) -> str:
+    """Normalize an IPv4/IPv6 address string (unwrapping IPv4-mapped IPv6), or return ''."""
+    candidate = (raw or "").strip()
+    if not candidate:
+        return ""
+    if candidate.startswith("["):
+        end_bracket = candidate.find("]")
+        if end_bracket == -1:
+            return ""
+        candidate = candidate[1:end_bracket]
+    if "%" in candidate:
+        candidate = candidate.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(candidate)
+    except ValueError:
+        if candidate.count(":") == 1 and "." in candidate:
+            host_part = candidate.split(":", 1)[0]
+            try:
+                addr = ipaddress.ip_address(host_part)
+            except ValueError:
+                return ""
+        else:
+            return ""
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return addr.compressed
+
+
+def parse_trusted_proxies(spec: str) -> Tuple[ipaddress._BaseNetwork, ...]:
+    """Parse a comma/whitespace-separated list of trusted proxy IPs or CIDR subnets."""
+    networks: List[ipaddress._BaseNetwork] = []
+    for token in re.split(r"[\s,]+", (spec or "").strip()):
+        tok = token.strip()
+        if not tok:
+            continue
+        if tok.startswith("[") and tok.endswith("]"):
+            tok = tok[1:-1]
+        if "%" in tok and "/" not in tok:
+            tok = tok.split("%", 1)[0]
+        try:
+            net = ipaddress.ip_network(tok, strict=False)
+            if (
+                isinstance(net, ipaddress.IPv6Network)
+                and net.prefixlen == 128
+                and net.network_address.ipv4_mapped is not None
+            ):
+                net = ipaddress.ip_network(net.network_address.ipv4_mapped)
+            networks.append(net)
+        except ValueError:
+            logger.warning("Ignoring invalid trusted proxy entry %r", tok)
+    return tuple(networks)
+
+
+def is_ip_trusted(ip_str: str, trusted_networks: Tuple[ipaddress._BaseNetwork, ...]) -> bool:
+    """Return True if ``ip_str`` belongs to any network in ``trusted_networks``."""
+    if not trusted_networks:
+        return False
+    norm = normalize_ip_str(ip_str)
+    if not norm:
+        return False
+    try:
+        addr = ipaddress.ip_address(norm)
+    except ValueError:
+        return False
+    return any(addr.version == net.version and addr in net for net in trusted_networks)
+
+
+def resolve_client_ip(
+    peer_ip: str,
+    x_forwarded_for: str = "",
+    x_real_ip: str = "",
+    trusted_networks: Tuple[ipaddress._BaseNetwork, ...] = (),
+) -> str:
+    """Resolve the effective client IP for rate limiting, honoring forwarding headers only from trusted proxies."""
+    peer = normalize_ip_str(peer_ip) or (peer_ip or "unknown").strip() or "unknown"
+    if not is_ip_trusted(peer, trusted_networks):
+        return peer
+
+    if x_forwarded_for:
+        chain: List[str] = []
+        for part in x_forwarded_for.split(","):
+            norm = normalize_ip_str(part)
+            if norm:
+                chain.append(norm)
+        if chain:
+            for candidate in reversed(chain):
+                if not is_ip_trusted(candidate, trusted_networks):
+                    return candidate
+            return chain[0]
+
+    if x_real_ip:
+        real = normalize_ip_str(x_real_ip)
+        if real:
+            return real
+
+    return peer
+
+
+@dataclass
+class _IpAttemptRecord:
+    failures: Deque[float] = field(default_factory=deque)
+    banned_until: float = 0.0
+    ban_count: int = 0
+    last_seen: float = 0.0
+
+
+class LoginRateLimiter:
+    """Fail2Ban-style thread-safe sliding-window login attempt limiter with escalating IP bans."""
+
+    def __init__(
+        self,
+        max_attempts: int = 5,
+        window_seconds: float = 300.0,
+        ban_seconds: float = 900.0,
+        max_ban_seconds: Optional[float] = None,
+        max_tracked_ips: int = 4096,
+        global_max_failures: int = 40,
+        global_window_seconds: float = 60.0,
+        global_cooldown_seconds: float = 60.0,
+        clock_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._clock = clock_fn
+        self._records: Dict[str, _IpAttemptRecord] = {}
+        self._global_failures: Deque[float] = deque()
+        self._global_cooldown_until: float = 0.0
+
+        self.max_attempts = max(1, int(max_attempts))
+        self.window_seconds = max(10.0, float(window_seconds))
+        self.ban_seconds = max(10.0, float(ban_seconds))
+        cap = 7200.0 if max_ban_seconds is None else float(max_ban_seconds)
+        self.max_ban_seconds = max(self.ban_seconds, cap)
+        self.max_tracked_ips = max(16, int(max_tracked_ips))
+        self.global_max_failures = max(5, int(global_max_failures))
+        self.global_window_seconds = max(5.0, float(global_window_seconds))
+        self.global_cooldown_seconds = max(5.0, float(global_cooldown_seconds))
+
+    def configure(
+        self,
+        max_attempts: Optional[int] = None,
+        window_seconds: Optional[float] = None,
+        ban_seconds: Optional[float] = None,
+        max_ban_seconds: Optional[float] = None,
+    ) -> None:
+        """Update rate-limiter thresholds in place while preserving active bans."""
+        with self._lock:
+            if max_attempts is not None:
+                self.max_attempts = max(1, int(max_attempts))
+            if window_seconds is not None:
+                self.window_seconds = max(10.0, float(window_seconds))
+            if ban_seconds is not None:
+                self.ban_seconds = max(10.0, float(ban_seconds))
+            if max_ban_seconds is not None:
+                self.max_ban_seconds = max(self.ban_seconds, float(max_ban_seconds))
+            else:
+                self.max_ban_seconds = max(self.ban_seconds, self.max_ban_seconds)
+
+    def _prune_stale_locked(self, now: float) -> None:
+        g_cutoff = now - self.global_window_seconds
+        while self._global_failures and self._global_failures[0] < g_cutoff:
+            self._global_failures.popleft()
+
+        w_cutoff = now - self.window_seconds
+        escalation_ttl = max(self.ban_seconds * 4.0, 3600.0)
+        stale_ips: List[str] = []
+        for ip, rec in self._records.items():
+            while rec.failures and rec.failures[0] < w_cutoff:
+                rec.failures.popleft()
+            if rec.banned_until <= now:
+                if not rec.failures and (
+                    rec.ban_count <= 0 or (now - rec.last_seen) > escalation_ttl
+                ):
+                    stale_ips.append(ip)
+        for ip in stale_ips:
+            self._records.pop(ip, None)
+
+    def check_allowed(self, ip: str) -> Tuple[bool, int]:
+        """Return ``(allowed, retry_after_seconds)`` for ``ip``."""
+        ip_key = (ip or "unknown").strip() or "unknown"
+        with self._lock:
+            now = self._clock()
+            rec = self._records.get(ip_key)
+            ip_rem = max(0.0, rec.banned_until - now) if rec is not None else 0.0
+            global_rem = max(0.0, self._global_cooldown_until - now)
+            wait_sec = max(ip_rem, global_rem)
+            if wait_sec > 0.0:
+                return (False, max(1, int(math.ceil(wait_sec))))
+            return (True, 0)
+
+    def record_failure(self, ip: str) -> Tuple[bool, int, int]:
+        """Record a failed login attempt for ``ip``.
+
+        Returns ``(is_banned, retry_after_seconds, attempts_remaining)``.
+        """
+        ip_key = (ip or "unknown").strip() or "unknown"
+        with self._lock:
+            now = self._clock()
+            self._prune_stale_locked(now)
+
+            self._global_failures.append(now)
+            if len(self._global_failures) >= self.global_max_failures:
+                self._global_cooldown_until = max(
+                    self._global_cooldown_until, now + self.global_cooldown_seconds
+                )
+                self._global_failures.clear()
+                logger.warning(
+                    "Global login failure threshold reached (%d failures); activating %ds cooldown",
+                    self.global_max_failures,
+                    int(self.global_cooldown_seconds),
+                )
+
+            rec = self._records.get(ip_key)
+            if rec is not None and rec.banned_until > now:
+                rec.last_seen = now
+                rem = max(
+                    rec.banned_until - now,
+                    max(0.0, self._global_cooldown_until - now),
+                )
+                return (True, max(1, int(math.ceil(rem))), 0)
+
+            if rec is None:
+                if len(self._records) >= self.max_tracked_ips:
+                    unbanned = [k for k, v in self._records.items() if v.banned_until <= now]
+                    if unbanned:
+                        victim = min(unbanned, key=lambda k: self._records[k].last_seen)
+                    else:
+                        victim = min(self._records.keys(), key=lambda k: self._records[k].banned_until)
+                    self._records.pop(victim, None)
+                rec = _IpAttemptRecord()
+                self._records[ip_key] = rec
+
+            escalation_ttl = max(self.ban_seconds * 4.0, 3600.0)
+            if rec.last_seen > 0.0 and (now - rec.last_seen) > escalation_ttl and rec.banned_until <= now:
+                rec.ban_count = 0
+
+            rec.failures.append(now)
+            rec.last_seen = now
+
+            if len(rec.failures) >= self.max_attempts:
+                rec.ban_count += 1
+                duration = min(
+                    self.max_ban_seconds,
+                    self.ban_seconds * (2 ** (rec.ban_count - 1)),
+                )
+                rec.banned_until = now + duration
+                rec.failures.clear()
+                logger.warning(
+                    "Fail2Ban lockout triggered for IP %s for %ds (repeat ban #%d)",
+                    ip_key,
+                    int(math.ceil(duration)),
+                    rec.ban_count,
+                )
+                rem = max(duration, max(0.0, self._global_cooldown_until - now))
+                return (True, max(1, int(math.ceil(rem))), 0)
+
+            if self._global_cooldown_until > now:
+                g_rem = self._global_cooldown_until - now
+                return (True, max(1, int(math.ceil(g_rem))), 0)
+
+            remaining = max(0, self.max_attempts - len(rec.failures))
+            return (False, 0, remaining)
+
+    def record_success(self, ip: str) -> None:
+        """Clear prior failed-attempt history for ``ip`` after successful authentication."""
+        ip_key = (ip or "unknown").strip() or "unknown"
+        with self._lock:
+            now = self._clock()
+            rec = self._records.get(ip_key)
+            if rec is not None and rec.banned_until <= now:
+                self._records.pop(ip_key, None)
+
+    def clear_all(self) -> int:
+        """Clear all tracked failures, active IP bans, and global cooldown. Return active bans cleared."""
+        with self._lock:
+            now = self._clock()
+            active = sum(1 for rec in self._records.values() if rec.banned_until > now)
+            if self._global_cooldown_until > now and active == 0:
+                active = 1
+            self._records.clear()
+            self._global_failures.clear()
+            self._global_cooldown_until = 0.0
+            return active
+
+    def unban_ip(self, ip: str) -> bool:
+        """Remove a specific IP from the lockout/tracking table. Return True if it was actively banned."""
+        ip_key = normalize_ip_str(ip) or (ip or "").strip()
+        if not ip_key:
+            return False
+        with self._lock:
+            now = self._clock()
+            rec = self._records.pop(ip_key, None)
+            return bool(rec is not None and rec.banned_until > now)
+
+    def get_banned_summary(self) -> List[Dict[str, Any]]:
+        """Return active IP bans sorted by longest remaining lockout."""
+        with self._lock:
+            now = self._clock()
+            self._prune_stale_locked(now)
+            out: List[Dict[str, Any]] = []
+            for ip, rec in self._records.items():
+                if rec.banned_until > now:
+                    out.append({
+                        "ip": ip,
+                        "remaining_seconds": max(1, int(math.ceil(rec.banned_until - now))),
+                        "ban_count": int(rec.ban_count),
+                    })
+            out.sort(key=lambda item: (-int(item["remaining_seconds"]), str(item["ip"])))
+            return out
 
 
 @dataclass
@@ -183,52 +502,89 @@ class WebSocketConnection:
                 return False
 
 
-def _read_exact(sock: socket.socket, n: int) -> Optional[bytes]:
+def _read_exact(
+    sock: socket.socket, n: int, max_idle_seconds: Optional[float] = None
+) -> Optional[bytes]:
     buf = bytearray()
+    deadline = (
+        (time.monotonic() + float(max_idle_seconds))
+        if max_idle_seconds is not None and max_idle_seconds > 0
+        else None
+    )
     while len(buf) < n:
         try:
             chunk = sock.recv(n - len(buf))
-        except socket.timeout:
+        except (socket.timeout, TimeoutError):
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
             continue
+        except ssl.SSLError as exc:
+            if "timed out" in str(exc).lower():
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+                continue
+            return None
         except Exception:
             return None
         if not chunk:
             return None
         buf.extend(chunk)
+        if deadline is not None:
+            deadline = time.monotonic() + float(max_idle_seconds)  # type: ignore[arg-type]
     return bytes(buf)
 
 
-def read_ws_frame(sock: socket.socket, max_payload: int = 262144) -> Optional[Tuple[int, bytes]]:
-    """Read a single RFC 6455 client-to-server frame."""
-    hdr = _read_exact(sock, 2)
+def read_ws_frame(
+    sock: socket.socket,
+    max_payload: int = 262144,
+    *,
+    require_mask: bool = False,
+    max_idle_seconds: Optional[float] = None,
+) -> Optional[Tuple[int, bytes]]:
+    """Read a single RFC 6455 WebSocket frame."""
+    hdr = _read_exact(sock, 2, max_idle_seconds=max_idle_seconds)
     if not hdr:
         return None
     b1, b2 = hdr[0], hdr[1]
+    if (b1 & 0x70) != 0:
+        # No RSV extensions are negotiated
+        return None
+    fin = bool(b1 & 0x80)
     opcode = b1 & 0x0F
     masked = bool(b2 & 0x80)
     length = b2 & 0x7F
 
+    if require_mask and not masked:
+        return None
+
     if length == 126:
-        ext = _read_exact(sock, 2)
+        ext = _read_exact(sock, 2, max_idle_seconds=max_idle_seconds)
         if not ext:
             return None
         length = struct.unpack("!H", ext)[0]
     elif length == 127:
-        ext = _read_exact(sock, 8)
+        ext = _read_exact(sock, 8, max_idle_seconds=max_idle_seconds)
         if not ext:
             return None
         length = struct.unpack("!Q", ext)[0]
+
+    if opcode >= 0x8 and (length > 125 or not fin):
+        return None
 
     if length > max_payload:
         return None
 
     mask_key = b""
     if masked:
-        mask_key = _read_exact(sock, 4)
+        mask_key = _read_exact(sock, 4, max_idle_seconds=max_idle_seconds)
         if not mask_key:
             return None
 
-    payload = _read_exact(sock, length) if length > 0 else b""
+    payload = (
+        _read_exact(sock, length, max_idle_seconds=max_idle_seconds)
+        if length > 0
+        else b""
+    )
     if payload is None:
         return None
 
@@ -244,6 +600,41 @@ def read_ws_frame(sock: socket.socket, max_payload: int = 262144) -> Optional[Tu
 class _SecureProducerHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def __init__(self, *args: Any, max_connections: int = MAX_HTTP_CONNECTIONS, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._conn_sem = threading.BoundedSemaphore(max(4, int(max_connections)))
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._conn_sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_sem.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_sem.release()
+
+    def finish_request(self, request: Any, client_address: Any) -> None:
+        try:
+            request.settimeout(HTTP_SOCKET_TIMEOUT_SEC)
+        except OSError:
+            pass
+        if hasattr(request, "do_handshake"):
+            try:
+                request.do_handshake()
+            except (OSError, ValueError):
+                return
+        super().finish_request(request, client_address)
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        logger.debug("RemoteProducerHTTPS request error from %s", client_address, exc_info=True)
 
 
 class RemoteProducerServer:
@@ -282,6 +673,16 @@ class RemoteProducerServer:
         self._server_thread: Optional[threading.Thread] = None
         self._broadcast_thread: Optional[threading.Thread] = None
         self._running = threading.Event()
+
+        s = self.config_manager.settings
+        self.rate_limiter = LoginRateLimiter(
+            max_attempts=int(getattr(s, "remote_producer_max_login_attempts", 5) or 5),
+            window_seconds=float(getattr(s, "remote_producer_lockout_window_sec", 300) or 300),
+            ban_seconds=float(getattr(s, "remote_producer_ban_duration_sec", 900) or 900),
+        )
+        self._trusted_networks: Tuple[ipaddress._BaseNetwork, ...] = parse_trusted_proxies(
+            str(getattr(s, "remote_producer_trusted_proxies", "127.0.0.1,::1") or "127.0.0.1,::1")
+        )
 
         self._clients_lock = threading.Lock()
         self._clients: Dict[str, WebSocketConnection] = {}
@@ -359,6 +760,7 @@ class RemoteProducerServer:
             created_at = float(self.session.created_at)
             session_url, login_url = build_session_urls(primary, active_port, sid, token)
             cert_info = self._cert_info
+            banned_summary = self.rate_limiter.get_banned_summary()
             return {
                 "pid": os.getpid(),
                 "updated_at": time.time(),
@@ -380,7 +782,121 @@ class RemoteProducerServer:
                 "talent_mic_live": bool(self.audio_engine.is_talent_mic_live_to_producer),
                 "ssl_mode": cert_info.mode if cert_info is not None else "",
                 "ssl_fingerprint_sha256": cert_info.fingerprint_sha256 if cert_info is not None else "",
+                "banned_ip_count": len(banned_summary),
+                "banned_ips": banned_summary,
+                "max_login_attempts": int(self.rate_limiter.max_attempts),
+                "ban_duration_sec": int(self.rate_limiter.ban_seconds),
+                "trusted_proxies": str(
+                    getattr(self.config_manager.settings, "remote_producer_trusted_proxies", "127.0.0.1,::1")
+                ),
             }
+
+    def reload_security_settings(self) -> None:
+        """Reload Fail2Ban rate-limiter thresholds and trusted proxy CIDR networks from ConfigManager."""
+        s = self.config_manager.settings
+        self.rate_limiter.configure(
+            max_attempts=int(getattr(s, "remote_producer_max_login_attempts", 5) or 5),
+            window_seconds=float(getattr(s, "remote_producer_lockout_window_sec", 300) or 300),
+            ban_seconds=float(getattr(s, "remote_producer_ban_duration_sec", 900) or 900),
+        )
+        self._trusted_networks = parse_trusted_proxies(
+            str(getattr(s, "remote_producer_trusted_proxies", "127.0.0.1,::1") or "127.0.0.1,::1")
+        )
+        self._control_server.sync_state()
+
+    def clear_login_bans(self, ip: Optional[str] = None) -> int:
+        """Clear all active login bans (or a single IP if provided)."""
+        if ip and str(ip).strip():
+            cleared = 1 if self.rate_limiter.unban_ip(str(ip)) else 0
+        else:
+            cleared = self.rate_limiter.clear_all()
+        self._control_server.sync_state()
+        return cleared
+
+    def _resolve_client_ip(self, handler: BaseHTTPRequestHandler) -> str:
+        peer = str(handler.client_address[0]) if handler.client_address else ""
+        xff = handler.headers.get("X-Forwarded-For", "")
+        xri = handler.headers.get("X-Real-IP", "")
+        return resolve_client_ip(peer, xff, xri, self._trusted_networks)
+
+    @staticmethod
+    def _normalize_host_port(netloc: str, default_scheme: str = "https") -> Tuple[str, Optional[int]]:
+        clean = (netloc or "").strip()
+        if not clean:
+            return ("", None)
+        try:
+            parsed = urllib.parse.urlsplit(f"{default_scheme}://{clean}")
+            host = (parsed.hostname or "").strip().lower()
+            port = parsed.port
+            if port is None:
+                port = 443 if default_scheme.lower() == "https" else 80
+            return (host, port)
+        except Exception:
+            return (clean.lower(), None)
+
+    def _is_same_origin_request(
+        self, handler: BaseHTTPRequestHandler, *, is_navigation: bool = False
+    ) -> bool:
+        """Validate Origin and Fetch Metadata headers to block CSWSH and cross-site CSRF."""
+        if not is_navigation:
+            sec_site = (handler.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            if sec_site and sec_site not in ("same-origin", "none"):
+                return False
+
+        origin = (handler.headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        if origin.lower() == "null":
+            return False
+
+        try:
+            parsed_origin = urllib.parse.urlsplit(origin)
+        except Exception:
+            return False
+
+        orig_scheme = (parsed_origin.scheme or "").lower()
+        if orig_scheme not in ("https", "http") or not parsed_origin.netloc:
+            return False
+
+        peer_ip = str(handler.client_address[0]) if handler.client_address else ""
+        peer_trusted = is_ip_trusted(peer_ip, self._trusted_networks)
+
+        expected_scheme = "https"
+        if peer_trusted:
+            xf_proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+            if xf_proto in ("http", "https"):
+                expected_scheme = xf_proto
+        if orig_scheme != expected_scheme:
+            return False
+
+        orig_hp = self._normalize_host_port(parsed_origin.netloc, default_scheme=orig_scheme)
+        if not orig_hp[0]:
+            return False
+
+        candidate_hosts: List[str] = []
+        host_hdr = (handler.headers.get("Host") or "").strip()
+        if host_hdr:
+            candidate_hosts.append(host_hdr)
+        if peer_trusted:
+            xf_host = (handler.headers.get("X-Forwarded-Host") or "").strip()
+            for item in xf_host.split(","):
+                item_clean = item.strip()
+                if item_clean:
+                    candidate_hosts.append(item_clean)
+
+        if not candidate_hosts:
+            return False
+
+        for cand in candidate_hosts:
+            cand_hp = self._normalize_host_port(cand, default_scheme=expected_scheme)
+            if not cand_hp[0]:
+                continue
+            if orig_hp == cand_hp:
+                return True
+            if peer_trusted and orig_hp[0] == cand_hp[0]:
+                return True
+
+        return False
 
     def start_control_server(self, persistent: bool = True) -> bool:
         """Start the local loopback control server and sync ``web_session.json``."""
@@ -453,6 +969,14 @@ class RemoteProducerServer:
             self.stop()
             return (True, "Remote Producer HTTPS server stopped.", self.get_session_info())
 
+        if action == "unban":
+            cleared = self.clear_login_bans(req.get("ip"))
+            return (
+                True,
+                f"Cleared {cleared} active login lockout(s).",
+                self.get_session_info(),
+            )
+
         return (False, f"Unsupported action: {action}", self.get_session_info())
 
     def rotate_session(self) -> ProducerSession:
@@ -500,6 +1024,7 @@ class RemoteProducerServer:
 
             class Handler(BaseHTTPRequestHandler):
                 protocol_version = "HTTP/1.1"
+                timeout = HTTP_SOCKET_TIMEOUT_SEC
 
                 def log_message(self, fmt: str, *args: Any) -> None:
                     logger.debug("RemoteProducerHTTP: " + fmt, *args)
@@ -511,7 +1036,11 @@ class RemoteProducerServer:
                     server_ref._handle_http_post(self)
 
             httpd = _SecureProducerHTTPServer((self.host, self._configured_port), Handler)
-            httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
+            httpd.socket = ssl_ctx.wrap_socket(
+                httpd.socket,
+                server_side=True,
+                do_handshake_on_connect=False,
+            )
             self._httpd = httpd
             self._running.set()
 
@@ -922,9 +1451,30 @@ class RemoteProducerServer:
             return (False, "Project name editing is disabled in studio settings.")
         if self.audio_engine.is_recording or self.audio_engine.is_record_paused:
             return (False, "Cannot change project name while recording is in progress.")
-        cleaned = (new_name or "").strip()
-        if not cleaned:
+        raw = (new_name or "").strip()
+        if not raw:
             return (False, "Please enter a valid project name.")
+        if (
+            "/" in raw
+            or "\\" in raw
+            or "\x00" in raw
+            or any(ord(ch) < 32 for ch in raw)
+            or raw.startswith(".")
+        ):
+            return (False, "Project name cannot contain path separators, control characters, or start with a dot.")
+        if len(raw) > MAX_PROJECT_NAME_LENGTH:
+            return (False, f"Project name must be {MAX_PROJECT_NAME_LENGTH} characters or fewer.")
+        if self.config_manager.is_protected_storage_name(raw):
+            return (False, "That project name is reserved by the studio system.")
+
+        cleaned = sanitize_project_name(raw)
+        if (
+            self.config_manager.is_protected_storage_name(cleaned)
+            or not self.config_manager._is_valid_user_path_in_storage(
+                self.config_manager.get_project_dir(cleaned)
+            )
+        ):
+            return (False, "Please enter a valid non-reserved project name.")
 
         self.config_manager.settings.project_name = cleaned
         self.config_manager.save(commit_lbu=True)
@@ -953,11 +1503,14 @@ class RemoteProducerServer:
         extra_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         handler.send_header("Content-Type", content_type)
+        handler.send_header("Strict-Transport-Security", "max-age=31536000")
         handler.send_header("X-Content-Type-Options", "nosniff")
         handler.send_header("X-Frame-Options", "DENY")
         handler.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        handler.send_header("Cross-Origin-Opener-Policy", "same-origin-allow-popups")
         handler.send_header("Cross-Origin-Resource-Policy", "same-origin")
         handler.send_header("Permissions-Policy", "camera=(), geolocation=(), microphone=(self)")
+        handler.send_header("Vary", "Origin, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site")
         handler.send_header("Cache-Control", "no-store, max-age=0")
         if csp_nonce:
             csp = (
@@ -965,16 +1518,70 @@ class RemoteProducerServer:
                 f"script-src 'nonce-{csp_nonce}' 'strict-dynamic'; "
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data: blob:; "
-                "connect-src 'self' wss: https:; "
+                "connect-src 'self' wss:; "
                 "media-src 'self' blob:; "
                 "object-src 'none'; "
-                "base-uri 'self'; "
+                "base-uri 'none'; "
+                "form-action 'self'; "
                 "frame-ancestors 'none'"
             )
             handler.send_header("Content-Security-Policy", csp)
         if extra_headers:
             for k, v in extra_headers.items():
                 handler.send_header(k, v)
+
+    @staticmethod
+    def _format_duration_human(seconds: int) -> str:
+        secs = max(1, int(seconds))
+        mins, rem = divmod(secs, 60)
+        hrs, mins = divmod(mins, 60)
+        if hrs > 0:
+            return f"{hrs}h {mins}m {rem}s"
+        if mins > 0:
+            return f"{mins}m {rem}s"
+        return f"{rem}s"
+
+    def _send_rate_limited(
+        self,
+        handler: BaseHTTPRequestHandler,
+        retry_after: int,
+        as_html: bool = False,
+        prefill_session: str = "",
+        message: Optional[str] = None,
+    ) -> None:
+        wait_sec = max(1, int(retry_after))
+        msg = message or (
+            f"Too many failed login attempts. Try again in {self._format_duration_human(wait_sec)}."
+        )
+        if as_html:
+            nonce = secrets.token_urlsafe(16)
+            html = self._render_producer_html(
+                csp_nonce=nonce,
+                authenticated=False,
+                prefill_session=prefill_session,
+                prefill_token="",
+                initial_error=msg,
+                initial_retry_after=wait_sec,
+            )
+            body = html.encode("utf-8")
+            handler.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+            self._set_security_headers(
+                handler,
+                "text/html; charset=utf-8",
+                csp_nonce=nonce,
+                extra_headers={"Retry-After": str(wait_sec)},
+            )
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return
+
+        self._send_json(
+            handler,
+            HTTPStatus.TOO_MANY_REQUESTS,
+            {"ok": False, "error": msg, "retry_after": wait_sec},
+            extra_headers={"Retry-After": str(wait_sec)},
+        )
 
     def _extract_auth_token(self, handler: BaseHTTPRequestHandler, query_params: Dict[str, List[str]]) -> str:
         cookie_hdr = handler.headers.get("Cookie", "")
@@ -1014,8 +1621,11 @@ class RemoteProducerServer:
             return
 
         if path == "/api/status":
+            if not self._is_same_origin_request(handler):
+                self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "Cross-origin request rejected"})
+                return
             if not self._is_request_authenticated(handler, query):
-                self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"authenticated": False, "session_id": self.session.session_id})
+                self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"authenticated": False})
                 return
             snap = self.build_status_snapshot()
             snap["authenticated"] = True
@@ -1023,6 +1633,14 @@ class RemoteProducerServer:
             return
 
         if path == "/api/qr.svg":
+            if not self._is_same_origin_request(handler):
+                self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "Cross-origin request rejected"})
+                return
+            client_ip = self._resolve_client_ip(handler)
+            allowed, retry_after = self.rate_limiter.check_allowed(client_ip)
+            if not allowed:
+                self._send_rate_limited(handler, retry_after)
+                return
             if not self._is_request_authenticated(handler, query):
                 self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized"})
                 return
@@ -1035,23 +1653,59 @@ class RemoteProducerServer:
             return
 
         if path == "/" or path == "/index.html":
-            # Check if URL carries a valid session invite token (from QR scan or link)
             invite = (query.get("token") or [""])[0]
+            prefill_session = (query.get("session") or [""])[0].strip()[:32]
             set_cookie_header: Optional[str] = None
             authenticated = self._is_request_authenticated(handler, query)
+            client_ip = self._resolve_client_ip(handler)
+            allowed, retry_after = self.rate_limiter.check_allowed(client_ip)
 
-            if not authenticated and invite and self.session.verify_credentials(invite_token=invite):
-                auth_token = self.session.create_auth_token()
-                set_cookie_header = (
-                    f"__Host-ars_session={auth_token}; SameSite=Lax; HttpOnly; Secure; Path=/; Max-Age=43200"
+            initial_error = ""
+            initial_retry_after = 0
+            clean_prefill_token = ""
+
+            if not authenticated and invite:
+                if not allowed:
+                    self._send_rate_limited(
+                        handler,
+                        retry_after,
+                        as_html=True,
+                        prefill_session=prefill_session,
+                    )
+                    return
+                if self.session.verify_credentials(invite_token=invite):
+                    auth_token = self.session.create_auth_token()
+                    set_cookie_header = (
+                        f"__Host-ars_session={auth_token}; SameSite=Lax; HttpOnly; Secure; Path=/; Max-Age=43200"
+                    )
+                    self.rate_limiter.record_success(client_ip)
+                    authenticated = True
+                else:
+                    banned, ban_retry, _rem = self.rate_limiter.record_failure(client_ip)
+                    if banned:
+                        self._send_rate_limited(
+                            handler,
+                            ban_retry,
+                            as_html=True,
+                            prefill_session=prefill_session,
+                        )
+                        return
+                    initial_error = "Invalid Session ID, passcode, or invite token."
+            elif not authenticated and not allowed:
+                initial_retry_after = retry_after
+                initial_error = (
+                    f"Too many failed login attempts. Try again in "
+                    f"{self._format_duration_human(retry_after)}."
                 )
-                authenticated = True
 
             nonce = secrets.token_urlsafe(16)
             html = self._render_producer_html(
                 csp_nonce=nonce,
                 authenticated=authenticated,
-                prefill_token=invite if not authenticated else "",
+                prefill_session=prefill_session if not authenticated else "",
+                prefill_token=clean_prefill_token,
+                initial_error=initial_error,
+                initial_retry_after=initial_retry_after,
             )
             body = html.encode("utf-8")
             handler.send_response(HTTPStatus.OK)
@@ -1065,18 +1719,42 @@ class RemoteProducerServer:
         self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def _handle_http_post(self, handler: BaseHTTPRequestHandler) -> None:
+        if not self._is_same_origin_request(handler):
+            self._send_json(handler, HTTPStatus.FORBIDDEN, {"ok": False, "error": "Cross-origin request rejected"})
+            return
+
         parsed = urllib.parse.urlsplit(handler.path)
         path = parsed.path or "/"
 
-        content_len = int(handler.headers.get("Content-Length", "0") or "0")
-        raw_body = handler.rfile.read(min(content_len, 16384)) if content_len > 0 else b""
+        raw_cl = (handler.headers.get("Content-Length") or "0").strip()
+        try:
+            content_len = int(raw_cl) if raw_cl else 0
+        except ValueError:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Invalid Content-Length header"})
+            return
+        if content_len < 0:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Invalid Content-Length header"})
+            return
+        if content_len > MAX_HTTP_POST_BYTES:
+            self._send_json(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Request payload too large"})
+            return
+
+        raw_body = handler.rfile.read(content_len) if content_len > 0 else b""
 
         if path == "/api/login":
+            client_ip = self._resolve_client_ip(handler)
+            allowed, retry_after = self.rate_limiter.check_allowed(client_ip)
+            if not allowed:
+                self._send_rate_limited(handler, retry_after)
+                return
+
             data: Dict[str, Any] = {}
             ctype = handler.headers.get("Content-Type", "")
             if "application/json" in ctype:
                 try:
-                    data = json.loads(raw_body.decode("utf-8"))
+                    parsed_json = json.loads(raw_body.decode("utf-8"))
+                    if isinstance(parsed_json, dict):
+                        data = parsed_json
                 except Exception:
                     data = {}
             else:
@@ -1087,15 +1765,18 @@ class RemoteProducerServer:
             invite_token = str(data.get("invite_token") or data.get("token") or "")
             submitted_session = str(data.get("session_id") or data.get("username") or "").strip()
 
-            if submitted_session and submitted_session.upper() != self.session.session_id.upper():
-                self._send_json(
-                    handler,
-                    HTTPStatus.UNAUTHORIZED,
-                    {"ok": False, "error": "Session ID does not match the active studio session."},
-                )
-                return
+            expected_sid = self.session.session_id.upper().encode("utf-8")
+            provided_sid = submitted_session.upper().encode("utf-8")
+            sid_matches = bool(submitted_session) and hmac.compare_digest(provided_sid, expected_sid)
+            sid_conflict = bool(submitted_session) and not sid_matches
 
-            if self.session.verify_credentials(passcode=passcode, invite_token=invite_token):
+            invite_clean = invite_token.strip()
+            pass_clean = passcode.strip()
+            invite_ok = bool(invite_clean) and self.session.verify_credentials(invite_token=invite_clean) and not sid_conflict
+            pin_ok = bool(pass_clean) and self.session.verify_credentials(passcode=pass_clean) and sid_matches
+
+            if pin_ok or invite_ok:
+                self.rate_limiter.record_success(client_ip)
                 auth_token = self.session.create_auth_token()
                 cookie_val = (
                     f"__Host-ars_session={auth_token}; SameSite=Lax; HttpOnly; Secure; Path=/; Max-Age=43200"
@@ -1111,11 +1792,19 @@ class RemoteProducerServer:
                     extra_headers={"Set-Cookie": cookie_val},
                 )
             else:
-                self._send_json(
-                    handler,
-                    HTTPStatus.UNAUTHORIZED,
-                    {"ok": False, "error": "Invalid session passcode or expired invite token."},
-                )
+                banned, ban_retry, remaining = self.rate_limiter.record_failure(client_ip)
+                if banned:
+                    self._send_rate_limited(handler, ban_retry)
+                else:
+                    self._send_json(
+                        handler,
+                        HTTPStatus.UNAUTHORIZED,
+                        {
+                            "ok": False,
+                            "error": "Invalid Session ID, passcode, or invite token.",
+                            "attempts_remaining": remaining,
+                        },
+                    )
             return
 
         if path == "/api/logout":
@@ -1155,8 +1844,22 @@ class RemoteProducerServer:
     def _handle_websocket_upgrade(
         self, handler: BaseHTTPRequestHandler, query: Dict[str, List[str]]
     ) -> None:
+        if not self._is_same_origin_request(handler):
+            self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "Cross-origin WebSocket connection rejected"})
+            return
+
+        client_ip = self._resolve_client_ip(handler)
+        allowed, retry_after = self.rate_limiter.check_allowed(client_ip)
+        if not allowed:
+            self._send_rate_limited(handler, retry_after)
+            return
+
         if not self._is_request_authenticated(handler, query):
             self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"error": "Session authentication required"})
+            return
+
+        if self.connected_client_count >= MAX_WS_CLIENTS:
+            self._send_json(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Maximum concurrent producer connections reached"})
             return
 
         ws_key = handler.headers.get("Sec-WebSocket-Key", "").strip()
@@ -1182,7 +1885,7 @@ class RemoteProducerServer:
             self._clients[ws_conn.client_id] = ws_conn
 
         self._control_server.sync_state()
-        logger.info("Remote producer connected (%s, client=%s)", handler.client_address[0], ws_conn.client_id)
+        logger.info("Remote producer connected (%s, client=%s)", client_ip, ws_conn.client_id)
 
         try:
             # Send initial state snapshot immediately
@@ -1194,7 +1897,12 @@ class RemoteProducerServer:
                     ws_conn.send_text(json.dumps({"type": "session_revoked"}))
                     break
 
-                frame = read_ws_frame(sock)
+                frame = read_ws_frame(
+                    sock,
+                    max_payload=131072,
+                    require_mask=True,
+                    max_idle_seconds=WS_IDLE_TIMEOUT_SEC,
+                )
                 if frame is None:
                     break
                 opcode, payload = frame
@@ -1291,13 +1999,25 @@ class RemoteProducerServer:
     # ------------------------------------------------------------------
     # Stripped-Down Producer Console Single-Page HTML
     # ------------------------------------------------------------------
-    def _render_producer_html(self, csp_nonce: str, authenticated: bool, prefill_token: str = "") -> str:
+    def _render_producer_html(
+        self,
+        csp_nonce: str,
+        authenticated: bool,
+        prefill_session: str = "",
+        prefill_token: str = "",
+        initial_error: str = "",
+        initial_retry_after: int = 0,
+    ) -> str:
         session_id = self.session.session_id
         project_name = self.config_manager.settings.project_name or "Session"
         auth_str = "true" if authenticated else "false"
         safe_prefill = html_escape(prefill_token)
-        safe_session = html_escape(session_id)
-        safe_project = html_escape(project_name)
+        safe_prefill_session = html_escape(prefill_session) if (not authenticated and prefill_session) else ""
+        safe_hdr_session = html_escape(session_id) if authenticated else "Auth Required"
+        safe_hdr_project = html_escape(project_name) if authenticated else "--"
+        safe_js_project = json.dumps(project_name if authenticated else "").replace("</", "<\\/")
+        safe_js_initial_error = json.dumps(initial_error or "").replace("</", "<\\/")
+        safe_js_retry_after = max(0, int(initial_retry_after or 0))
 
         return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1542,6 +2262,12 @@ body {{
 }}
 .btn-primary:hover {{
   background: #388BFD;
+}}
+.btn-primary:disabled {{
+  background: #21262D;
+  border-color: #30363D;
+  color: #8B949E;
+  cursor: not-allowed;
 }}
 .login-error {{
   background: #3D1114;
@@ -1821,8 +2547,8 @@ input[type="range"].brand-slider {{
     <span class="role-pill">REMOTE PRODUCER — GUIDED VO</span>
   </div>
   <div class="header-meta">
-    <span class="badge" id="hdr-session">Session: {safe_session}</span>
-    <span class="badge" id="hdr-project">Project: {safe_project}</span>
+    <span class="badge" id="hdr-session">Session: {safe_hdr_session}</span>
+    <span class="badge" id="hdr-project">Project: {safe_hdr_project}</span>
     <button type="button" class="btn-subtle" id="btn-edit-project" style="display:none;" title="Update active Project Name">✎ Project</button>
     <span class="badge badge-conn-warn" id="hdr-conn">● Connecting...</span>
     <button type="button" class="btn-subtle" id="btn-logout" style="display:none;">Sign Out</button>
@@ -1833,7 +2559,7 @@ input[type="range"].brand-slider {{
   <!-- SESSION-TIED LOGIN VIEW -->
   <section class="login-card" id="login-view" style="display:none;">
     <h1>Join Guided VO Session</h1>
-    <p>Authenticate with the 6-digit Session Passcode displayed on the studio's Remote Producer setup screen, or scan the session QR code.</p>
+    <p>Authenticate with the Studio Session ID and 6-digit Session Passcode displayed on the studio's Remote Producer setup screen, or scan the session QR code.</p>
     <div class="login-error" id="login-error" role="alert"></div>
     <form id="login-form" action="/api/login" method="post">
       <div class="form-field">
@@ -1844,8 +2570,14 @@ input[type="range"].brand-slider {{
           name="username"
           class="text-input"
           autocomplete="username"
-          value="{safe_session}"
-          readonly
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="false"
+          enterkeyhint="next"
+          maxlength="32"
+          value="{safe_prefill_session}"
+          placeholder="e.g. ARS-1A2B"
+          required
         >
       </div>
       <div class="form-field">
@@ -1858,6 +2590,8 @@ input[type="range"].brand-slider {{
             class="text-input"
             autocomplete="current-password"
             inputmode="numeric"
+            enterkeyhint="done"
+            maxlength="64"
             placeholder="Enter 6-digit passcode"
             required
           >
@@ -1881,7 +2615,7 @@ input[type="range"].brand-slider {{
     <div class="project-edit-bar" id="project-edit-bar">
       <div class="project-edit-row">
         <label for="project-name-input">PROJECT NAME</label>
-        <input type="text" id="project-name-input" class="text-input" placeholder="Enter Project Name..." maxlength="120">
+        <input type="text" id="project-name-input" class="text-input" placeholder="Enter Project Name..." maxlength="{MAX_PROJECT_NAME_LENGTH}">
         <button type="button" class="btn-save-inline" id="btn-save-project">Save Project</button>
         <button type="button" class="btn-subtle" id="btn-cancel-project">Cancel</button>
       </div>
@@ -1971,6 +2705,16 @@ input[type="range"].brand-slider {{
   "use strict";
 
   let isAuthenticated = {auth_str};
+  const initialError = {safe_js_initial_error};
+  const initialRetryAfter = {safe_js_retry_after};
+  let lockoutTimer = null;
+  let lockoutUntilMs = 0;
+
+  // Immediately strip sensitive URL query parameters (e.g. ?token= or ?session=) from browser bar/history
+  if (window.location.search && window.history && window.history.replaceState) {{
+    window.history.replaceState({{}}, document.title, window.location.pathname || "/");
+  }}
+
   let ws = null;
   let reconnectTimer = null;
   let pingInterval = null;
@@ -2011,7 +2755,7 @@ input[type="range"].brand-slider {{
   let latestToneHz = 1000.0;
   let latestPressToneSec = 1.0;
   let latestReleaseToneSec = 0.5;
-  let latestProjectName = "{safe_project}";
+  let latestProjectName = {safe_js_project};
   let latestAllowProjectRename = false;
   let lastObservedLocalTbActive = null;
   let activeToneOsc = null;
@@ -2021,8 +2765,10 @@ input[type="range"].brand-slider {{
   const consoleView = document.getElementById("console-view");
   const loginForm = document.getElementById("login-form");
   const loginError = document.getElementById("login-error");
+  const sessionInput = document.getElementById("session-id-input");
   const passInput = document.getElementById("session-passcode");
   const btnTogglePass = document.getElementById("btn-toggle-pass");
+  const btnLoginSubmit = document.getElementById("btn-login-submit");
   const btnLogout = document.getElementById("btn-logout");
 
   const hdrConn = document.getElementById("hdr-conn");
@@ -2054,9 +2800,61 @@ input[type="range"].brand-slider {{
   const talkbackHint = document.getElementById("talkback-hint");
   const rttReadout = document.getElementById("rtt-readout");
 
+  function formatLockoutDuration(totalSec) {{
+    const sec = Math.max(1, Math.floor(Number(totalSec) || 1));
+    const hrs = Math.floor(sec / 3600);
+    const mins = Math.floor((sec % 3600) / 60);
+    const rem = sec % 60;
+    if (hrs > 0) return hrs + "h " + mins + "m " + rem + "s";
+    if (mins > 0) return mins + "m " + rem + "s";
+    return rem + "s";
+  }}
+
+  function stopLockoutCountdown() {{
+    if (lockoutTimer) {{
+      clearInterval(lockoutTimer);
+      lockoutTimer = null;
+    }}
+    lockoutUntilMs = 0;
+    btnLoginSubmit.disabled = false;
+  }}
+
+  function startLockoutCountdown(seconds, baseMsg) {{
+    stopLockoutCountdown();
+    const secs = Math.max(1, Number(seconds) || 60);
+    lockoutUntilMs = Date.now() + secs * 1000;
+    btnLoginSubmit.disabled = true;
+
+    const raw = (baseMsg || "Too many failed login attempts").trim();
+    const marker = raw.toLowerCase().indexOf("try again in");
+    let prefix = marker >= 0 ? raw.slice(0, marker).trim() : raw;
+    while (prefix.endsWith(".")) {{
+      prefix = prefix.slice(0, -1).trim();
+    }}
+    if (!prefix) {{
+      prefix = "Too many failed login attempts";
+    }}
+
+    function tick() {{
+      const rem = Math.max(0, Math.ceil((lockoutUntilMs - Date.now()) / 1000));
+      if (rem <= 0) {{
+        stopLockoutCountdown();
+        loginError.textContent = "Lockout expired. Verify your Session ID and Passcode before trying again.";
+        loginError.style.display = "block";
+        return;
+      }}
+      loginError.textContent = prefix + ". Try again in " + formatLockoutDuration(rem) + ".";
+      loginError.style.display = "block";
+    }}
+    tick();
+    lockoutTimer = setInterval(tick, 1000);
+  }}
+
   function showView(authenticated) {{
     isAuthenticated = authenticated;
     if (authenticated) {{
+      stopLockoutCountdown();
+      loginError.style.display = "none";
       loginView.style.display = "none";
       consoleView.style.display = "block";
       btnLogout.style.display = "inline-block";
@@ -2065,10 +2863,21 @@ input[type="range"].brand-slider {{
       loginView.style.display = "block";
       consoleView.style.display = "none";
       btnLogout.style.display = "none";
+      hdrSession.textContent = "Session: Auth Required";
+      hdrProject.textContent = "Project: --";
       hdrConn.textContent = "● Auth Required";
       hdrConn.className = "badge badge-conn-warn";
     }}
   }}
+
+  // Clear stale inline login error as soon as the user edits credentials (unless Fail2Ban lockout is active)
+  function clearErrorOnEdit() {{
+    if (Date.now() >= lockoutUntilMs && loginError.style.display !== "none") {{
+      loginError.style.display = "none";
+    }}
+  }}
+  sessionInput.addEventListener("input", clearErrorOnEdit);
+  passInput.addEventListener("input", clearErrorOnEdit);
 
   // Password show/hide toggle
   btnTogglePass.addEventListener("click", function() {{
@@ -2081,8 +2890,12 @@ input[type="range"].brand-slider {{
   // Login submit handler
   loginForm.addEventListener("submit", async function(ev) {{
     ev.preventDefault();
+    if (Date.now() < lockoutUntilMs) {{
+      return;
+    }}
     loginError.style.display = "none";
-    const sessionVal = document.getElementById("session-id-input").value;
+    btnLoginSubmit.disabled = true;
+    const sessionVal = sessionInput.value;
     const passVal = passInput.value;
     const inviteVal = document.getElementById("invite-token-input").value;
     try {{
@@ -2095,20 +2908,33 @@ input[type="range"].brand-slider {{
           invite_token: inviteVal
         }})
       }});
-      const data = await resp.json();
+      let data = {{}};
+      try {{
+        data = await resp.json();
+      }} catch (_e) {{}}
+
       if (resp.ok && data.ok) {{
         // Clean token from URL bar for security
         if (window.history && window.history.replaceState) {{
           window.history.replaceState({{}}, document.title, "/");
         }}
         showView(true);
+      }} else if (resp.status === 429) {{
+        const headerRetry = parseInt(resp.headers.get("Retry-After") || "60", 10);
+        const retrySec = Number(data.retry_after) || (Number.isFinite(headerRetry) ? headerRetry : 60);
+        startLockoutCountdown(retrySec, data.error || "Too many failed login attempts");
       }} else {{
-        loginError.textContent = data.error || "Authentication failed.";
+        const remSuffix = (typeof data.attempts_remaining === "number")
+          ? (" (" + data.attempts_remaining + " attempt" + (data.attempts_remaining === 1 ? "" : "s") + " left before temporary lockout)")
+          : "";
+        loginError.textContent = (data.error || "Authentication failed.") + remSuffix;
         loginError.style.display = "block";
+        btnLoginSubmit.disabled = false;
       }}
     }} catch (err) {{
       loginError.textContent = "Network error connecting to studio.";
       loginError.style.display = "block";
+      btnLoginSubmit.disabled = false;
     }}
   }});
 
@@ -2542,7 +3368,21 @@ input[type="range"].brand-slider {{
       }}
       if (isAuthenticated) {{
         if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(connectWebSocket, 1500);
+        reconnectTimer = setTimeout(async function() {{
+          try {{
+            const statusResp = await fetch("/api/status", {{ cache: "no-store" }});
+            if (statusResp.status === 401 || statusResp.status === 403 || statusResp.status === 429) {{
+              stopMicCapture();
+              showView(false);
+              if (statusResp.status === 429) {{
+                const ra = parseInt(statusResp.headers.get("Retry-After") || "60", 10);
+                startLockoutCountdown(Number.isFinite(ra) ? ra : 60, "Too many failed login attempts");
+              }}
+              return;
+            }}
+          }} catch (_e) {{}}
+          connectWebSocket();
+        }}, 1500);
       }}
     }};
   }}
@@ -2873,6 +3713,14 @@ input[type="range"].brand-slider {{
   }}
 
   showView(isAuthenticated);
+  if (!isAuthenticated) {{
+    if (initialRetryAfter > 0) {{
+      startLockoutCountdown(initialRetryAfter, initialError);
+    }} else if (initialError) {{
+      loginError.textContent = initialError;
+      loginError.style.display = "block";
+    }}
+  }}
   refreshMicAndTalkbackUi();
   requestAnimationFrame(drawVuMeter);
 }})();

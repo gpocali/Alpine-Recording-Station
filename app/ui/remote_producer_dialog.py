@@ -320,6 +320,66 @@ class RemoteProducerDialog(QDialog):
         self.lbl_privacy_status.setStyleSheet("font-size: 12px; color: #8B949E;")
         p_layout.addWidget(self.lbl_privacy_status)
 
+        sec_hdr = QLabel("Fail2Ban Login Lockout && HAProxy Trust:")
+        sec_hdr.setStyleSheet(
+            "font-size: 12px; color: #79C0FF; font-weight: 700; margin-top: 4px;"
+        )
+        p_layout.addWidget(sec_hdr)
+
+        sec_row = QHBoxLayout()
+        sec_row.setSpacing(6)
+        sec_row.addWidget(QLabel("Max Fails:"))
+        self.spin_max_attempts = QSpinBox()
+        self.spin_max_attempts.setRange(1, 20)
+        self.spin_max_attempts.setValue(
+            max(1, min(20, int(getattr(self.config_manager.settings, "remote_producer_max_login_attempts", 5) or 5)))
+        )
+        self.spin_max_attempts.setToolTip(
+            "Maximum consecutive failed logins per IP within the rolling window before temporary ban."
+        )
+        self.spin_max_attempts.valueChanged.connect(self._on_security_settings_changed)
+        sec_row.addWidget(self.spin_max_attempts)
+
+        sec_row.addWidget(QLabel("Ban (min):"))
+        self.spin_ban_minutes = QSpinBox()
+        self.spin_ban_minutes.setRange(1, 1440)
+        ban_sec = int(getattr(self.config_manager.settings, "remote_producer_ban_duration_sec", 900) or 900)
+        self.spin_ban_minutes.setValue(max(1, min(1440, round(ban_sec / 60))))
+        self.spin_ban_minutes.setToolTip(
+            "Initial temporary ban duration in minutes (doubles on repeat lockouts, up to 120 min)."
+        )
+        self.spin_ban_minutes.valueChanged.connect(self._on_security_settings_changed)
+        sec_row.addWidget(self.spin_ban_minutes)
+
+        sec_row.addStretch(1)
+        self.btn_clear_bans = QPushButton("Unlock IPs (0)")
+        self.btn_clear_bans.setMinimumHeight(30)
+        self.btn_clear_bans.setEnabled(False)
+        self.btn_clear_bans.setToolTip(
+            "Immediately clear all temporary Fail2Ban IP lockouts."
+        )
+        self.btn_clear_bans.clicked.connect(self._on_clear_bans)
+        sec_row.addWidget(self.btn_clear_bans)
+        p_layout.addLayout(sec_row)
+
+        proxy_row = QHBoxLayout()
+        proxy_row.setSpacing(6)
+        proxy_row.addWidget(QLabel("Trusted Proxies:"))
+        self.trusted_proxies_edit = QLineEdit(
+            str(getattr(self.config_manager.settings, "remote_producer_trusted_proxies", "127.0.0.1,::1") or "")
+        )
+        self.trusted_proxies_edit.setPlaceholderText("127.0.0.1, ::1, 10.0.0.0/8")
+        self.trusted_proxies_edit.setToolTip(
+            "Comma-separated reverse proxy IPs/CIDRs (e.g. HAProxy host/subnet). "
+            "X-Forwarded-For / X-Real-IP headers are trusted ONLY when the direct peer matches."
+        )
+        self.osk_controller.register_line_edit(
+            self.trusted_proxies_edit, title="Trusted Reverse Proxy IPs / CIDRs"
+        )
+        self.trusted_proxies_edit.editingFinished.connect(self._on_security_settings_changed)
+        proxy_row.addWidget(self.trusted_proxies_edit, stretch=1)
+        p_layout.addLayout(proxy_row)
+
         right_col.addWidget(privacy_card)
 
         # SSL Certificate Management Card
@@ -500,6 +560,20 @@ class RemoteProducerDialog(QDialog):
             )
             self.lbl_privacy_status.setStyleSheet("font-size: 12px; color: #FFA198;")
 
+        banned_ips = self.remote_server.rate_limiter.get_banned_summary()
+        ban_count = len(banned_ips)
+        label = f"Unlock IPs ({ban_count})"
+        if self.btn_clear_bans.text() != label:
+            self.btn_clear_bans.setText(label)
+        self.btn_clear_bans.setEnabled(ban_count > 0)
+        if ban_count > 0:
+            self.btn_clear_bans.setStyleSheet(
+                "background-color: #3D1A1A; color: #FFA198; border: 1px solid #F85149; "
+                "border-radius: 6px; padding: 4px 10px; font-weight: 700;"
+            )
+        else:
+            self.btn_clear_bans.setStyleSheet("")
+
     def _on_toggle_server(self, checked: bool) -> None:
         port = int(self.spin_port.value())
         self.config_manager.settings.remote_producer_enabled = bool(checked)
@@ -562,6 +636,31 @@ class RemoteProducerDialog(QDialog):
             self.feedback_label.setText(
                 "Remote Producer Project Name editing disabled."
             )
+
+    def _on_security_settings_changed(self, *_args) -> None:
+        max_attempts = max(1, min(20, int(self.spin_max_attempts.value())))
+        ban_minutes = max(1, min(1440, int(self.spin_ban_minutes.value())))
+        trusted_proxies = self.trusted_proxies_edit.text().strip()
+
+        self.config_manager.settings.remote_producer_max_login_attempts = max_attempts
+        self.config_manager.settings.remote_producer_ban_duration_sec = ban_minutes * 60
+        self.config_manager.settings.remote_producer_trusted_proxies = trusted_proxies
+        self.config_manager.save(commit_lbu=True)
+        self.remote_server.reload_security_settings()
+        self.feedback_label.setText(
+            f"✓ Security updated: Fail2Ban max {max_attempts} attempt(s), "
+            f"{ban_minutes} min base ban."
+        )
+
+    def _on_clear_bans(self) -> None:
+        cleared = self.remote_server.clear_login_bans()
+        self._refresh_live_status()
+        if cleared:
+            self.feedback_label.setText(
+                f"✓ Cleared {cleared} active Fail2Ban IP lockout(s) / failure counter(s)."
+            )
+        else:
+            self.feedback_label.setText("No active Fail2Ban IP lockouts to clear.")
 
     def _on_import_drop_ssl(self) -> None:
         ok, msg = self.remote_server.ssl_manager.import_from_drop_dir()

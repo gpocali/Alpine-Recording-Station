@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import datetime
+import os
 import re
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1370,6 +1372,7 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             cm = ConfigManager(storage_dir=base / "storage", etc_config_dir=base / "etc")
+            cm.settings.studio_mode = True
             engine = AudioEngine(simulate_if_empty=True)
             server = RemoteProducerServer(
                 audio_engine=engine,
@@ -1385,11 +1388,15 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                 client_ctx = ssl.create_default_context()
                 client_ctx.check_hostname = False
                 client_ctx.verify_mode = ssl.CERT_NONE
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}),
+                    urllib.request.HTTPSHandler(context=client_ctx),
+                )
 
                 # 1. Unauthenticated /api/status returns 401
                 req = urllib.request.Request(f"https://127.0.0.1:{port}/api/status")
                 with self.assertRaises(urllib.error.HTTPError) as ctx_err:
-                    urllib.request.urlopen(req, context=client_ctx, timeout=5)
+                    opener.open(req, timeout=5)
                 self.assertEqual(ctx_err.exception.code, 401)
 
                 # 2. Authenticate via /api/login with session passcode
@@ -1403,7 +1410,7 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with urllib.request.urlopen(login_req, context=client_ctx, timeout=5) as resp:
+                with opener.open(login_req, timeout=5) as resp:
                     self.assertEqual(resp.status, 200)
                     login_data = json.loads(resp.read().decode("utf-8"))
                     self.assertTrue(login_data["ok"])
@@ -1419,7 +1426,7 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                     f"https://127.0.0.1:{port}/api/status",
                     headers={"Authorization": f"Bearer {auth_token}"},
                 )
-                with urllib.request.urlopen(status_req, context=client_ctx, timeout=5) as resp:
+                with opener.open(status_req, timeout=5) as resp:
                     self.assertEqual(resp.status, 200)
                     st_data = json.loads(resp.read().decode("utf-8"))
                     self.assertTrue(st_data["authenticated"])
@@ -1786,12 +1793,29 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
         self.assertIn("lbu commit", install_sh)
 
     def test_playback_streams_recorded_audio_and_status_to_remote_producer_even_when_mic_muted(self) -> None:
+        import struct
+        import time
+        import wave
+        from app.remote_producer import (
+            FRAME_TALENT_AUDIO,
+            STREAM_SAMPLE_RATE,
+            RemoteProducerServer,
+            WebSocketConnection,
+        )
+        from app.ssl_manager import SslCertificateManager
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            cfg = ConfigManager(config_path=tmp_path / "settings.json", storage_dir=tmp_path / "storage")
+            cfg = ConfigManager(storage_dir=tmp_path / "storage", etc_config_dir=tmp_path / "etc")
             engine = AudioEngine(simulate_if_empty=True)
-            ssl_mgr = SslCertificateManager(cert_dir=tmp_path / "ssl", storage_ssl_dir=tmp_path / "storage" / "ssl")
-            server = RemoteProducerServer(audio_engine=engine, config_manager=cfg, ssl_manager=ssl_mgr)
+            ssl_mgr = SslCertificateManager(cert_dir=tmp_path / "ssl", drop_dir=tmp_path / "storage" / "ssl")
+            server = RemoteProducerServer(
+                audio_engine=engine,
+                config_manager=cfg,
+                ssl_manager=ssl_mgr,
+                host="127.0.0.1",
+                port=0,
+            )
 
             # 1. Verify Studio Mode 2ch downmix preserves unity gain for both Left (VO) and Right (Talkback)
             stereo_vo = np.column_stack([
@@ -1846,16 +1870,17 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                     pass
 
             cap_sock = _CaptureSocket()
-            ws_conn = _WebSocketConnection(cap_sock, ("127.0.0.1", 55100), "client-review")  # type: ignore[arg-type]
-            with server._clients_lock:
-                server._clients["client-review"] = ws_conn
-
-            # Even with Talent Mic muted for privacy, playback of recorded clips MUST stream to the producer
-            engine.set_talent_mic_send_enabled(False)
-            self.assertTrue(engine.is_mic_muted)
-
-            engine.start_playback(filepath=wav_path, output_device=None)
+            ws_conn = WebSocketConnection(cap_sock, ("127.0.0.1", 55100), "client-review")  # type: ignore[arg-type]
+            self.assertTrue(server.start(port=0))
             try:
+                with server._clients_lock:
+                    server._clients["client-review"] = ws_conn
+
+                # Even with Talent Mic muted for privacy, playback of recorded clips MUST stream to the producer
+                engine.set_talent_mic_send_enabled(False)
+                self.assertTrue(engine.is_mic_muted)
+
+                engine.start_playback(filepath=wav_path, output_device=None)
                 deadline = time.monotonic() + 1.5
                 while len(cap_sock.binary_packets) < 2 and time.monotonic() < deadline:
                     time.sleep(0.03)
@@ -1893,6 +1918,7 @@ class TestRemoteProducerAndSslSuite(unittest.TestCase):
                 self.assertTrue(snap_paused["is_play_paused"])
             finally:
                 engine.stop_playback()
+                server.stop()
 
     def test_main_window_playback_controls_and_inline_clip_row_position(self) -> None:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -2891,14 +2917,502 @@ class TestTakeNumberingAndRemoteProjectRename(unittest.TestCase):
             self.assertEqual(changed_events, ["Spot_B"])
 
             # Blocked while recording is active
-            ae._recording = True
+            ae._is_recording = True
             try:
                 ok_rec, rec_msg = srv.update_project_name("Spot_C")
                 self.assertFalse(ok_rec)
                 self.assertIn("recording", rec_msg.lower())
                 self.assertEqual(cm.settings.project_name, "Spot_B")
             finally:
-                ae._recording = False
+                ae._is_recording = False
+
+
+class TestRemoteProducerSecurityAndFail2Ban(unittest.TestCase):
+    def test_login_rate_limiter_sliding_window_escalation_eviction_and_global_breaker(self) -> None:
+        from app.remote_producer import LoginRateLimiter
+
+        now = [100.0]
+        rl = LoginRateLimiter(
+            max_attempts=3,
+            window_seconds=60.0,
+            ban_seconds=120.0,
+            max_ban_seconds=300.0,
+            max_tracked_ips=16,
+            global_max_failures=10,
+            global_window_seconds=30.0,
+            global_cooldown_seconds=45.0,
+            clock_fn=lambda: now[0],
+        )
+
+        # Two failed attempts keep IP unbanned with remaining count decremented
+        banned, wait_sec, rem = rl.record_failure("198.51.100.1")
+        self.assertFalse(banned)
+        self.assertEqual(wait_sec, 0)
+        self.assertEqual(rem, 2)
+
+        banned, wait_sec, rem = rl.record_failure("198.51.100.1")
+        self.assertFalse(banned)
+        self.assertEqual(wait_sec, 0)
+        self.assertEqual(rem, 1)
+        self.assertEqual(rl.check_allowed("198.51.100.1"), (True, 0))
+
+        # Successful login clears prior failure history
+        rl.record_success("198.51.100.1")
+        banned, _wait, rem = rl.record_failure("198.51.100.1")
+        self.assertFalse(banned)
+        self.assertEqual(rem, 2)
+
+        # Advancing past sliding window expires stale failure
+        now[0] += 61.0
+        banned, _wait, rem = rl.record_failure("198.51.100.1")
+        self.assertFalse(banned)
+        self.assertEqual(rem, 2)
+
+        # Reaching max_attempts triggers 120s base ban
+        rl.record_failure("198.51.100.1")
+        banned, wait_sec, rem = rl.record_failure("198.51.100.1")
+        self.assertTrue(banned)
+        self.assertEqual(wait_sec, 120)
+        self.assertEqual(rem, 0)
+        self.assertEqual(rl.check_allowed("198.51.100.1"), (False, 120))
+
+        # Repeat offense after ban expiry escalates 2x (240s), then caps at 300s
+        now[0] += 121.0
+        self.assertEqual(rl.check_allowed("198.51.100.1"), (True, 0))
+        rl.record_failure("198.51.100.1")
+        rl.record_failure("198.51.100.1")
+        banned, wait_sec, _ = rl.record_failure("198.51.100.1")
+        self.assertTrue(banned)
+        self.assertEqual(wait_sec, 240)
+
+        now[0] += 241.0
+        rl.record_failure("198.51.100.1")
+        rl.record_failure("198.51.100.1")
+        banned, wait_sec, _ = rl.record_failure("198.51.100.1")
+        self.assertTrue(banned)
+        self.assertEqual(wait_sec, 300)
+
+        summary = rl.get_banned_summary()
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["ip"], "198.51.100.1")
+        self.assertEqual(summary[0]["ban_count"], 3)
+        self.assertEqual(summary[0]["remaining_seconds"], 300)
+
+        # Specific IP unban clears lockout immediately
+        self.assertTrue(rl.unban_ip("198.51.100.1"))
+        self.assertFalse(rl.unban_ip("198.51.100.1"))
+        self.assertEqual(rl.check_allowed("198.51.100.1"), (True, 0))
+
+        # Bounded tracking (max_tracked_ips=16): unbanned IPs are evicted before active bans
+        for vip in ("192.0.2.1", "192.0.2.2"):
+            for _ in range(3):
+                rl.record_failure(vip)
+                now[0] += 0.1
+        now[0] += 35.0  # Keep bans active while resetting global 30s failure window
+        for idx in range(10, 26):
+            rl.record_failure(f"192.0.2.{idx}")
+            now[0] += 4.0  # Space failures out to avoid global circuit breaker during eviction check
+
+        banned_ips = {item["ip"] for item in rl.get_banned_summary()}
+        self.assertIn("192.0.2.1", banned_ips)
+        self.assertIn("192.0.2.2", banned_ips)
+        self.assertGreaterEqual(rl.clear_all(), 2)
+        self.assertEqual(rl.get_banned_summary(), [])
+
+        # Global brute-force circuit breaker blocks distributed attacks across fresh IPs
+        rl_global = LoginRateLimiter(
+            max_attempts=5,
+            window_seconds=60.0,
+            ban_seconds=120.0,
+            global_max_failures=6,
+            global_window_seconds=30.0,
+            global_cooldown_seconds=45.0,
+            clock_fn=lambda: now[0],
+        )
+        for idx in range(1, 7):
+            rl_global.record_failure(f"10.20.0.{idx}")
+        allowed, wait_sec = rl_global.check_allowed("10.20.0.99")
+        self.assertFalse(allowed)
+        self.assertEqual(wait_sec, 45)
+
+    def test_trusted_proxy_ip_resolution_and_anti_spoofing(self) -> None:
+        from app.remote_producer import parse_trusted_proxies, resolve_client_ip
+
+        nets = parse_trusted_proxies("127.0.0.1, ::1, 10.0.0.0/8, not-an-ip")
+        self.assertEqual(len(nets), 3)
+
+        # Untrusted peer cannot spoof forwarding headers
+        self.assertEqual(
+            resolve_client_ip(
+                "198.51.100.7",
+                x_forwarded_for="1.2.3.4",
+                x_real_ip="5.6.7.8",
+                trusted_networks=nets,
+            ),
+            "198.51.100.7",
+        )
+
+        # Trusted HAProxy peer picks rightmost non-trusted IP, ignoring attacker-injected leftmost hop
+        self.assertEqual(
+            resolve_client_ip(
+                "::ffff:10.0.0.2",
+                x_forwarded_for="1.2.3.4, 203.0.113.50, 10.0.0.1",
+                trusted_networks=nets,
+            ),
+            "203.0.113.50",
+        )
+
+        # Trusted peer falls back to X-Real-IP with bracketed IPv6 + port normalized
+        self.assertEqual(
+            resolve_client_ip(
+                "::1",
+                x_forwarded_for="",
+                x_real_ip="[2001:db8::9]:54321",
+                trusted_networks=nets,
+            ),
+            "2001:db8::9",
+        )
+
+    def test_https_fail2ban_haproxy_xff_csrf_metadata_and_limits(self) -> None:
+        import json
+        import socket
+        import ssl
+        import urllib.error
+        import urllib.request
+        from app.remote_producer import (
+            MAX_HTTP_POST_BYTES,
+            RemoteProducerServer,
+            read_ws_frame,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cm = ConfigManager(storage_dir=base / "storage", etc_config_dir=base / "etc")
+            cm.settings.project_name = "SecretClientSpot"
+            cm.settings.remote_producer_max_login_attempts = 3
+            cm.settings.remote_producer_lockout_window_sec = 300
+            cm.settings.remote_producer_ban_duration_sec = 600
+            cm.settings.remote_producer_trusted_proxies = "127.0.0.1"
+            cm.save()
+
+            engine = AudioEngine(simulate_if_empty=True)
+            server = RemoteProducerServer(
+                audio_engine=engine,
+                config_manager=cm,
+                host="127.0.0.1",
+                port=0,
+            )
+            self.assertTrue(server.start(port=0))
+            try:
+                port = server.port
+                client_ctx = ssl.create_default_context()
+                client_ctx.check_hostname = False
+                client_ctx.verify_mode = ssl.CERT_NONE
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}),
+                    urllib.request.HTTPSHandler(context=client_ctx),
+                )
+
+                # 1. Unauthenticated GET / hides session_id & project_name and emits security headers
+                with opener.open(f"https://127.0.0.1:{port}/", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    hdrs = {k.lower(): v for k, v in resp.headers.items()}
+                    self.assertIn("strict-transport-security", hdrs)
+                    self.assertEqual(hdrs.get("cross-origin-opener-policy"), "same-origin-allow-popups")
+                    self.assertEqual(hdrs.get("x-frame-options"), "DENY")
+                    self.assertIn("frame-ancestors 'none'", hdrs.get("content-security-policy", ""))
+                    self.assertIn("script-src 'nonce-", hdrs.get("content-security-policy", ""))
+                    self.assertIn("Origin", hdrs.get("vary", ""))
+                    body = resp.read().decode("utf-8")
+                    self.assertNotIn(server.session.session_id, body)
+                    self.assertNotIn("SecretClientSpot", body)
+
+                # 2. Unauthenticated GET /api/status does not leak session_id
+                with self.assertRaises(urllib.error.HTTPError) as status_err:
+                    opener.open(f"https://127.0.0.1:{port}/api/status", timeout=5)
+                self.assertEqual(status_err.exception.code, 401)
+                status_body = json.loads(status_err.exception.read().decode("utf-8"))
+                self.assertEqual(status_body, {"authenticated": False})
+
+                # 3. PIN login requires matching Session ID (missing or wrong session_id -> 401)
+                for bad_sid in ("", "ARS-0000"):
+                    req = urllib.request.Request(
+                        f"https://127.0.0.1:{port}/api/login",
+                        data=json.dumps({
+                            "session_id": bad_sid,
+                            "password": server.session.session_passcode,
+                        }).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Forwarded-For": "203.0.113.5",
+                        },
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as err:
+                        opener.open(req, timeout=5)
+                    self.assertEqual(err.exception.code, 401)
+
+                # 4. HAProxy per-client Fail2Ban isolation via X-Forwarded-For
+                for expected_remaining in (2, 1):
+                    req = urllib.request.Request(
+                        f"https://127.0.0.1:{port}/api/login",
+                        data=json.dumps({
+                            "session_id": server.session.session_id,
+                            "password": "000000",
+                        }).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Forwarded-For": "203.0.113.10",
+                        },
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as err:
+                        opener.open(req, timeout=5)
+                    self.assertEqual(err.exception.code, 401)
+                    payload = json.loads(err.exception.read().decode("utf-8"))
+                    self.assertEqual(payload["attempts_remaining"], expected_remaining)
+
+                # 3rd failed attempt triggers 429 Too Many Requests + Retry-After
+                req_ban = urllib.request.Request(
+                    f"https://127.0.0.1:{port}/api/login",
+                    data=json.dumps({
+                        "session_id": server.session.session_id,
+                        "password": "000000",
+                    }).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Forwarded-For": "203.0.113.10",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ban_err:
+                    opener.open(req_ban, timeout=5)
+                self.assertEqual(ban_err.exception.code, 429)
+                self.assertGreaterEqual(int(ban_err.exception.headers.get("Retry-After", "0")), 500)
+
+                # Banned IP is blocked even with valid credentials or invite token
+                req_valid_while_banned = urllib.request.Request(
+                    f"https://127.0.0.1:{port}/api/login",
+                    data=json.dumps({
+                        "session_id": server.session.session_id,
+                        "password": server.session.session_passcode,
+                    }).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Forwarded-For": "203.0.113.10",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as still_banned_err:
+                    opener.open(req_valid_while_banned, timeout=5)
+                self.assertEqual(still_banned_err.exception.code, 429)
+
+                inv_req = urllib.request.Request(
+                    f"https://127.0.0.1:{port}/?session={server.session.session_id}&token={server.session.invite_token}",
+                    headers={"X-Forwarded-For": "203.0.113.10"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as inv_ban_err:
+                    opener.open(inv_req, timeout=5)
+                self.assertEqual(inv_ban_err.exception.code, 429)
+
+                # Different client behind the same HAProxy peer is NOT affected
+                other_req = urllib.request.Request(
+                    f"https://127.0.0.1:{port}/api/login",
+                    data=json.dumps({
+                        "session_id": server.session.session_id,
+                        "password": server.session.session_passcode,
+                    }).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Forwarded-For": "203.0.113.20",
+                    },
+                    method="POST",
+                )
+                with opener.open(other_req, timeout=5) as ok_resp:
+                    self.assertEqual(ok_resp.status, 200)
+                    self.assertIn("__Host-ars_session=", ok_resp.headers.get("Set-Cookie", ""))
+                    valid_auth_token = json.loads(ok_resp.read().decode("utf-8"))["auth_token"]
+
+                # Clearing specific ban restores access for 203.0.113.10
+                self.assertEqual(server.clear_login_bans("203.0.113.10"), 1)
+                with opener.open(req_valid_while_banned, timeout=5) as restored_resp:
+                    self.assertEqual(restored_resp.status, 200)
+
+                # 5. Untrusted peer cannot evade Fail2Ban by rotating X-Forwarded-For
+                cm.settings.remote_producer_trusted_proxies = "10.99.0.0/16"
+                server.reload_security_settings()
+                try:
+                    for idx, fake_ip in enumerate(("1.1.1.1", "2.2.2.2", "3.3.3.3"), start=1):
+                        spoof_req = urllib.request.Request(
+                            f"https://127.0.0.1:{port}/api/login",
+                            data=json.dumps({
+                                "session_id": server.session.session_id,
+                                "password": "000000",
+                            }).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json",
+                                "X-Forwarded-For": fake_ip,
+                            },
+                            method="POST",
+                        )
+                        with self.assertRaises(urllib.error.HTTPError) as sp_err:
+                            opener.open(spoof_req, timeout=5)
+                        self.assertEqual(sp_err.exception.code, 429 if idx == 3 else 401)
+                finally:
+                    server.clear_login_bans()
+                    cm.settings.remote_producer_trusted_proxies = "127.0.0.1"
+                    server.reload_security_settings()
+
+                # 6. CSRF and Cross-Site WebSocket Hijacking protection
+                for hdr_name, hdr_val in (
+                    ("Origin", "https://evil.example"),
+                    ("Sec-Fetch-Site", "cross-site"),
+                ):
+                    csrf_req = urllib.request.Request(
+                        f"https://127.0.0.1:{port}/api/login",
+                        data=json.dumps({
+                            "session_id": server.session.session_id,
+                            "password": server.session.session_passcode,
+                        }).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            hdr_name: hdr_val,
+                        },
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as csrf_err:
+                        opener.open(csrf_req, timeout=5)
+                    self.assertEqual(csrf_err.exception.code, 403)
+
+                # Reverse-proxied public hostname via trusted X-Forwarded-Host / Proto succeeds
+                proxy_origin_req = urllib.request.Request(
+                    f"https://127.0.0.1:{port}/api/login",
+                    data=json.dumps({
+                        "session_id": server.session.session_id,
+                        "password": server.session.session_passcode,
+                    }).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": "https://producer.studio.example",
+                        "X-Forwarded-Host": "producer.studio.example",
+                        "X-Forwarded-Proto": "https",
+                        "X-Forwarded-For": "203.0.113.30",
+                    },
+                    method="POST",
+                )
+                with opener.open(proxy_origin_req, timeout=5) as proxy_ok:
+                    self.assertEqual(proxy_ok.status, 200)
+
+                # CSWSH rejection over TLS WebSocket upgrade with evil Origin
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as raw_ws:
+                    with client_ctx.wrap_socket(raw_ws, server_hostname="127.0.0.1") as tls_ws:
+                        tls_ws.sendall(
+                            (
+                                f"GET /ws/producer?auth={valid_auth_token} HTTP/1.1\r\n"
+                                f"Host: 127.0.0.1:{port}\r\n"
+                                "Origin: https://evil.example\r\n"
+                                "Upgrade: websocket\r\n"
+                                "Connection: Upgrade\r\n"
+                                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                                "Sec-WebSocket-Version: 13\r\n\r\n"
+                            ).encode("ascii")
+                        )
+                        ws_resp = tls_ws.recv(4096).decode("utf-8", errors="ignore")
+                        self.assertIn("403", ws_resp.splitlines()[0])
+
+                # 7. Malformed / oversized Content-Length validation
+                for bad_cl, expected_code in (("-5", "400"), (str(MAX_HTTP_POST_BYTES + 1), "413")):
+                    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw_http:
+                        with client_ctx.wrap_socket(raw_http, server_hostname="127.0.0.1") as tls_http:
+                            tls_http.sendall(
+                                (
+                                    f"POST /api/login HTTP/1.1\r\n"
+                                    f"Host: 127.0.0.1:{port}\r\n"
+                                    f"Content-Length: {bad_cl}\r\n"
+                                    "Connection: close\r\n\r\n"
+                                ).encode("ascii")
+                            )
+                            http_resp = tls_http.recv(4096).decode("utf-8", errors="ignore")
+                            self.assertIn(expected_code, http_resp.splitlines()[0])
+
+                # 8. WebSocket frame hardening (require_mask, RSV bits, fragmented/oversized control frames)
+                invalid_frames = (
+                    b"\x81\x02hi",                          # Unmasked when require_mask=True
+                    b"\xc1\x80\x00\x00\x00\x00",            # RSV1 bit set
+                    b"\x09\x80\x00\x00\x00\x00",            # Fragmented control Ping
+                    b"\x89\xfe\x00\x7e\x00\x00\x00\x00",    # Control Ping length 126 > 125
+                )
+                for raw_frame in invalid_frames:
+                    s_srv, s_cli = socket.socketpair()
+                    try:
+                        s_srv.settimeout(1.0)
+                        s_cli.sendall(raw_frame)
+                        self.assertIsNone(read_ws_frame(s_srv, require_mask=True))
+                    finally:
+                        s_srv.close()
+                        s_cli.close()
+
+                s_srv, s_cli = socket.socketpair()
+                try:
+                    s_srv.settimeout(1.0)
+                    mask = b"\x12\x34\x56\x78"
+                    payload = b"hi"
+                    masked_payload = bytes(payload[i] ^ mask[i & 3] for i in range(len(payload)))
+                    s_cli.sendall(bytes([0x81, 0x80 | len(payload)]) + mask + masked_payload)
+                    self.assertEqual(read_ws_frame(s_srv, require_mask=True), (0x1, b"hi"))
+                finally:
+                    s_srv.close()
+                    s_cli.close()
+            finally:
+                server.stop()
+
+    def test_project_name_sanitization_and_rename_traversal_blocking(self) -> None:
+        from app.config_manager import MAX_PROJECT_NAME_LENGTH, sanitize_project_name
+        from app.remote_producer import RemoteProducerServer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc"))
+            cm.settings.remote_producer_allow_project_rename = True
+            cm.save()
+            ae = AudioEngine()
+            srv = RemoteProducerServer(audio_engine=ae, config_manager=cm)
+
+            # sanitize_project_name & is_protected_storage_name harden path components
+            self.assertEqual(sanitize_project_name(".."), "Project")
+            self.assertEqual(sanitize_project_name("."), "Project")
+            self.assertEqual(sanitize_project_name("ssl"), "Project")
+            self.assertEqual(sanitize_project_name("SSL"), "Project")
+            self.assertEqual(sanitize_project_name(".alpine-recorder"), "Project")
+            self.assertEqual(sanitize_project_name("lost+found"), "Project")
+            self.assertEqual(sanitize_project_name(".hidden"), "Project")
+            self.assertEqual(len(sanitize_project_name("A" * 120)), MAX_PROJECT_NAME_LENGTH)
+
+            for bad in ("..", ".", ".hidden", "ssl", "SSL", ".alpine-recorder", "lost+found"):
+                self.assertTrue(cm.is_protected_storage_name(bad), f"Expected protected: {bad}")
+
+            # Remote rename rejects traversal, separators, leading dot, reserved dirs, and >96 chars
+            for bad_rename in (
+                "../etc",
+                "sub/dir",
+                "sub\\dir",
+                "ssl",
+                "SSL",
+                ".alpine-recorder",
+                "lost+found",
+                ".hidden",
+                "..",
+                ".",
+                "A" * 120,
+            ):
+                ok, _msg = srv.update_project_name(bad_rename)
+                self.assertFalse(ok, f"Expected update_project_name to reject {bad_rename!r}")
+                self.assertEqual(cm.settings.project_name, "Session")
+
+            ok_good, cleaned = srv.update_project_name("Client_VO_2026")
+            self.assertTrue(ok_good)
+            self.assertEqual(cleaned, "Client_VO_2026")
+            self.assertEqual(cm.settings.project_name, "Client_VO_2026")
 
 
 if __name__ == "__main__":
