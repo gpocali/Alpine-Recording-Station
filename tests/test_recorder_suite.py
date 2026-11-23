@@ -3415,5 +3415,356 @@ class TestRemoteProducerSecurityAndFail2Ban(unittest.TestCase):
             self.assertEqual(cm.settings.project_name, "Client_VO_2026")
 
 
+class TestMuteAutoPauseAndSessionTimeout(unittest.TestCase):
+    def test_settings_defaults_persistence_and_dialog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            storage = base / "storage"
+            etc = base / "etc"
+            cm = ConfigManager(storage_dir=str(storage), etc_config_dir=str(etc))
+            self.assertEqual(cm.settings.mute_auto_pause_timeout_sec, 30.0)
+            self.assertEqual(cm.settings.auto_pause_session_timeout_sec, 1800.0)
+
+            cm.settings.mute_auto_pause_timeout_sec = 45.0
+            cm.settings.auto_pause_session_timeout_sec = 600.0
+            cm.save()
+
+            cm_reloaded = ConfigManager(storage_dir=str(storage), etc_config_dir=str(etc))
+            self.assertEqual(cm_reloaded.settings.mute_auto_pause_timeout_sec, 45.0)
+            self.assertEqual(cm_reloaded.settings.auto_pause_session_timeout_sec, 600.0)
+
+        try:
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PyQt6.QtWidgets import QApplication
+            from app.ui.settings_dialog import SettingsDialog
+        except Exception:
+            return
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(
+                storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc")
+            )
+            engine = AudioEngine(simulate_if_empty=True)
+            sm = SambaManager(cm)
+            sm.pdbedit_bin = None
+            sm.smbpasswd_bin = None
+
+            dlg = SettingsDialog(
+                config_manager=cm,
+                audio_engine=engine,
+                samba_manager=sm,
+            )
+            try:
+                self.assertEqual(float(dlg.mute_auto_pause_combo.currentData()), 30.0)
+                self.assertEqual(
+                    float(dlg.auto_pause_session_timeout_combo.currentData()), 1800.0
+                )
+
+                idx_60 = dlg.mute_auto_pause_combo.findData(60.0)
+                idx_300 = dlg.auto_pause_session_timeout_combo.findData(300.0)
+                self.assertGreaterEqual(idx_60, 0)
+                self.assertGreaterEqual(idx_300, 0)
+                dlg.mute_auto_pause_combo.setCurrentIndex(idx_60)
+                dlg.auto_pause_session_timeout_combo.setCurrentIndex(idx_300)
+                dlg._on_save_settings()
+            finally:
+                dlg.close()
+
+            cm2 = ConfigManager(
+                storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc")
+            )
+            self.assertEqual(cm2.settings.mute_auto_pause_timeout_sec, 60.0)
+            self.assertEqual(cm2.settings.auto_pause_session_timeout_sec, 300.0)
+        _ = app
+
+    def test_auto_pause_on_mute_auto_resume_on_unmute_and_manual_pause_stays_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rec_path = Path(tmpdir) / "auto_pause_mute_test.wav"
+            engine = AudioEngine(simulate_if_empty=True)
+            devs = engine.get_capture_devices()
+            self.assertTrue(devs)
+
+            engine.start_recording(
+                device=devs[0],
+                output_path=rec_path,
+                sample_rate=48000,
+                bit_depth=16,
+                studio_mode=True,
+                channels=2,
+                mute_auto_pause_timeout_sec=30.0,
+                auto_pause_session_timeout_sec=1800.0,
+            )
+            try:
+                time.sleep(0.10)
+                self.assertTrue(engine.is_recording)
+                self.assertFalse(engine.is_record_paused)
+                self.assertFalse(engine.is_auto_paused)
+
+                # Mute mic -> still recording until 30s timeout elapses
+                engine.set_talent_mic_send_enabled(False)
+                t_mute = time.monotonic()
+                self.assertIsNone(engine.check_mute_auto_pause_timeouts(now=t_mute + 29.0))
+                self.assertFalse(engine.is_record_paused)
+                self.assertFalse(engine.is_auto_paused)
+
+                # Crossing 30s timeout automatically pauses and closes WAV file on disk
+                ev = engine.check_mute_auto_pause_timeouts(now=t_mute + 30.5)
+                self.assertEqual(ev, "auto_paused")
+                self.assertTrue(engine.is_recording)
+                self.assertTrue(engine.is_record_paused)
+                self.assertTrue(engine.is_auto_paused)
+                self.assertFalse(engine.is_recording_file_open)
+                frames_paused, _, _, _ = read_wav_as_float64(rec_path)
+                self.assertGreater(frames_paused.shape[0], 0)
+
+                # Unmuting automatically resumes recording to the same WAV file
+                engine.set_talent_mic_send_enabled(True)
+                self.assertTrue(engine.is_recording)
+                self.assertFalse(engine.is_record_paused)
+                self.assertFalse(engine.is_auto_paused)
+                time.sleep(0.10)
+
+                # Momentary cough mute also auto-pauses and auto-resumes on unmute
+                engine.set_talent_cough_muted(True)
+                t_cough = time.monotonic()
+                self.assertEqual(
+                    engine.check_mute_auto_pause_timeouts(now=t_cough + 31.0),
+                    "auto_paused",
+                )
+                self.assertTrue(engine.is_auto_paused)
+                engine.set_talent_cough_muted(False)
+                self.assertFalse(engine.is_record_paused)
+                self.assertFalse(engine.is_auto_paused)
+
+                # Manual pause must NOT auto-resume when unmuted
+                self.assertTrue(engine.pause_recording())
+                self.assertTrue(engine.is_record_paused)
+                self.assertFalse(engine.is_auto_paused)
+                engine.set_talent_mic_send_enabled(False)
+                engine.set_talent_mic_send_enabled(True)
+                self.assertTrue(engine.is_record_paused)
+                self.assertFalse(engine.is_auto_paused)
+            finally:
+                engine.stop_recording()
+
+    def test_talkback_resumes_auto_pause_and_resets_timeout_for_local_and_remote(self) -> None:
+        from app.remote_producer import RemoteProducerServer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(
+                storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc")
+            )
+            rec_path = base / "auto_pause_talkback_reset.wav"
+            engine = AudioEngine(simulate_if_empty=True)
+            srv = RemoteProducerServer(audio_engine=engine, config_manager=cm)
+            devs = engine.get_capture_devices()
+            self.assertTrue(devs)
+
+            engine.start_recording(
+                device=devs[0],
+                output_path=rec_path,
+                sample_rate=48000,
+                bit_depth=16,
+                studio_mode=True,
+                channels=2,
+                mute_auto_pause_timeout_sec=30.0,
+                auto_pause_session_timeout_sec=1800.0,
+            )
+            try:
+                time.sleep(0.08)
+                engine.set_talent_mic_send_enabled(False)
+                t0 = time.monotonic()
+                self.assertEqual(
+                    engine.check_mute_auto_pause_timeouts(now=t0 + 31.0), "auto_paused"
+                )
+                self.assertTrue(engine.is_auto_paused)
+
+                snap_paused = srv.build_status_snapshot()
+                self.assertTrue(snap_paused["is_auto_paused"])
+                self.assertEqual(snap_paused["mute_auto_pause_timeout_sec"], 30.0)
+                self.assertEqual(snap_paused["auto_pause_session_timeout_sec"], 1800.0)
+
+                # 1. Local Talkback during auto-pause immediately resumes recording
+                engine.set_talkback(True, latched=False)
+                self.assertTrue(engine.is_recording)
+                self.assertFalse(engine.is_record_paused)
+                self.assertFalse(engine.is_auto_paused)
+                self.assertTrue(engine.local_talkback_active)
+                # While talking (>30s), timeout keeps resetting and does not pause
+                self.assertIsNone(
+                    engine.check_mute_auto_pause_timeouts(now=time.monotonic() + 60.0)
+                )
+                self.assertFalse(engine.is_record_paused)
+
+                # Releasing local talkback while still muted resets the countdown from release time
+                engine.set_talkback(False, latched=False)
+                t_local_rel = time.monotonic()
+                self.assertFalse(engine.local_talkback_active)
+                self.assertFalse(engine.is_record_paused)
+                self.assertIsNone(
+                    engine.check_mute_auto_pause_timeouts(now=t_local_rel + 25.0)
+                )
+                self.assertFalse(engine.is_record_paused)
+                self.assertEqual(
+                    engine.check_mute_auto_pause_timeouts(now=t_local_rel + 31.0),
+                    "auto_paused",
+                )
+                self.assertTrue(engine.is_auto_paused)
+
+                # 2. Remote Producer Talkback during auto-pause immediately resumes recording
+                engine.set_remote_talkback(True, latched=False)
+                self.assertTrue(engine.is_recording)
+                self.assertFalse(engine.is_record_paused)
+                self.assertFalse(engine.is_auto_paused)
+                self.assertTrue(engine.remote_talkback_active)
+                snap_resumed = srv.build_status_snapshot()
+                self.assertFalse(snap_resumed["is_auto_paused"])
+
+                # Receiving remote talkback audio keeps resetting the mute countdown
+                engine.push_remote_talkback_audio(
+                    np.full(480, 0.2, dtype=np.float64), sample_rate=24000
+                )
+                self.assertIsNone(
+                    engine.check_mute_auto_pause_timeouts(now=time.monotonic() + 45.0)
+                )
+                self.assertFalse(engine.is_record_paused)
+
+                # Ending remote talkback while talent mic is still muted resets timeout from finish time
+                engine.set_remote_talkback(False, latched=False)
+                t_rem_rel = time.monotonic()
+                self.assertFalse(engine.remote_talkback_active)
+                self.assertIsNone(
+                    engine.check_mute_auto_pause_timeouts(now=t_rem_rel + 20.0)
+                )
+                self.assertFalse(engine.is_record_paused)
+                self.assertEqual(
+                    engine.check_mute_auto_pause_timeouts(now=t_rem_rel + 31.0),
+                    "auto_paused",
+                )
+                self.assertTrue(engine.is_auto_paused)
+            finally:
+                engine.stop_recording()
+
+    def test_extended_auto_pause_session_timeout_stops_and_finalizes(self) -> None:
+        from app.sayodevice_led import COLOR_OFF, COLOR_TALKBACK_READY, SayoStudioState
+
+        # SayoDevice button 2 stays armed during auto-pause, unlike manual pause
+        self.assertEqual(
+            SayoStudioState(
+                has_device=True, is_recording=True, is_record_paused=True, is_auto_paused=True
+            ).compute_button_colors()[2],
+            COLOR_TALKBACK_READY,
+        )
+        self.assertEqual(
+            SayoStudioState(
+                has_device=True, is_recording=True, is_record_paused=True, is_auto_paused=False
+            ).compute_button_colors()[2],
+            COLOR_OFF,
+        )
+
+        # Background recording loop naturally triggers auto-pause and extended session stop
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rec_path = Path(tmpdir) / "auto_stop_natural.wav"
+            engine = AudioEngine(simulate_if_empty=True)
+            devs = engine.get_capture_devices()
+            self.assertTrue(devs)
+
+            engine.set_talent_mic_send_enabled(False)
+            engine.start_recording(
+                device=devs[0],
+                output_path=rec_path,
+                sample_rate=48000,
+                bit_depth=16,
+                studio_mode=True,
+                channels=2,
+                mute_auto_pause_timeout_sec=0.12,
+                auto_pause_session_timeout_sec=0.15,
+            )
+            deadline = time.monotonic() + 2.0
+            saw_auto_paused = False
+            while time.monotonic() < deadline:
+                if engine.is_auto_paused:
+                    saw_auto_paused = True
+                if not engine.is_recording and saw_auto_paused:
+                    break
+                time.sleep(0.02)
+
+            self.assertTrue(saw_auto_paused)
+            self.assertFalse(engine.is_recording)
+            self.assertFalse(engine.is_record_paused)
+            self.assertFalse(engine.is_auto_paused)
+            self.assertEqual(engine.consume_auto_stopped_recording(), rec_path)
+            self.assertIsNone(engine.consume_auto_stopped_recording())
+            frames, sr, ch, bd = read_wav_as_float64(rec_path)
+            self.assertEqual((sr, ch, bd), (48000, 2, 16))
+            self.assertGreater(frames.shape[0], 0)
+
+        try:
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PyQt6.QtWidgets import QApplication
+            from app.ui.main_window import MainWindow
+        except Exception:
+            return
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(
+                storage_dir=str(base / "storage"), etc_config_dir=str(base / "etc")
+            )
+            cm.settings.mute_auto_pause_timeout_sec = 0.12
+            cm.settings.auto_pause_session_timeout_sec = 0.25
+            cm.save()
+            ae = AudioEngine(simulate_if_empty=True)
+            sm = SambaManager(cm)
+            win = MainWindow(
+                config_manager=cm,
+                audio_engine=ae,
+                samba_manager=sm,
+                fullscreen=False,
+            )
+            try:
+                ae.set_talent_mic_send_enabled(False)
+                win._on_record_button_clicked()
+                self.assertTrue(ae.is_recording)
+
+                # Wait for auto-pause via UI ticks
+                pause_deadline = time.monotonic() + 1.5
+                while time.monotonic() < pause_deadline and not ae.is_auto_paused:
+                    win._on_ui_tick()
+                    time.sleep(0.02)
+                win._on_ui_tick()
+                self.assertTrue(ae.is_auto_paused)
+                self.assertTrue(win.talkback_btn.isEnabled())
+                self.assertIn("AUTO-PAUSED", win.talkback_banner.text())
+                self.assertIn("[AUTO-PAUSED]", win.timer_label.text())
+
+                # Pressing Talkback in UI while auto-paused resumes recording
+                win._on_talkback_pressed()
+                self.assertFalse(ae.is_record_paused)
+                self.assertFalse(ae.is_auto_paused)
+                self.assertTrue(ae.local_talkback_active)
+                win._on_talkback_released()
+                self.assertFalse(ae.local_talkback_active)
+
+                # Wait for second auto-pause and then extended session stop timeout
+                stop_deadline = time.monotonic() + 2.5
+                while time.monotonic() < stop_deadline and ae.is_recording:
+                    win._on_ui_tick()
+                    time.sleep(0.02)
+                win._on_ui_tick()
+
+                self.assertFalse(ae.is_recording)
+                self.assertEqual(win.record_btn.text(), "●  Record")
+                self.assertEqual(win.timer_label.text(), "00:00:00.0")
+                self.assertEqual(win.recordings_list.count(), 1)
+            finally:
+                win.close()
+                app.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()

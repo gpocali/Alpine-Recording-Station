@@ -23,8 +23,10 @@ from PyQt6.QtWidgets import (
 
 from app.audio_engine import AudioDeviceCapabilities, AudioEngine
 from app.config_manager import (
+    AUTO_PAUSE_SESSION_TIMEOUT_OPTIONS,
     CLOCK_DATE_FORMAT_OPTIONS,
     CLOCK_TIME_FORMAT_OPTIONS,
+    MUTE_AUTO_PAUSE_TIMEOUT_OPTIONS,
     TALKBACK_TONE_DURATION_OPTIONS,
     TALKBACK_TONE_FREQ_OPTIONS,
     ConfigManager,
@@ -263,6 +265,36 @@ class SettingsDialog(QDialog):
 
         form.addRow("Talkback Tone Duration:", tone_dur_row)
 
+        mute_timeout_row = QHBoxLayout()
+        mute_timeout_row.setContentsMargins(0, 0, 0, 0)
+        mute_timeout_row.setSpacing(10)
+
+        pause_after_lbl = QLabel("Pause After:")
+        mute_timeout_row.addWidget(pause_after_lbl)
+
+        self.mute_auto_pause_combo = QComboBox()
+        for sec_val, sec_label in MUTE_AUTO_PAUSE_TIMEOUT_OPTIONS:
+            self.mute_auto_pause_combo.addItem(sec_label, float(sec_val))
+        self.mute_auto_pause_combo.setToolTip(
+            "Automatically pause recording if the microphone remains muted for this duration "
+            "(Default: 30s). Automatically resumes when unmuted or during Talkback."
+        )
+        mute_timeout_row.addWidget(self.mute_auto_pause_combo, stretch=1)
+
+        session_stop_lbl = QLabel("Session Stop:")
+        mute_timeout_row.addWidget(session_stop_lbl)
+
+        self.auto_pause_session_timeout_combo = QComboBox()
+        for sec_val, sec_label in AUTO_PAUSE_SESSION_TIMEOUT_OPTIONS:
+            self.auto_pause_session_timeout_combo.addItem(sec_label, float(sec_val))
+        self.auto_pause_session_timeout_combo.setToolTip(
+            "If left in the auto-paused state for this extended duration, automatically stop "
+            "and finalize the recording session (Default: 30 minutes)."
+        )
+        mute_timeout_row.addWidget(self.auto_pause_session_timeout_combo, stretch=1)
+
+        form.addRow("Muted Mic Auto-Pause:", mute_timeout_row)
+
         self.osk_combo = QComboBox()
         self.osk_combo.addItem(
             "Enabled (Touchscreen Mode — Show on-screen keyboard for text fields)",
@@ -483,6 +515,16 @@ class SettingsDialog(QDialog):
             self.release_tone_duration_combo,
             float(settings.talkback_release_tone_duration_sec),
             lambda v: self._format_duration_option(v, default_sec=0.5),
+        )
+        self._select_or_add_float_combo(
+            self.mute_auto_pause_combo,
+            float(getattr(settings, "mute_auto_pause_timeout_sec", 30.0)),
+            lambda v: self._format_duration_option(v, default_sec=30.0),
+        )
+        self._select_or_add_float_combo(
+            self.auto_pause_session_timeout_combo,
+            float(getattr(settings, "auto_pause_session_timeout_sec", 1800.0)),
+            lambda v: f"{v:g} seconds (Custom)",
         )
 
         osk_idx = self.osk_combo.findData(bool(settings.on_screen_keyboard))
@@ -777,6 +819,16 @@ class SettingsDialog(QDialog):
             self.release_tone_duration_combo.currentData()
             if self.release_tone_duration_combo.currentData() is not None
             else 0.5
+        )
+        s.mute_auto_pause_timeout_sec = float(
+            self.mute_auto_pause_combo.currentData()
+            if self.mute_auto_pause_combo.currentData() is not None
+            else 30.0
+        )
+        s.auto_pause_session_timeout_sec = float(
+            self.auto_pause_session_timeout_combo.currentData()
+            if self.auto_pause_session_timeout_combo.currentData() is not None
+            else 1800.0
         )
         s.on_screen_keyboard = self._is_osk_enabled()
         s.clock_time_format = str(self.clock_time_format_combo.currentData() or "12h")

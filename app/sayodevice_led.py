@@ -104,6 +104,7 @@ class SayoStudioState:
     has_device: bool = False
     is_recording: bool = False
     is_record_paused: bool = False
+    is_auto_paused: bool = False
     talkback_active: bool = False
     is_mic_muted: bool = False
     is_talkback_mute_override: bool = False
@@ -133,7 +134,7 @@ class SayoStudioState:
             btn1 = COLOR_OFF
 
         # Button 2: Talkback [T]
-        if not self.has_device or self.is_record_paused:
+        if not self.has_device or (self.is_record_paused and not self.is_auto_paused):
             btn2 = COLOR_OFF
         elif self.talkback_active:
             btn2 = COLOR_TALKBACK_ACTIVE
@@ -159,7 +160,11 @@ class SayoStudioState:
             (self.is_recording and self.is_record_paused and self.blink_on)
             or (not self.is_recording and self.is_playing and not self.is_playback_paused)
         )
-        tb_led = bool(self.has_device and not self.is_record_paused and self.talkback_active)
+        tb_led = bool(
+            self.has_device
+            and (not self.is_record_paused or self.is_auto_paused)
+            and self.talkback_active
+        )
         mute_led = bool(
             self.has_device
             and self.is_mic_muted
@@ -842,12 +847,14 @@ class SayoDeviceLedController:
         is_playing: bool = False,
         is_playback_paused: bool = False,
         blink_on: bool = True,
+        is_auto_paused: bool = False,
     ) -> None:
         """Update the target studio state and wake the LED writer only if state changed."""
         new_state = SayoStudioState(
             has_device=bool(has_device),
             is_recording=bool(is_recording),
             is_record_paused=bool(is_record_paused),
+            is_auto_paused=bool(is_auto_paused),
             talkback_active=bool(talkback_active),
             is_mic_muted=bool(is_mic_muted),
             is_talkback_mute_override=bool(is_talkback_mute_override),

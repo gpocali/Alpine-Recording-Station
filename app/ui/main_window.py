@@ -720,7 +720,12 @@ class HelpDialog(QDialog):
                 "<b>Paused</b> and flashes amber along with the Studio Deck border.<br>"
                 "<b>Safe Disk Closure:</b> When paused, the WAV file header is immediately updated, "
                 "flushed, and closed on disk so the take is safe even if power is lost. Clicking "
-                "<b>Paused</b> reopens the exact same WAV file and seamlessly continues appending audio."
+                "<b>Paused</b> reopens the exact same WAV file and seamlessly continues appending audio.<br>"
+                "<b>Muted Mic Auto-Pause:</b> If the microphone remains muted past the configured timeout "
+                "(default 30s), recording automatically pauses and safely closes the file. Unmuting the mic "
+                "or engaging local/remote Talkback automatically resumes recording (and Talkback resets the "
+                "mute timeout until after Talkback finishes). Extended auto-paused sessions automatically stop "
+                "after the configured Session Stop timeout."
             ),
             self._build_section_card(
                 "TALKBACK  [Hotkey: T]",
@@ -858,6 +863,8 @@ class HelpDialog(QDialog):
                 "Mono track or Studio Split Mode Left/Right tracks.<br>"
                 "• <b>Talkback Tone Frequency && Durations:</b> Customize the marker tone pitch (330 Hz to 1000 Hz) "
                 "and independent Press (default 1.0s) and Release (default 0.5s) durations.<br>"
+                "• <b>Muted Mic Auto-Pause && Session Stop:</b> Configure how long a muted mic records before "
+                "auto-pausing (default 30s) and the extended auto-pause timeout before the session automatically stops (default 30 minutes).<br>"
                 "• <b>On-Screen Keyboard:</b> Enables or disables the pop-up touch keyboard for text fields.<br>"
                 "• <b>Studio Clock Display:</b> Choose 12-hour (AM/PM, default) or 24-hour clock format and "
                 "select your preferred regional date format (or hide the date)."
@@ -973,6 +980,9 @@ class MainWindow(QMainWindow):
         self._last_observed_producer_running = self.remote_producer_server.is_running
         self._last_observed_producer_port = self.remote_producer_server.port
         self._last_observed_mute_state = False
+        self._last_observed_auto_paused = False
+        self._last_observed_is_recording = False
+        self._last_observed_is_record_paused = False
         self._pause_blink_phase = True
         self._last_storage_refresh_monotonic: float = 0.0
         self._last_resource_refresh_monotonic: float = 0.0
@@ -1439,12 +1449,17 @@ class MainWindow(QMainWindow):
             tone_duration_sec=settings.talkback_tone_duration_sec,
             release_tone_duration_sec=settings.talkback_release_tone_duration_sec,
         )
+        self.audio_engine.set_auto_pause_timeouts(
+            mute_timeout_sec=float(getattr(settings, "mute_auto_pause_timeout_sec", 30.0)),
+            session_timeout_sec=float(getattr(settings, "auto_pause_session_timeout_sec", 1800.0)),
+        )
         self._refresh_transport_styles()
 
     def _refresh_transport_styles(self) -> None:
         settings = self.config_manager.settings
         is_rec = self.audio_engine.is_recording
         is_rec_paused = self.audio_engine.is_record_paused
+        is_auto_paused = self.audio_engine.is_auto_paused
         blink_on = self._pause_blink_phase
         dev = self._active_input_device
         rec_path = self.audio_engine.current_recording_path
@@ -1536,7 +1551,8 @@ class MainWindow(QMainWindow):
                 else ("STEREO (2ch)" if settings.channels >= 2 else "MONO (1ch)")
             )
             if is_rec_paused:
-                self.hw_status_label.setText(f"❚❚ Paused: {rec_name}")
+                paused_prefix = "❚❚ Auto-Paused" if is_auto_paused else "❚❚ Paused"
+                self.hw_status_label.setText(f"{paused_prefix}: {rec_name}")
                 status_col = "#FFDF5D" if blink_on else "#F0B72F"
                 self.hw_status_label.setStyleSheet(f"color: {status_col}; font-weight: bold;")
             else:
@@ -1598,7 +1614,7 @@ class MainWindow(QMainWindow):
 
         # Talkback button & visual banner state
         tb_active = self.audio_engine.talkback_active
-        tb_enabled = bool(dev is not None and not is_rec_paused)
+        tb_enabled = bool(dev is not None and (not is_rec_paused or is_auto_paused))
         self.talkback_btn.setVisible(True)
         self.talkback_btn.setEnabled(tb_enabled)
         self.talkback_btn.setText("⚡  Talkback" if tb_active else "◉  Talkback")
@@ -1609,7 +1625,12 @@ class MainWindow(QMainWindow):
         if is_rec_paused:
             self.talkback_banner.setVisible(True)
             file_info = f" ({rec_name})" if rec_name else ""
-            self.talkback_banner.setText(f"❚❚ RECORDING PAUSED{file_info}")
+            if is_auto_paused:
+                self.talkback_banner.setText(
+                    f"❚❚ AUTO-PAUSED (MIC MUTED){file_info} — UNMUTE OR TALKBACK TO RESUME"
+                )
+            else:
+                self.talkback_banner.setText(f"❚❚ RECORDING PAUSED{file_info}")
             if blink_on:
                 self.talkback_banner.setStyleSheet(
                     "background-color: #E36209; color: #FFFFFF; font-weight: bold; "
@@ -1685,6 +1706,7 @@ class MainWindow(QMainWindow):
             has_device=(self._active_input_device is not None),
             is_recording=self.audio_engine.is_recording,
             is_record_paused=self.audio_engine.is_record_paused,
+            is_auto_paused=self.audio_engine.is_auto_paused,
             talkback_active=self.audio_engine.talkback_active,
             is_mic_muted=is_mute_active,
             is_talkback_mute_override=self.audio_engine.is_talkback_mute_override,
@@ -1791,6 +1813,12 @@ class MainWindow(QMainWindow):
             tone_duration_sec=settings.talkback_tone_duration_sec,
             release_tone_duration_sec=settings.talkback_release_tone_duration_sec,
             on_error=self._on_recording_error_threadsafe,
+            mute_auto_pause_timeout_sec=float(
+                getattr(settings, "mute_auto_pause_timeout_sec", 30.0)
+            ),
+            auto_pause_session_timeout_sec=float(
+                getattr(settings, "auto_pause_session_timeout_sec", 1800.0)
+            ),
         )
         self._refresh_transport_styles()
 
@@ -1822,7 +1850,7 @@ class MainWindow(QMainWindow):
     def _on_talkback_pressed(self) -> None:
         if (
             self._active_input_device is None
-            or self.audio_engine.is_record_paused
+            or (self.audio_engine.is_record_paused and not self.audio_engine.is_auto_paused)
         ):
             return
         self._talkback_btn_press_mono = time.monotonic()
@@ -2013,7 +2041,12 @@ class MainWindow(QMainWindow):
         rec_path = self.audio_engine.current_recording_path
         folder = sanitize_project_name(self.config_manager.settings.project_name)
         if self.audio_engine.is_record_paused and rec_path is not None:
-            self.filename_preview_label.setText(f"❚❚ Paused File: {folder}/{rec_path.name}")
+            prefix = (
+                "❚❚ Auto-Paused File"
+                if self.audio_engine.is_auto_paused
+                else "❚❚ Paused File"
+            )
+            self.filename_preview_label.setText(f"{prefix}: {folder}/{rec_path.name}")
             self.filename_preview_label.setStyleSheet(
                 "border: none; color: #FFDF5D; font-family: monospace; font-weight: bold;"
             )
@@ -2444,8 +2477,23 @@ class MainWindow(QMainWindow):
     # Periodic Timers & Keyboard Hotkeys
     # -------------------------------------------------------------------------
     def _on_ui_tick(self) -> None:
+        timeout_event = self.audio_engine.check_mute_auto_pause_timeouts()
+        auto_stopped_path = self.audio_engine.consume_auto_stopped_recording()
+        if auto_stopped_path is not None:
+            self._talkback_key_held = False
+            self.timer_label.setText("00:00:00.0")
+            self._last_observed_is_recording = False
+            self._last_observed_is_record_paused = False
+            self._last_observed_auto_paused = False
+            self._refresh_transport_styles()
+            self._refresh_recordings_list(select_path=auto_stopped_path)
+            self.remote_producer_server.broadcast_state_snapshot()
+        elif timeout_event in ("auto_paused", "auto_resumed"):
+            self.remote_producer_server.broadcast_state_snapshot()
+
         is_rec = self.audio_engine.is_recording
         is_rec_paused = self.audio_engine.is_record_paused
+        auto_paused_now = self.audio_engine.is_auto_paused
         self._refresh_vu_meter()
         self._refresh_clock_display()
 
@@ -2472,6 +2520,9 @@ class MainWindow(QMainWindow):
             or prod_running_now != self._last_observed_producer_running
             or prod_port_now != self._last_observed_producer_port
             or mute_active_now != self._last_observed_mute_state
+            or is_rec != self._last_observed_is_recording
+            or is_rec_paused != self._last_observed_is_record_paused
+            or auto_paused_now != self._last_observed_auto_paused
             or blink_now != self._pause_blink_phase
         ):
             self._last_observed_tb_active = tb_now
@@ -2481,6 +2532,9 @@ class MainWindow(QMainWindow):
             self._last_observed_producer_running = prod_running_now
             self._last_observed_producer_port = prod_port_now
             self._last_observed_mute_state = mute_active_now
+            self._last_observed_is_recording = is_rec
+            self._last_observed_is_record_paused = is_rec_paused
+            self._last_observed_auto_paused = auto_paused_now
             self._pause_blink_phase = blink_now
             self._refresh_transport_styles()
 
@@ -2493,8 +2547,9 @@ class MainWindow(QMainWindow):
             mins = int((elapsed % 3600) // 60)
             secs = elapsed % 60.0
             if is_rec_paused:
+                tag = "[AUTO-PAUSED]" if auto_paused_now else "[PAUSED]"
                 self.timer_label.setText(
-                    f"❚❚ {hrs:02d}:{mins:02d}:{secs:04.1f}  [PAUSED]"
+                    f"❚❚ {hrs:02d}:{mins:02d}:{secs:04.1f}  {tag}"
                 )
             else:
                 self.timer_label.setText(f"{hrs:02d}:{mins:02d}:{secs:04.1f}")

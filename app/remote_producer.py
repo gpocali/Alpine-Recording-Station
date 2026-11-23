@@ -1321,6 +1321,13 @@ class RemoteProducerServer:
             "state": state_code,
             "is_recording": bool(self.audio_engine.is_recording),
             "is_record_paused": bool(self.audio_engine.is_record_paused),
+            "is_auto_paused": bool(self.audio_engine.is_auto_paused),
+            "mute_auto_pause_timeout_sec": float(
+                getattr(settings, "mute_auto_pause_timeout_sec", 30.0)
+            ),
+            "auto_pause_session_timeout_sec": float(
+                getattr(settings, "auto_pause_session_timeout_sec", 1800.0)
+            ),
             "is_playing": is_playing,
             "is_play_paused": is_play_paused,
             "play_position_sec": play_position_sec,
@@ -2739,6 +2746,7 @@ input[type="range"].brand-slider {{
   let lastTalkbackActionTs = 0;
   let latestIsRecording = false;
   let latestIsRecordPaused = false;
+  let latestIsAutoPaused = false;
 
   // Latest VU state
   let latestVu = {{
@@ -3186,7 +3194,7 @@ input[type="range"].brand-slider {{
   }}
 
   function handleTalkbackPress() {{
-    if (latestIsRecording && latestIsRecordPaused) {{
+    if (latestIsRecording && latestIsRecordPaused && !latestIsAutoPaused) {{
       return;
     }}
     talkbackPressTs = performance.now();
@@ -3442,6 +3450,7 @@ input[type="range"].brand-slider {{
     const wasRecording = latestIsRecording;
     latestIsRecording = Boolean(msg.is_recording);
     latestIsRecordPaused = Boolean(msg.is_record_paused);
+    latestIsAutoPaused = Boolean(msg.is_auto_paused);
     if (!wasRecording && latestIsRecording) {{
       // Recording just started: unlatch Talkback and switch to momentary PTT
       if (talkbackLatched || (talkbackPressed && !talkbackHoldActive)) {{
@@ -3532,7 +3541,9 @@ input[type="range"].brand-slider {{
     }} else if (msg.is_recording && msg.is_record_paused) {{
       studioDeck.className = "studio-deck deck-paused";
       stateBanner.className = "state-banner banner-paused";
-      stateBanner.textContent = "❚❚ RECORDING PAUSED";
+      stateBanner.textContent = msg.is_auto_paused
+        ? "❚❚ RECORDING AUTO-PAUSED (MIC MUTED — TALKBACK OR UNMUTE TO RESUME)"
+        : "❚❚ RECORDING PAUSED";
       timerDisplay.className = "timer-display timer-paused";
     }} else if (msg.is_recording) {{
       studioDeck.className = "studio-deck deck-recording";

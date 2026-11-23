@@ -55,6 +55,27 @@ TALKBACK_TONE_DURATION_OPTIONS: tuple[float, ...] = (
     3.0,
 )
 
+MUTE_AUTO_PAUSE_TIMEOUT_OPTIONS: tuple[tuple[float, str], ...] = (
+    (0.0, "Off (0s — Disabled)"),
+    (10.0, "10 seconds"),
+    (15.0, "15 seconds"),
+    (30.0, "30 seconds (Default)"),
+    (45.0, "45 seconds"),
+    (60.0, "60 seconds (1 minute)"),
+    (120.0, "120 seconds (2 minutes)"),
+    (300.0, "300 seconds (5 minutes)"),
+)
+
+AUTO_PAUSE_SESSION_TIMEOUT_OPTIONS: tuple[tuple[float, str], ...] = (
+    (0.0, "Off (0s — Never Auto-Stop)"),
+    (60.0, "1 minute"),
+    (300.0, "5 minutes"),
+    (600.0, "10 minutes"),
+    (900.0, "15 minutes"),
+    (1800.0, "30 minutes (Default)"),
+    (3600.0, "60 minutes (1 hour)"),
+)
+
 CLOCK_TIME_FORMAT_OPTIONS: tuple[tuple[str, str], ...] = (
     ("12h", "12-Hour (e.g. 08:05:30 PM — Default)"),
     ("24h", "24-Hour (e.g. 20:05:30)"),
@@ -230,6 +251,8 @@ class RecorderSettings:
     talkback_tone_hz: float = 1000.0
     talkback_tone_duration_sec: float = 1.0
     talkback_release_tone_duration_sec: float = 0.5
+    mute_auto_pause_timeout_sec: float = 30.0
+    auto_pause_session_timeout_sec: float = 1800.0
     remote_producer_enabled: bool = False
     remote_producer_port: int = 8443
     remote_producer_send_talent_mic: bool = True

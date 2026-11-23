@@ -930,12 +930,21 @@ class AudioEngine:
 
         self._record_lock = threading.Lock()
         self._writer_lock = threading.Lock()
+        self._timeout_check_lock = threading.Lock()
         self._is_recording = False
         self._is_record_paused = False
+        self._is_auto_paused = False
         self._stop_record_event = threading.Event()
         self._record_thread: Optional[threading.Thread] = None
         self._record_start_monotonic: float = 0.0
         self._record_accumulated_sec: float = 0.0
+        self._mute_auto_pause_timeout_sec: float = 30.0
+        self._auto_pause_session_timeout_sec: float = 1800.0
+        self._mute_countdown_start_monotonic: Optional[float] = None
+        self._auto_paused_since_monotonic: Optional[float] = None
+        self._last_auto_stopped_path: Optional[Path] = None
+        self._auto_stop_pending: bool = False
+        self._resume_monitoring_after_record_exit: bool = False
         self._current_processor: Optional[StudioTalkbackProcessor] = None
         self._current_recording_path: Optional[Path] = None
         self._active_writer: Optional[WavFileWriter] = None
@@ -1593,8 +1602,7 @@ class AudioEngine:
     def set_talent_mic_send_enabled(self, enabled: bool) -> None:
         """Enable or disable sending the talent's live microphone feed (and unmuting/muting mic input)."""
         self._talent_mic_send_enabled = bool(enabled)
-        if self.is_mic_muted:
-            self._clear_live_meter_levels()
+        self._handle_mic_mute_state_changed()
 
     @property
     def talent_cough_muted(self) -> bool:
@@ -1603,8 +1611,25 @@ class AudioEngine:
     def set_talent_cough_muted(self, muted: bool) -> None:
         """Set momentary Cough / Privacy mute state on the talent's microphone."""
         self._talent_cough_muted = bool(muted)
+        self._handle_mic_mute_state_changed()
+
+    @property
+    def is_raw_mic_muted(self) -> bool:
+        """Return True when the local mic is muted by cough mute or mute toggle (ignoring Talkback override)."""
+        return bool(self._talent_cough_muted or not self._talent_mic_send_enabled)
+
+    def _handle_mic_mute_state_changed(self) -> None:
         if self.is_mic_muted:
             self._clear_live_meter_levels()
+        raw_muted = self.is_raw_mic_muted
+        if not raw_muted:
+            self._mute_countdown_start_monotonic = None
+            if self.is_auto_paused:
+                self.resume_recording()
+        else:
+            if self.is_recording and not self.is_record_paused:
+                if self._mute_countdown_start_monotonic is None or self.talkback_active:
+                    self._mute_countdown_start_monotonic = time.monotonic()
 
     @property
     def is_mic_muted(self) -> bool:
@@ -1857,9 +1882,12 @@ class AudioEngine:
         changed = False
         with self._talkback_state_lock:
             if active and self.is_record_paused:
-                self._remote_talkback_active = False
-                self._remote_talkback_latched = False
-                return
+                if self.is_auto_paused:
+                    self.resume_recording()
+                else:
+                    self._remote_talkback_active = False
+                    self._remote_talkback_latched = False
+                    return
             was_remote = self._remote_talkback_active
             was_latched = self._remote_talkback_latched
             was_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
@@ -1877,6 +1905,11 @@ class AudioEngine:
             if proc is not None:
                 proc.set_remote_talkback(bool(active))
             now_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
+            if now_tb_active or (now_tb_active != was_tb_active):
+                if self.is_raw_mic_muted:
+                    self._mute_countdown_start_monotonic = time.monotonic()
+                else:
+                    self._mute_countdown_start_monotonic = None
             if now_tb_active and not was_tb_active:
                 self._emit_headset_talkback_tone(is_press=True)
             elif not now_tb_active and was_tb_active:
@@ -1897,6 +1930,8 @@ class AudioEngine:
         """Feed incoming Remote Producer microphone audio to both Studio Mode Right-Ch recording and Talent headphones."""
         if not self.remote_talkback_active:
             return
+        if self.is_raw_mic_muted:
+            self._mute_countdown_start_monotonic = time.monotonic()
         if input_sample_rate is not None:
             sample_rate = int(input_sample_rate)
         flat = np.asarray(samples, dtype=np.float64).reshape(-1)
@@ -2102,6 +2137,77 @@ class AudioEngine:
             return self._is_recording and self._is_record_paused
 
     @property
+    def is_auto_paused(self) -> bool:
+        with self._record_lock:
+            return bool(
+                self._is_recording
+                and self._is_record_paused
+                and self._is_auto_paused
+            )
+
+    @property
+    def mute_auto_pause_timeout_sec(self) -> float:
+        return self._mute_auto_pause_timeout_sec
+
+    @mute_auto_pause_timeout_sec.setter
+    def mute_auto_pause_timeout_sec(self, value: float) -> None:
+        self._mute_auto_pause_timeout_sec = max(0.0, float(value))
+
+    @property
+    def auto_pause_session_timeout_sec(self) -> float:
+        return self._auto_pause_session_timeout_sec
+
+    @auto_pause_session_timeout_sec.setter
+    def auto_pause_session_timeout_sec(self, value: float) -> None:
+        self._auto_pause_session_timeout_sec = max(0.0, float(value))
+
+    def set_auto_pause_timeouts(
+        self, mute_timeout_sec: float = 30.0, session_timeout_sec: float = 1800.0
+    ) -> None:
+        """Configure muted-mic auto-pause timeout and extended auto-paused session timeout."""
+        self.mute_auto_pause_timeout_sec = mute_timeout_sec
+        self.auto_pause_session_timeout_sec = session_timeout_sec
+
+    @property
+    def mute_auto_pause_remaining_sec(self) -> Optional[float]:
+        """Return seconds remaining before auto-pausing due to mic mute, or None if not counting down."""
+        if (
+            not self.is_recording
+            or self.is_record_paused
+            or not self.is_raw_mic_muted
+            or self.talkback_active
+            or self._mute_auto_pause_timeout_sec <= 0.0
+        ):
+            return None
+        start = self._mute_countdown_start_monotonic
+        if start is None:
+            return float(self._mute_auto_pause_timeout_sec)
+        return max(
+            0.0,
+            float(self._mute_auto_pause_timeout_sec) - max(0.0, time.monotonic() - start),
+        )
+
+    @property
+    def auto_pause_session_remaining_sec(self) -> Optional[float]:
+        """Return seconds remaining before an auto-paused session times out and stops, or None."""
+        if not self.is_auto_paused or self._auto_pause_session_timeout_sec <= 0.0:
+            return None
+        since = self._auto_paused_since_monotonic
+        if since is None:
+            return float(self._auto_pause_session_timeout_sec)
+        return max(
+            0.0,
+            float(self._auto_pause_session_timeout_sec) - max(0.0, time.monotonic() - since),
+        )
+
+    def consume_auto_stopped_recording(self) -> Optional[Path]:
+        """Pop and return the WAV path of a recording stopped by extended auto-pause timeout."""
+        with self._record_lock:
+            path = self._last_auto_stopped_path
+            self._last_auto_stopped_path = None
+            return path
+
+    @property
     def current_recording_path(self) -> Optional[Path]:
         with self._record_lock:
             return self._current_recording_path
@@ -2143,11 +2249,14 @@ class AudioEngine:
         changed = False
         with self._talkback_state_lock:
             if active and self.is_record_paused:
-                self._local_talkback_active = False
-                self._local_talkback_latched = False
-                if self.is_mic_muted:
-                    self._clear_live_meter_levels()
-                return
+                if self.is_auto_paused:
+                    self.resume_recording()
+                else:
+                    self._local_talkback_active = False
+                    self._local_talkback_latched = False
+                    if self.is_mic_muted:
+                        self._clear_live_meter_levels()
+                    return
             was_local = self._local_talkback_active
             was_latched = self._local_talkback_latched
             was_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
@@ -2161,9 +2270,14 @@ class AudioEngine:
             proc = self._current_processor
             if proc is not None:
                 proc.set_talkback(bool(active))
+            now_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
+            if now_tb_active or (now_tb_active != was_tb_active):
+                if self.is_raw_mic_muted:
+                    self._mute_countdown_start_monotonic = time.monotonic()
+                else:
+                    self._mute_countdown_start_monotonic = None
             if not active and self.is_mic_muted:
                 self._clear_live_meter_levels()
-            now_tb_active = bool(self._local_talkback_active or self._remote_talkback_active)
             if now_tb_active and not was_tb_active:
                 self._emit_headset_talkback_tone(is_press=True)
             elif not now_tb_active and was_tb_active:
@@ -2202,7 +2316,7 @@ class AudioEngine:
                 logger.debug("Talkback unlatch listener error: %s", exc)
         self._notify_talkback_state_listeners()
 
-    def pause_recording(self) -> bool:
+    def pause_recording(self, auto_paused: bool = False) -> bool:
         """Pause active recording, flushing and closing the WAV file on disk to prevent corruption."""
         with self._record_lock:
             if not self._is_recording:
@@ -2215,6 +2329,9 @@ class AudioEngine:
             )
             self._record_start_monotonic = now
             self._is_record_paused = True
+            self._is_auto_paused = bool(auto_paused)
+            self._mute_countdown_start_monotonic = None
+            self._auto_paused_since_monotonic = now if auto_paused else None
             proc = self._current_processor
 
         was_tb_active = bool(
@@ -2251,8 +2368,14 @@ class AudioEngine:
                 self._active_writer.reopen()
 
         with self._record_lock:
-            self._record_start_monotonic = time.monotonic()
+            now = time.monotonic()
+            self._record_start_monotonic = now
             self._is_record_paused = False
+            self._is_auto_paused = False
+            self._auto_paused_since_monotonic = None
+            self._mute_countdown_start_monotonic = (
+                now if self.is_raw_mic_muted else None
+            )
 
         return True
 
@@ -2279,6 +2402,8 @@ class AudioEngine:
         tone_duration_sec: float = 1.0,
         release_tone_duration_sec: float = 0.5,
         on_error: Optional[Callable[[str], None]] = None,
+        mute_auto_pause_timeout_sec: Optional[float] = None,
+        auto_pause_session_timeout_sec: Optional[float] = None,
     ) -> None:
         """Start recording from the selected hardware device to a WAV file."""
         self.stop_playback()
@@ -2290,6 +2415,10 @@ class AudioEngine:
             tone_duration_sec=tone_duration_sec,
             release_tone_duration_sec=release_tone_duration_sec,
         )
+        if mute_auto_pause_timeout_sec is not None:
+            self.mute_auto_pause_timeout_sec = mute_auto_pause_timeout_sec
+        if auto_pause_session_timeout_sec is not None:
+            self.auto_pause_session_timeout_sec = auto_pause_session_timeout_sec
 
         # If Talkback is latched (or active) when recording starts, unlatch it and switch to PTT
         if (
@@ -2314,13 +2443,22 @@ class AudioEngine:
                 tone_duration_sec=tone_duration_sec,
                 release_tone_duration_sec=release_tone_duration_sec,
             )
+            now = time.monotonic()
             self._current_processor = processor
             self._current_recording_path = output_path
             self._stop_record_event.clear()
             self._is_recording = True
             self._is_record_paused = False
+            self._is_auto_paused = False
+            self._auto_stop_pending = False
+            self._resume_monitoring_after_record_exit = False
+            self._last_auto_stopped_path = None
+            self._auto_paused_since_monotonic = None
+            self._mute_countdown_start_monotonic = (
+                now if self.is_raw_mic_muted else None
+            )
             self._record_accumulated_sec = 0.0
-            self._record_start_monotonic = time.monotonic()
+            self._record_start_monotonic = now
 
             self._record_thread = threading.Thread(
                 target=self._record_worker,
@@ -2336,16 +2474,20 @@ class AudioEngine:
             )
             self._record_thread.start()
 
-    def stop_recording(self) -> Optional[Path]:
+    def stop_recording(self, auto_stopped: bool = False) -> Optional[Path]:
         """Stop active recording and finalize the WAV file on disk."""
         with self._record_lock:
             if not self._is_recording:
+                self._auto_stop_pending = False
                 return None
             self._stop_record_event.set()
             thread = self._record_thread
             recorded_path = self._current_recording_path
+            called_from_record_thread = (thread is threading.current_thread())
+            if auto_stopped and called_from_record_thread:
+                self._resume_monitoring_after_record_exit = True
 
-        if thread is not None and thread.is_alive():
+        if thread is not None and thread.is_alive() and not called_from_record_thread:
             thread.join(timeout=5.0)
 
         with self._writer_lock:
@@ -2356,16 +2498,76 @@ class AudioEngine:
         with self._record_lock:
             self._is_recording = False
             self._is_record_paused = False
+            self._is_auto_paused = False
+            self._auto_stop_pending = False
             self._record_accumulated_sec = 0.0
             self._current_processor = None
             self._current_recording_path = None
             self._local_talkback_latched = False
             self._remote_talkback_latched = False
+            self._mute_countdown_start_monotonic = None
+            self._auto_paused_since_monotonic = None
+            if auto_stopped and recorded_path is not None:
+                self._last_auto_stopped_path = recorded_path
 
         # Resume live input monitoring so VU meter & Peak Hold remain active
-        self._resume_monitoring_if_configured()
+        if not called_from_record_thread:
+            self._resume_monitoring_if_configured()
 
         return recorded_path
+
+    def check_mute_auto_pause_timeouts(
+        self, now: Optional[float] = None
+    ) -> Optional[str]:
+        """Evaluate mute auto-pause, unmute auto-resume, and extended auto-pause session stop timeouts."""
+        now_mono = time.monotonic() if now is None else float(now)
+        do_auto_stop = False
+
+        with self._timeout_check_lock:
+            if not self.is_recording or self._stop_record_event.is_set() or self._auto_stop_pending:
+                if not self.is_recording:
+                    self._mute_countdown_start_monotonic = None
+                    self._auto_paused_since_monotonic = None
+                return None
+
+            if not self.is_record_paused:
+                if not self.is_raw_mic_muted:
+                    self._mute_countdown_start_monotonic = None
+                    return None
+                if self.talkback_active:
+                    self._mute_countdown_start_monotonic = now_mono
+                    return None
+                if self._mute_countdown_start_monotonic is None:
+                    self._mute_countdown_start_monotonic = now_mono
+                    return None
+                timeout_sec = float(self._mute_auto_pause_timeout_sec)
+                if timeout_sec > 0.0 and (now_mono - self._mute_countdown_start_monotonic) >= timeout_sec:
+                    if self.pause_recording(auto_paused=True):
+                        self._auto_paused_since_monotonic = now_mono
+                        return "auto_paused"
+                return None
+
+            if not self.is_auto_paused:
+                return None
+
+            if not self.is_raw_mic_muted:
+                if self.resume_recording():
+                    return "auto_resumed"
+                return None
+
+            if self._auto_paused_since_monotonic is None:
+                self._auto_paused_since_monotonic = now_mono
+                return None
+
+            session_timeout = float(self._auto_pause_session_timeout_sec)
+            if session_timeout > 0.0 and (now_mono - self._auto_paused_since_monotonic) >= session_timeout:
+                self._auto_stop_pending = True
+                do_auto_stop = True
+
+        if do_auto_stop:
+            self.stop_recording(auto_stopped=True)
+            return "auto_stopped"
+        return None
 
     def _record_worker(
         self,
@@ -2407,6 +2609,11 @@ class AudioEngine:
             with self._record_lock:
                 self._is_recording = False
                 self._is_record_paused = False
+                self._is_auto_paused = False
+                should_resume_mon = self._resume_monitoring_after_record_exit
+                self._resume_monitoring_after_record_exit = False
+            if should_resume_mon:
+                self._resume_monitoring_if_configured()
 
     def _record_simulated_loop(
         self,
@@ -2422,6 +2629,9 @@ class AudioEngine:
 
         while not self._stop_record_event.is_set():
             t0 = time.monotonic()
+            self.check_mute_auto_pause_timeouts()
+            if self._stop_record_event.is_set():
+                break
             in_block = self._generate_simulated_input_block(chunk_frames, sample_rate, phase)
             phase += chunk_frames
             if self.is_mic_muted:
@@ -2524,6 +2734,9 @@ class AudioEngine:
 
         try:
             while not self._stop_record_event.is_set():
+                self.check_mute_auto_pause_timeouts()
+                if self._stop_record_event.is_set():
+                    break
                 frames_read = lib.snd_pcm_readi(pcm, buf, period_frames)
                 if frames_read < 0:
                     recovered = lib.snd_pcm_recover(pcm, int(frames_read), 1)
