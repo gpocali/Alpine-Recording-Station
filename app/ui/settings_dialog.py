@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -47,6 +49,7 @@ from app.prompter_engine import (
     MIN_PROMPTER_FONT_SIZE,
     WHISPER_MODEL_OPTIONS,
     detect_whisper_backend,
+    install_whisper_all,
 )
 from app.samba_manager import SambaManager
 from app.ui.on_screen_keyboard import OnScreenKeyboardController
@@ -59,6 +62,9 @@ from app.ui.styles import (
 
 class SettingsDialog(QDialog):
     """Modal settings pane for Audio Hardware, Recording Mode, and Samba User Administration."""
+
+    _whisper_install_progress = pyqtSignal(int, str)
+    _whisper_install_finished = pyqtSignal(bool, str)
 
     def __init__(
         self,
@@ -91,6 +97,10 @@ class SettingsDialog(QDialog):
         self._device_map: Dict[str, AudioDeviceCapabilities] = {}
         self._initializing = True
         self.exit_to_console_requested = False
+        self._whisper_cancel_event = threading.Event()
+        self._whisper_installing = False
+        self._whisper_install_progress.connect(self._on_whisper_install_progress)
+        self._whisper_install_finished.connect(self._on_whisper_install_finished)
 
         self.osk_controller = OnScreenKeyboardController(
             is_enabled=self._is_osk_enabled,
@@ -428,6 +438,7 @@ class SettingsDialog(QDialog):
         m_idx = self.prompter_model_combo.findData(saved_model)
         if m_idx >= 0:
             self.prompter_model_combo.setCurrentIndex(m_idx)
+        self.prompter_model_combo.currentIndexChanged.connect(self._refresh_whisper_status)
         form.addRow("Whisper AI Model:", self.prompter_model_combo)
 
         self.prompter_font_spin = QSpinBox()
@@ -473,27 +484,125 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(form)
 
+        self.whisper_status_label = QLabel()
+        self.whisper_status_label.setWordWrap(True)
+        layout.addWidget(self.whisper_status_label)
+
+        install_row = QHBoxLayout()
+        install_row.setSpacing(10)
+
+        self.btn_install_whisper = QPushButton("↓ Install / Download Whisper AI && Model")
+        self.btn_install_whisper.setMinimumHeight(36)
+        self.btn_install_whisper.setStyleSheet(
+            "background-color: #238636; color: #FFFFFF; font-weight: bold;"
+        )
+        self.btn_install_whisper.setToolTip(
+            "Download the selected Whisper GGML model and install whisper-cli onto persistent /storage/.alpine-recorder/whisper/"
+        )
+        self.btn_install_whisper.clicked.connect(self._on_install_whisper_clicked)
+        install_row.addWidget(self.btn_install_whisper)
+
+        self.btn_cancel_whisper = QPushButton("Cancel")
+        self.btn_cancel_whisper.setMinimumHeight(36)
+        self.btn_cancel_whisper.setVisible(False)
+        self.btn_cancel_whisper.clicked.connect(self._on_cancel_whisper_install)
+        install_row.addWidget(self.btn_cancel_whisper)
+
+        install_row.addStretch(1)
+        layout.addLayout(install_row)
+
+        self.whisper_progress_bar = QProgressBar()
+        self.whisper_progress_bar.setRange(0, 100)
+        self.whisper_progress_bar.setValue(0)
+        self.whisper_progress_bar.setVisible(False)
+        layout.addWidget(self.whisper_progress_bar)
+
+        self._refresh_whisper_status()
+        layout.addStretch(1)
+
+    def _refresh_whisper_status(self) -> None:
+        if not hasattr(self, "whisper_status_label"):
+            return
+        selected_model = str(self.prompter_model_combo.currentData() or "tiny.en")
         backend_info = detect_whisper_backend(
-            model_name=saved_model,
-            custom_binary=str(getattr(s, "prompter_whisper_binary", "") or ""),
+            model_name=selected_model,
+            custom_binary=str(getattr(self.config_manager.settings, "prompter_whisper_binary", "") or ""),
             storage_dir=self.config_manager.storage_dir,
         )
-        self.whisper_status_label = QLabel(
+        self.whisper_status_label.setText(
             f"Whisper Backend Status: {backend_info.get('detail', 'Unknown')}"
         )
-        self.whisper_status_label.setWordWrap(True)
         if backend_info.get("available"):
             self.whisper_status_label.setStyleSheet(
                 "background-color: #0F2D1E; color: #7EE787; padding: 10px; "
                 "border-radius: 6px; border: 1px solid #2EA043; font-weight: 600;"
             )
+            if not self._whisper_installing:
+                self.btn_install_whisper.setText("✓ Whisper Ready (Re-verify / Download Model)")
         else:
             self.whisper_status_label.setStyleSheet(
                 "background-color: #19150B; color: #F2CC60; padding: 10px; "
                 "border-radius: 6px; border: 1px solid #D29922;"
             )
-        layout.addWidget(self.whisper_status_label)
-        layout.addStretch(1)
+            if not self._whisper_installing:
+                self.btn_install_whisper.setText("↓ Install / Download Whisper AI && Model")
+
+    def _on_install_whisper_clicked(self) -> None:
+        if self._whisper_installing:
+            return
+        selected_model = str(self.prompter_model_combo.currentData() or "tiny.en")
+        custom_bin = str(getattr(self.config_manager.settings, "prompter_whisper_binary", "") or "")
+        storage_dir = self.config_manager.storage_dir
+
+        self._whisper_installing = True
+        self._whisper_cancel_event.clear()
+        self.btn_install_whisper.setEnabled(False)
+        self.btn_install_whisper.setText("Installing Whisper AI...")
+        self.btn_cancel_whisper.setVisible(True)
+        self.whisper_progress_bar.setValue(0)
+        self.whisper_progress_bar.setVisible(True)
+        self.whisper_status_label.setText(f"Starting Whisper AI installation ({selected_model})...")
+        self.whisper_status_label.setStyleSheet(
+            "background-color: #0E1B2B; color: #79C0FF; padding: 10px; "
+            "border-radius: 6px; border: 1px solid #388BFD; font-weight: 600;"
+        )
+
+        def _worker() -> None:
+            ok, msg = install_whisper_all(
+                model_name=selected_model,
+                storage_dir=storage_dir,
+                custom_binary=custom_bin,
+                on_progress=lambda pct, txt: self._whisper_install_progress.emit(int(pct), str(txt)),
+                cancel_event=self._whisper_cancel_event,
+            )
+            self._whisper_install_finished.emit(bool(ok), str(msg))
+
+        threading.Thread(target=_worker, daemon=True, name="WhisperInstallerUI").start()
+
+    def _on_cancel_whisper_install(self) -> None:
+        self._whisper_cancel_event.set()
+        self.whisper_status_label.setText("Cancelling Whisper installation...")
+
+    def _on_whisper_install_progress(self, pct: int, text: str) -> None:
+        self.whisper_progress_bar.setValue(max(0, min(100, int(pct))))
+        self.whisper_status_label.setText(text)
+
+    def _on_whisper_install_finished(self, ok: bool, msg: str) -> None:
+        self._whisper_installing = False
+        self.btn_install_whisper.setEnabled(True)
+        self.btn_cancel_whisper.setVisible(False)
+        self.whisper_progress_bar.setVisible(False)
+        self._refresh_whisper_status()
+        if not ok:
+            self.whisper_status_label.setText(f"Whisper Install Notice: {msg}")
+            self.whisper_status_label.setStyleSheet(
+                "background-color: #240D11; color: #FFA198; padding: 10px; "
+                "border-radius: 6px; border: 1px solid #F85149;"
+            )
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._whisper_cancel_event.set()
+        super().closeEvent(event)
 
     def _build_samba_tab(self, container: QWidget) -> None:
         layout = QVBoxLayout(container)

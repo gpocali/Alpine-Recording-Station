@@ -40,12 +40,22 @@ DEFAULT_AUTOSCROLL_SPEED = 45.0
 WHISPER_SAMPLE_RATE = 16000
 
 WHISPER_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("tiny.en", "tiny.en — Fastest English (Recommended for Low-Latency CPU)"),
-    ("base.en", "base.en — Balanced English Accuracy & Speed"),
-    ("small.en", "small.en — Higher English Accuracy (Heavier CPU)"),
-    ("tiny", "tiny — Fastest Multilingual"),
-    ("base", "base — Balanced Multilingual"),
+    ("tiny.en", "tiny.en — Fastest English (~75 MB, Recommended for Low-Latency CPU)"),
+    ("base.en", "base.en — Balanced English Accuracy & Speed (~142 MB)"),
+    ("small.en", "small.en — Higher English Accuracy (~466 MB, Heavier CPU)"),
+    ("tiny", "tiny — Fastest Multilingual (~75 MB)"),
+    ("base", "base — Balanced Multilingual (~142 MB)"),
 )
+
+WHISPER_MODEL_URLS: Dict[str, str] = {
+    "tiny.en": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+    "base.en": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+    "small.en": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+    "tiny": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+    "base": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+}
+
+WHISPER_CPP_REPO_URL = "https://github.com/ggml-org/whisper.cpp.git"
 
 # Common short function words that should not trigger a distant jump on a lone single-word match
 _COMMON_STOP_WORDS: frozenset[str] = frozenset(
@@ -677,15 +687,26 @@ class PrompterTracker:
 # Pluggable Whisper AI Speech-to-Text Backend & Background Worker
 # ---------------------------------------------------------------------------
 
-def _find_whisper_cli_binary(custom_binary: str = "") -> Optional[str]:
+def get_whisper_dir(storage_dir: Optional[Path] = None) -> Path:
+    """Return the persistent directory on /storage for Whisper models and whisper-cli."""
+    base = Path(storage_dir) if storage_dir is not None else Path("/storage")
+    return base / ".alpine-recorder" / "whisper"
+
+
+def _find_whisper_cli_binary(
+    custom_binary: str = "", storage_dir: Optional[Path] = None
+) -> Optional[str]:
     candidates: List[str] = []
     if custom_binary and str(custom_binary).strip():
         candidates.append(str(custom_binary).strip())
+    if storage_dir is not None:
+        candidates.append(str(get_whisper_dir(storage_dir) / "bin" / "whisper-cli"))
     candidates.extend(
         [
+            "/storage/.alpine-recorder/whisper/bin/whisper-cli",
+            "/opt/alpine-recorder/bin/whisper-cli",
             "whisper-cli",
             "whisper-cpp",
-            "/opt/alpine-recorder/bin/whisper-cli",
             "/usr/local/bin/whisper-cli",
             "/usr/bin/whisper-cli",
         ]
@@ -754,7 +775,7 @@ def detect_whisper_backend(
     except Exception:
         pass
 
-    cli_bin = _find_whisper_cli_binary(custom_binary)
+    cli_bin = _find_whisper_cli_binary(custom_binary, storage_dir=storage_dir)
     if cli_bin:
         ggml = _find_ggml_model_file(model_name, storage_dir=storage_dir)
         if ggml is not None:
@@ -1077,3 +1098,355 @@ class WhisperSpeechWorker:
                     self.on_advance(new_idx, transcript)
                 except Exception:
                     pass
+
+
+# ---------------------------------------------------------------------------
+# Whisper AI Model & Engine Installer (For Settings UI, install.sh & CLI)
+# ---------------------------------------------------------------------------
+
+def download_whisper_model(
+    model_name: str = "tiny.en",
+    storage_dir: Optional[Path] = None,
+    on_progress: Optional[Callable[[int, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    url_override: Optional[str] = None,
+) -> Tuple[bool, str, Optional[Path]]:
+    """Download a GGML Whisper model into persistent /storage/.alpine-recorder/whisper/."""
+    import urllib.request
+
+    clean_model = (model_name or "tiny.en").strip() or "tiny.en"
+    url = url_override or WHISPER_MODEL_URLS.get(clean_model)
+    if not url:
+        return (False, f"Unknown Whisper model '{clean_model}'.", None)
+
+    whisper_dir = get_whisper_dir(storage_dir)
+    try:
+        whisper_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return (False, f"Could not create whisper directory {whisper_dir}: {exc}", None)
+
+    fname = clean_model if clean_model.endswith(".bin") else f"ggml-{clean_model}.bin"
+    dest_path = whisper_dir / fname
+    if dest_path.is_file() and dest_path.stat().st_size > 1024 * 1024:
+        if on_progress:
+            on_progress(100, f"Model '{fname}' is already installed.")
+        return (True, f"Model '{fname}' already installed at {dest_path}.", dest_path)
+
+    tmp_path = whisper_dir / f".{fname}.part"
+    if on_progress:
+        on_progress(5, f"Downloading {fname}...")
+
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Alpine-Recording-Station/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total_hdr = resp.headers.get("Content-Length")
+            total_bytes = int(total_hdr) if total_hdr and total_hdr.isdigit() else 0
+            downloaded = 0
+            with tmp_path.open("wb") as out_f:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        tmp_path.unlink(missing_ok=True)
+                        return (False, "Download cancelled.", None)
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+                    downloaded += len(chunk)
+                    if on_progress:
+                        if total_bytes > 0:
+                            pct = min(99, max(5, int(round((downloaded / total_bytes) * 100))))
+                            dl_mb = downloaded / (1024.0 * 1024.0)
+                            tot_mb = total_bytes / (1024.0 * 1024.0)
+                            on_progress(pct, f"Downloading {fname}: {dl_mb:.1f} / {tot_mb:.1f} MB ({pct}%)")
+                        else:
+                            dl_mb = downloaded / (1024.0 * 1024.0)
+                            on_progress(50, f"Downloading {fname}: {dl_mb:.1f} MB...")
+                out_f.flush()
+                if hasattr(os, "fsync"):
+                    try:
+                        os.fsync(out_f.fileno())
+                    except OSError:
+                        pass
+        tmp_path.replace(dest_path)
+        if on_progress:
+            on_progress(100, f"Downloaded {fname} successfully.")
+        return (True, f"Downloaded {fname} to {dest_path}.", dest_path)
+    except Exception as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return (False, f"Failed to download {fname}: {exc}", None)
+
+
+def install_whisper_cli_binary(
+    storage_dir: Optional[Path] = None,
+    custom_binary: str = "",
+    on_progress: Optional[Callable[[int, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> Tuple[bool, str, Optional[Path]]:
+    """Ensure a standalone whisper-cli binary is installed (persisted on /storage)."""
+    existing = _find_whisper_cli_binary(custom_binary, storage_dir=storage_dir)
+    if existing:
+        if on_progress:
+            on_progress(100, f"Found existing whisper-cli at {existing}.")
+        return (True, f"Found whisper-cli at {existing}.", Path(existing))
+
+    if os.name != "posix":
+        return (
+            False,
+            "Automatic whisper-cli compilation is supported on Alpine Linux. "
+            "On Windows/macOS, install 'faster-whisper' via pip or place whisper-cli on PATH.",
+            None,
+        )
+
+    whisper_bin_dir = get_whisper_dir(storage_dir) / "bin"
+    whisper_bin_dir.mkdir(parents=True, exist_ok=True)
+    dest_bin = whisper_bin_dir / "whisper-cli"
+
+    apk_bin = shutil.which("apk")
+    if apk_bin:
+        if on_progress:
+            on_progress(10, "Checking Alpine package repository for whisper.cpp...")
+        for pkg in ("whisper.cpp", "whisper-cpp"):
+            proc = subprocess.run(
+                [apk_bin, "add", pkg],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if proc.returncode == 0:
+                found = _find_whisper_cli_binary(custom_binary, storage_dir=storage_dir)
+                if found:
+                    if on_progress:
+                        on_progress(100, f"Installed {pkg} via apk ({found}).")
+                    return (True, f"Installed {pkg} via apk.", Path(found))
+
+        if on_progress:
+            on_progress(18, "Installing Alpine C++ build tools (git, cmake, make, g++)...")
+        subprocess.run(
+            [apk_bin, "add", "git", "cmake", "make", "g++", "linux-headers"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    git_bin = shutil.which("git")
+    cmake_bin = shutil.which("cmake")
+    if not git_bin or not cmake_bin:
+        return (
+            False,
+            "Missing git or cmake to build whisper.cpp. Run 'apk add git cmake make g++' and retry.",
+            None,
+        )
+
+    tmp_build = Path(tempfile.mkdtemp(prefix="whisper_build_"))
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            return (False, "Installation cancelled.", None)
+        if on_progress:
+            on_progress(30, "Cloning whisper.cpp source...")
+        src_dir = tmp_build / "whisper.cpp"
+        clone_proc = subprocess.run(
+            [git_bin, "clone", "--depth", "1", WHISPER_CPP_REPO_URL, str(src_dir)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if clone_proc.returncode != 0:
+            return (
+                False,
+                f"git clone whisper.cpp failed: {(clone_proc.stderr or '').strip()[:200]}",
+                None,
+            )
+
+        if cancel_event is not None and cancel_event.is_set():
+            return (False, "Installation cancelled.", None)
+
+        if on_progress:
+            on_progress(50, "Configuring static whisper-cli build (CMake)...")
+        build_dir = src_dir / "build"
+        cfg_proc = subprocess.run(
+            [
+                cmake_bin,
+                "-B",
+                str(build_dir),
+                "-S",
+                str(src_dir),
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DBUILD_SHARED_LIBS=OFF",
+                "-DWHISPER_BUILD_TESTS=OFF",
+                "-DWHISPER_BUILD_EXAMPLES=ON",
+                "-DGGML_NATIVE=OFF",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if cfg_proc.returncode != 0:
+            return (
+                False,
+                f"CMake configure failed: {(cfg_proc.stderr or '').strip()[:200]}",
+                None,
+            )
+
+        if cancel_event is not None and cancel_event.is_set():
+            return (False, "Installation cancelled.", None)
+
+        if on_progress:
+            on_progress(70, "Compiling whisper-cli (this may take 1–2 minutes)...")
+        jobs = str(max(1, min(4, os.cpu_count() or 2)))
+        bld_proc = subprocess.run(
+            [cmake_bin, "--build", str(build_dir), "--target", "whisper-cli", "-j", jobs],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        if bld_proc.returncode != 0:
+            return (
+                False,
+                f"whisper-cli build failed: {(bld_proc.stderr or '').strip()[:200]}",
+                None,
+            )
+
+        built_candidates = [
+            build_dir / "bin" / "whisper-cli",
+            build_dir / "whisper-cli",
+        ]
+        built_bin = next((p for p in built_candidates if p.is_file()), None)
+        if built_bin is None:
+            return (False, "Build succeeded but whisper-cli binary was not found.", None)
+
+        shutil.copy2(str(built_bin), str(dest_bin))
+        os.chmod(dest_bin, 0o755)
+        if on_progress:
+            on_progress(100, f"Installed whisper-cli to {dest_bin}.")
+        return (True, f"Installed whisper-cli to {dest_bin}.", dest_bin)
+    except Exception as exc:
+        return (False, f"whisper-cli installation error: {exc}", None)
+    finally:
+        shutil.rmtree(tmp_build, ignore_errors=True)
+
+
+def install_whisper_all(
+    model_name: str = "tiny.en",
+    storage_dir: Optional[Path] = None,
+    custom_binary: str = "",
+    on_progress: Optional[Callable[[int, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> Tuple[bool, str]:
+    """Install/verify both the Whisper engine (if needed) and the selected GGML model."""
+    info = detect_whisper_backend(
+        model_name=model_name,
+        custom_binary=custom_binary,
+        storage_dir=storage_dir,
+    )
+    if info.get("available"):
+        if on_progress:
+            on_progress(100, f"Whisper AI already ready: {info.get('detail')}")
+        return (True, f"Whisper AI ready: {info.get('detail')}")
+
+    # Step 1: Download the GGML model first (works cross-platform and fast to verify network)
+    def _dl_prog(pct: int, text: str) -> None:
+        if on_progress:
+            on_progress(int(pct * 0.5), text)
+
+    ok_model, msg_model, _model_path = download_whisper_model(
+        model_name=model_name,
+        storage_dir=storage_dir,
+        on_progress=_dl_prog,
+        cancel_event=cancel_event,
+    )
+    if not ok_model:
+        return (False, msg_model)
+
+    # Step 2: Ensure whisper-cli binary is installed (unless a Python backend exists)
+    info_after_dl = detect_whisper_backend(
+        model_name=model_name,
+        custom_binary=custom_binary,
+        storage_dir=storage_dir,
+    )
+    if info_after_dl.get("available"):
+        if on_progress:
+            on_progress(100, f"Whisper AI ready: {info_after_dl.get('detail')}")
+        return (True, f"Whisper AI ready: {info_after_dl.get('detail')}")
+
+    def _bin_prog(pct: int, text: str) -> None:
+        if on_progress:
+            on_progress(50 + int(pct * 0.5), text)
+
+    ok_bin, msg_bin, _bin_path = install_whisper_cli_binary(
+        storage_dir=storage_dir,
+        custom_binary=custom_binary,
+        on_progress=_bin_prog,
+        cancel_event=cancel_event,
+    )
+    if not ok_bin:
+        return (False, f"Model downloaded, but engine setup incomplete: {msg_bin}")
+
+    if on_progress:
+        on_progress(100, f"Whisper AI ({model_name}) installed and ready.")
+    return (True, f"Installed Whisper AI ({model_name}) to {get_whisper_dir(storage_dir)}.")
+
+
+def run_whisper_installer_cli(argv: Optional[List[str]] = None) -> int:
+    """CLI entrypoint: python3 -m app.prompter_engine install-whisper [--model tiny.en]."""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="alpine-recorder install-whisper",
+        description="Install whisper.cpp engine and GGML model onto persistent /storage.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="install-whisper",
+        choices=["install-whisper", "status"],
+    )
+    parser.add_argument(
+        "--model",
+        default="tiny.en",
+        help="Whisper model to download (tiny.en, base.en, small.en, tiny, base).",
+    )
+    parser.add_argument(
+        "--storage-dir",
+        default=os.environ.get("ALPINE_RECORDER_STORAGE", "/storage"),
+        help="Persistent storage directory (default: /storage).",
+    )
+    args = parser.parse_args(argv)
+    storage_p = Path(args.storage_dir)
+
+    if args.command == "status":
+        info = detect_whisper_backend(model_name=args.model, storage_dir=storage_p)
+        print(f"Available: {info.get('available')}")
+        print(f"Backend:   {info.get('backend')}")
+        print(f"Detail:    {info.get('detail')}")
+        return 0 if info.get("available") else 1
+
+    last_msg = [""]
+
+    def _cb(pct: int, msg: str) -> None:
+        if msg != last_msg[0]:
+            print(f"[{pct:3d}%] {msg}", flush=True)
+            last_msg[0] = msg
+
+    ok, detail = install_whisper_all(
+        model_name=args.model,
+        storage_dir=storage_p,
+        on_progress=_cb,
+    )
+    if ok:
+        print(f"[OK] {detail}")
+        return 0
+    print(f"[FAIL] {detail}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_whisper_installer_cli())

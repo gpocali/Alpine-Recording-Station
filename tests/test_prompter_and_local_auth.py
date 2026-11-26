@@ -166,6 +166,28 @@ class TestPrompterEngine(unittest.TestCase):
         finally:
             worker.stop()
 
+    def test_download_whisper_model_and_storage_bin_detection(self) -> None:
+        from app.prompter_engine import download_whisper_model, get_whisper_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            storage_dir = base / "storage"
+            src_model = base / "fake-ggml-tiny.en.bin"
+            src_model.write_bytes(b"GGML" + (b"\x00" * 4096))
+
+            progress_events = []
+            ok, msg, saved_path = download_whisper_model(
+                model_name="tiny.en",
+                storage_dir=storage_dir,
+                on_progress=lambda pct, txt: progress_events.append((pct, txt)),
+                url_override=src_model.as_uri(),
+            )
+            self.assertTrue(ok, msg)
+            self.assertIsNotNone(saved_path)
+            self.assertTrue(saved_path.is_file())  # type: ignore[union-attr]
+            self.assertEqual(saved_path, get_whisper_dir(storage_dir) / "ggml-tiny.en.bin")
+            self.assertTrue(any(p == 100 for p, _ in progress_events))
+
 
 class TestLocalWebAuthAndHttpsEndpoints(unittest.TestCase):
     def setUp(self) -> None:

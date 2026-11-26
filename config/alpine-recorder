@@ -495,6 +495,10 @@ case "$cmd" in
         PYTHON_BIN="$(command -v python3 2>/dev/null || echo /usr/bin/python3)"
         PYTHONPATH="${APP_DIR}" "${PYTHON_BIN}" -m app.web_auth "$@"
         ;;
+    install-whisper|whisper-install)
+        PYTHON_BIN="$(command -v python3 2>/dev/null || echo /usr/bin/python3)"
+        PYTHONPATH="${APP_DIR}" "${PYTHON_BIN}" -m app.prompter_engine install-whisper "$@"
+        ;;
     enable)
         if command -v rc-update >/dev/null 2>&1; then
             rc-update add alpine-recorder default
@@ -541,6 +545,8 @@ case "$cmd" in
         echo "                   (e.g. 'session [status|enable|disable|rotate|url|pin|key|qr] [--json]')"
         echo "  user             Manage local Web UI logins (add, passwd, remove, list)"
         echo "                   (e.g. 'user add <name>', 'user passwd <name>', 'user remove <name>', 'user list')"
+        echo "  install-whisper  Build whisper-cli and download a Whisper GGML model onto /storage"
+        echo "                   (e.g. 'install-whisper --model tiny.en')"
         echo "  enable           Enable automatic post-boot startup via OpenRC"
         echo "  disable          Disable automatic post-boot startup (manual mode for troubleshooting)"
         echo "  logs             Show recent application and Xorg log output"

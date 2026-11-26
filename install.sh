@@ -18,6 +18,8 @@ FORCE_CONFIG=0
 OSK_MODE=""
 REMOTE_PRODUCER_MODE=""
 ENABLE_SERVICE=1
+INSTALL_WHISPER=0
+WHISPER_MODEL="tiny.en"
 
 for arg in "$@"; do
     case "$arg" in
@@ -42,8 +44,15 @@ for arg in "$@"; do
         --disable-service|--no-autostart)
             ENABLE_SERVICE=0
             ;;
+        --install-whisper)
+            INSTALL_WHISPER=1
+            ;;
+        --whisper-model=*)
+            INSTALL_WHISPER=1
+            WHISPER_MODEL="${arg#--whisper-model=}"
+            ;;
         --help|-h)
-            echo "Usage: $0 [--force-config] [--enable-osk | --disable-osk] [--enable-remote-producer | --disable-remote-producer] [--enable-service | --disable-service]"
+            echo "Usage: $0 [--force-config] [--enable-osk | --disable-osk] [--enable-remote-producer | --disable-remote-producer] [--enable-service | --disable-service] [--install-whisper] [--whisper-model=tiny.en]"
             echo "  --force-config              Overwrite existing smb.conf, xinitrc, and openbox configs."
             echo "  --enable-osk                Enable the touch On-Screen Keyboard in saved settings."
             echo "  --disable-osk               Disable the touch On-Screen Keyboard in saved settings."
@@ -51,6 +60,8 @@ for arg in "$@"; do
             echo "  --disable-remote-producer   Disable the Remote Producer (Guided VO) HTTPS server by default."
             echo "  --enable-service            Enable post-boot OpenRC kiosk service on VT7 (default)."
             echo "  --disable-service           Do not auto-start kiosk at boot; start manually via 'alpine-recorder'."
+            echo "  --install-whisper           Build whisper-cli and download the Whisper GGML model onto /storage."
+            echo "  --whisper-model=<name>      Select Whisper model to install (tiny.en, base.en, small.en, tiny, base)."
             exit 0
             ;;
     esac
@@ -327,6 +338,14 @@ cm.settings.remote_producer_enabled = ('${REMOTE_PRODUCER_MODE}' == 'true')
 cm.save()
 " 2>/dev/null || true
         log_ok "Remote Producer HTTPS server default updated to: ${REMOTE_PRODUCER_MODE}"
+    fi
+    if [ "${INSTALL_WHISPER}" -eq 1 ]; then
+        log_info "Installing Whisper AI (whisper-cli + ${WHISPER_MODEL} GGML model) into ${STORAGE_DIR}/.alpine-recorder/whisper/..."
+        if PYTHONPATH="${APP_DEST}" python3 -m app.prompter_engine install-whisper --model "${WHISPER_MODEL}" --storage-dir "${STORAGE_DIR}"; then
+            log_ok "Whisper AI (${WHISPER_MODEL}) installed on persistent /storage."
+        else
+            log_warn "Whisper AI installation did not complete cleanly; you can retry anytime via 'alpine-recorder install-whisper' or Settings [F2] -> Prompter & Whisper AI."
+        fi
     fi
 fi
 
