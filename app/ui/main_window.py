@@ -60,6 +60,7 @@ from app.ui.file_manager_dialog import (
     StorageFileManagerDialog,
 )
 from app.ui.on_screen_keyboard import OnScreenKeyboardController
+from app.ui.prompter_dialog import PrompterDialog
 from app.ui.remote_producer_dialog import RemoteProducerDialog
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.styles import (
@@ -946,6 +947,7 @@ class MainWindow(QMainWindow):
             self.remote_producer_server = remote_producer_server
             self.remote_producer_server.status_provider = self._build_remote_producer_extra_status
             self.remote_producer_server.on_project_name_changed = self._on_remote_project_name_changed_threadsafe
+            self.remote_producer_server.on_script_updated = self._on_remote_script_updated_threadsafe
         else:
             self.remote_producer_server = RemoteProducerServer(
                 audio_engine=self.audio_engine,
@@ -953,6 +955,7 @@ class MainWindow(QMainWindow):
                 ssl_manager=ssl_manager,  # type: ignore[arg-type]
                 status_provider=self._build_remote_producer_extra_status,
                 on_project_name_changed=self._on_remote_project_name_changed_threadsafe,
+                on_script_updated=self._on_remote_script_updated_threadsafe,
             )
             if getattr(self.config_manager.settings, "remote_producer_enabled", False):
                 self.remote_producer_server.start(
@@ -987,6 +990,7 @@ class MainWindow(QMainWindow):
         self._last_storage_refresh_monotonic: float = 0.0
         self._last_resource_refresh_monotonic: float = 0.0
         self._last_clock_text: str = ""
+        self._prompter_dialog: Optional[PrompterDialog] = None
         self.resource_monitor = SystemResourceMonitor()
         self._last_resource_status = SystemResourceStatus()
 
@@ -1042,6 +1046,13 @@ class MainWindow(QMainWindow):
             "border: none; color: #8B949E; font-family: monospace;"
         )
         top_layout.addWidget(self.filename_preview_label, stretch=1)
+
+        self.prompter_btn = QPushButton("¶ Prompter")
+        self.prompter_btn.setToolTip(
+            "Open Talent Script Prompter popup window with live rich text, compact controls, and Whisper AI tracking [Hotkey: F7]"
+        )
+        self.prompter_btn.clicked.connect(self._open_prompter_dialog)
+        top_layout.addWidget(self.prompter_btn)
 
         self.remote_producer_btn = QPushButton("◎ Remote Producer")
         self.remote_producer_btn.setToolTip(
@@ -2470,8 +2481,42 @@ class MainWindow(QMainWindow):
             self._sync_hardware_state()
             self._refresh_recordings_list()
             self._refresh_clock_display(force=True)
+            if self._prompter_dialog is not None and self._prompter_dialog.isVisible():
+                self._prompter_dialog.reload_prompter_settings()
         elif getattr(dlg, "exit_to_console_requested", False):
             self.close()
+
+    def _open_prompter_dialog(self) -> None:
+        if self._prompter_dialog is not None and self._prompter_dialog.isVisible():
+            self._prompter_dialog.raise_()
+            self._prompter_dialog.activateWindow()
+            return
+        self._prompter_dialog = PrompterDialog(
+            config_manager=self.config_manager,
+            audio_engine=self.audio_engine,
+            on_record_clicked=self._on_record_button_clicked,
+            on_pause_clicked=self._on_pause_record_button_clicked,
+            on_talkback_pressed=self._on_talkback_pressed,
+            on_talkback_released=self._on_talkback_released,
+            on_cough_pressed=self._on_cough_privacy_pressed,
+            on_cough_released=self._on_cough_privacy_released,
+            on_script_saved_locally=self._on_local_prompter_script_saved,
+            parent=self,
+        )
+        self._prompter_dialog.show()
+        self._prompter_dialog.raise_()
+        self._prompter_dialog.activateWindow()
+
+    def _on_remote_script_updated_threadsafe(self, project_name: str, html_content: str) -> None:
+        dlg = self._prompter_dialog
+        if dlg is not None:
+            try:
+                dlg.notify_external_script_update_threadsafe(project_name, html_content)
+            except Exception:
+                pass
+
+    def _on_local_prompter_script_saved(self, project_name: str, html_content: str) -> None:
+        self.remote_producer_server.broadcast_script_update(project_name, html_content)
 
     # -------------------------------------------------------------------------
     # Periodic Timers & Keyboard Hotkeys
@@ -2671,6 +2716,9 @@ class MainWindow(QMainWindow):
             if not self.audio_engine.is_recording:
                 self._open_file_manager_dialog()
             return
+        if key == Qt.Key.Key_F7:
+            self._open_prompter_dialog()
+            return
         if key == Qt.Key.Key_F11:
             if self.isFullScreen():
                 self.showNormal()
@@ -2700,6 +2748,12 @@ class MainWindow(QMainWindow):
         super().keyReleaseEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._prompter_dialog is not None:
+            try:
+                self._prompter_dialog.close()
+            except Exception:
+                pass
+            self._prompter_dialog = None
         self.sayo_led_controller.close()
         self.remote_producer_server.shutdown()
         self.audio_engine.stop_monitoring()

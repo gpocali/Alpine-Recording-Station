@@ -6,8 +6,10 @@ from typing import Dict, List, Optional
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -16,6 +18,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -32,6 +35,19 @@ from app.config_manager import (
     ConfigManager,
 )
 from app.network_info import get_primary_ip_display
+from app.prompter_engine import (
+    DEFAULT_AUTOSCROLL_SPEED,
+    DEFAULT_LOOKAHEAD_WORDS,
+    DEFAULT_PROMPTER_FONT_SIZE,
+    MAX_AUTOSCROLL_SPEED,
+    MAX_LOOKAHEAD_WORDS,
+    MAX_PROMPTER_FONT_SIZE,
+    MIN_AUTOSCROLL_SPEED,
+    MIN_LOOKAHEAD_WORDS,
+    MIN_PROMPTER_FONT_SIZE,
+    WHISPER_MODEL_OPTIONS,
+    detect_whisper_backend,
+)
 from app.samba_manager import SambaManager
 from app.ui.on_screen_keyboard import OnScreenKeyboardController
 from app.ui.styles import (
@@ -106,7 +122,12 @@ class SettingsDialog(QDialog):
         self._build_audio_tab(self.audio_tab)
         self.tabs.addTab(self.audio_tab, "Audio && Recording Settings")
 
-        # Tab 2: Samba Share Access
+        # Tab 2: Prompter & Whisper AI Settings
+        self.prompter_tab = QWidget()
+        self._build_prompter_tab(self.prompter_tab)
+        self.tabs.addTab(self.prompter_tab, "Prompter && Whisper AI")
+
+        # Tab 3: Samba Share Access
         self.samba_tab = QWidget()
         self._build_samba_tab(self.samba_tab)
         self.tabs.addTab(self.samba_tab, "Samba Share Administration")
@@ -351,6 +372,127 @@ class SettingsDialog(QDialog):
         self.storage_info_label = QLabel()
         self.storage_info_label.setWordWrap(True)
         layout.addWidget(self.storage_info_label)
+        layout.addStretch(1)
+
+    def _build_prompter_tab(self, container: QWidget) -> None:
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
+
+        intro = QLabel(
+            "Configure the Talent Teleprompter display, manual/autoscroll behavior, and optional "
+            "Whisper AI speech-to-text voice tracking. Non-spoken script directions enclosed in "
+            "(parentheses), [brackets], or {curly brackets} are automatically excluded from AI lookahead."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #8B949E;")
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        s = self.config_manager.settings
+
+        self.prompter_ai_combo = QComboBox()
+        self.prompter_ai_combo.addItem("Disabled (Manual / Autoscroll Only)", False)
+        self.prompter_ai_combo.addItem("Enabled (Whisper AI Voice-Tracking Auto-Scroll)", True)
+        self.prompter_ai_combo.setCurrentIndex(1 if bool(getattr(s, "prompter_ai_enabled", False)) else 0)
+        self.prompter_ai_combo.setToolTip(
+            "Enable or disable local Whisper AI speech-to-text tracking in the Prompter window"
+        )
+        form.addRow("Whisper AI Voice Tracking:", self.prompter_ai_combo)
+
+        self.prompter_lookahead_spin = QSpinBox()
+        self.prompter_lookahead_spin.setRange(MIN_LOOKAHEAD_WORDS, MAX_LOOKAHEAD_WORDS)
+        self.prompter_lookahead_spin.setValue(
+            max(
+                MIN_LOOKAHEAD_WORDS,
+                min(
+                    MAX_LOOKAHEAD_WORDS,
+                    int(getattr(s, "prompter_lookahead_words", DEFAULT_LOOKAHEAD_WORDS) or DEFAULT_LOOKAHEAD_WORDS),
+                ),
+            )
+        )
+        self.prompter_lookahead_spin.setSuffix(" spoken words")
+        self.prompter_lookahead_spin.setToolTip(
+            "Number of upcoming spoken words sent to Whisper AI lookahead "
+            "(text inside (...), [...], and {...} is automatically excluded)."
+        )
+        form.addRow("AI Lookahead Window:", self.prompter_lookahead_spin)
+
+        self.prompter_model_combo = QComboBox()
+        for model_key, model_label in WHISPER_MODEL_OPTIONS:
+            self.prompter_model_combo.addItem(model_label, model_key)
+        saved_model = str(getattr(s, "prompter_whisper_model", "tiny.en") or "tiny.en")
+        m_idx = self.prompter_model_combo.findData(saved_model)
+        if m_idx >= 0:
+            self.prompter_model_combo.setCurrentIndex(m_idx)
+        form.addRow("Whisper AI Model:", self.prompter_model_combo)
+
+        self.prompter_font_spin = QSpinBox()
+        self.prompter_font_spin.setRange(MIN_PROMPTER_FONT_SIZE, MAX_PROMPTER_FONT_SIZE)
+        self.prompter_font_spin.setValue(
+            max(
+                MIN_PROMPTER_FONT_SIZE,
+                min(
+                    MAX_PROMPTER_FONT_SIZE,
+                    int(getattr(s, "prompter_font_size", DEFAULT_PROMPTER_FONT_SIZE) or DEFAULT_PROMPTER_FONT_SIZE),
+                ),
+            )
+        )
+        self.prompter_font_spin.setSuffix(" pt")
+        form.addRow("Default Prompter Text Size:", self.prompter_font_spin)
+
+        self.prompter_scroll_mode_combo = QComboBox()
+        self.prompter_scroll_mode_combo.addItem(
+            "Direct Navigation (Up/Down & Mouse Wheel scroll directly)", "direct"
+        )
+        self.prompter_scroll_mode_combo.addItem(
+            "Autoscroll Cruise (Up/Down & Mouse Wheel adjust scroll speed)", "autoscroll"
+        )
+        saved_mode = str(getattr(s, "prompter_scroll_mode", "direct") or "direct").lower()
+        self.prompter_scroll_mode_combo.setCurrentIndex(1 if saved_mode == "autoscroll" else 0)
+        form.addRow("Default Manual Scroll Mode:", self.prompter_scroll_mode_combo)
+
+        self.prompter_speed_spin = QDoubleSpinBox()
+        self.prompter_speed_spin.setRange(MIN_AUTOSCROLL_SPEED, MAX_AUTOSCROLL_SPEED)
+        self.prompter_speed_spin.setSingleStep(5.0)
+        self.prompter_speed_spin.setDecimals(0)
+        self.prompter_speed_spin.setValue(
+            max(
+                MIN_AUTOSCROLL_SPEED,
+                min(
+                    MAX_AUTOSCROLL_SPEED,
+                    float(getattr(s, "prompter_autoscroll_speed", DEFAULT_AUTOSCROLL_SPEED) or DEFAULT_AUTOSCROLL_SPEED),
+                ),
+            )
+        )
+        self.prompter_speed_spin.setSuffix(" px/sec")
+        form.addRow("Default Autoscroll Speed:", self.prompter_speed_spin)
+
+        layout.addLayout(form)
+
+        backend_info = detect_whisper_backend(
+            model_name=saved_model,
+            custom_binary=str(getattr(s, "prompter_whisper_binary", "") or ""),
+            storage_dir=self.config_manager.storage_dir,
+        )
+        self.whisper_status_label = QLabel(
+            f"Whisper Backend Status: {backend_info.get('detail', 'Unknown')}"
+        )
+        self.whisper_status_label.setWordWrap(True)
+        if backend_info.get("available"):
+            self.whisper_status_label.setStyleSheet(
+                "background-color: #0F2D1E; color: #7EE787; padding: 10px; "
+                "border-radius: 6px; border: 1px solid #2EA043; font-weight: 600;"
+            )
+        else:
+            self.whisper_status_label.setStyleSheet(
+                "background-color: #19150B; color: #F2CC60; padding: 10px; "
+                "border-radius: 6px; border: 1px solid #D29922;"
+            )
+        layout.addWidget(self.whisper_status_label)
         layout.addStretch(1)
 
     def _build_samba_tab(self, container: QWidget) -> None:
@@ -835,6 +977,12 @@ class SettingsDialog(QDialog):
         s.clock_date_format = str(
             self.clock_date_format_combo.currentData() or "YYYY-MM-DD"
         )
+        s.prompter_ai_enabled = bool(self.prompter_ai_combo.currentData())
+        s.prompter_lookahead_words = int(self.prompter_lookahead_spin.value())
+        s.prompter_whisper_model = str(self.prompter_model_combo.currentData() or "tiny.en")
+        s.prompter_font_size = int(self.prompter_font_spin.value())
+        s.prompter_scroll_mode = str(self.prompter_scroll_mode_combo.currentData() or "direct")
+        s.prompter_autoscroll_speed = float(self.prompter_speed_spin.value())
 
         if dev_id:
             s.known_device_defaults[dev_id] = {

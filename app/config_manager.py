@@ -261,6 +261,13 @@ class RecorderSettings:
     remote_producer_lockout_window_sec: int = 300
     remote_producer_ban_duration_sec: int = 900
     remote_producer_trusted_proxies: str = "127.0.0.1,::1"
+    prompter_font_size: int = 36
+    prompter_ai_enabled: bool = False
+    prompter_lookahead_words: int = 12
+    prompter_autoscroll_speed: float = 45.0
+    prompter_scroll_mode: str = "direct"  # 'direct' or 'autoscroll'
+    prompter_whisper_model: str = "tiny.en"
+    prompter_whisper_binary: str = ""
     ssl_cert_path: str = ""
     ssl_key_path: str = ""
     storage_dir: str = DEFAULT_STORAGE_DIR
@@ -1661,3 +1668,140 @@ class ConfigManager:
                 return (duration, sample_rate, channels, bits_per_sample)
         except Exception:
             return (0.0, 0, 0, 0)
+
+    # -------------------------------------------------------------------------
+    # Project Creation, Renaming & Rich-Text Prompter Script Persistence
+    # -------------------------------------------------------------------------
+    def validate_new_project_name(self, raw_name: str) -> Tuple[bool, str]:
+        """Validate and sanitize a user-supplied project name for creation or rename."""
+        raw = (raw_name or "").strip()
+        if not raw:
+            return (False, "Please enter a valid project name.")
+        if (
+            "/" in raw
+            or "\\" in raw
+            or "\x00" in raw
+            or any(ord(ch) < 32 for ch in raw)
+            or raw.startswith(".")
+        ):
+            return (
+                False,
+                "Project name cannot contain path separators, control characters, or start with a dot.",
+            )
+        if len(raw) > MAX_PROJECT_NAME_LENGTH:
+            return (
+                False,
+                f"Project name must be {MAX_PROJECT_NAME_LENGTH} characters or fewer.",
+            )
+        if self.is_protected_storage_name(raw):
+            return (False, "That project name is reserved by the studio system.")
+        cleaned = sanitize_project_name(raw)
+        if (
+            self.is_protected_storage_name(cleaned)
+            or not self._is_valid_user_path_in_storage(self.get_project_dir(cleaned))
+        ):
+            return (False, "Please enter a valid non-reserved project name.")
+        return (True, cleaned)
+
+    def create_project_folder(self, project_name: str) -> Tuple[bool, str]:
+        """Create a new project directory inside /storage and return (ok, cleaned_name_or_error)."""
+        ok, cleaned_or_err = self.validate_new_project_name(project_name)
+        if not ok:
+            return (False, cleaned_or_err)
+        proj_dir = self.get_project_dir(cleaned_or_err)
+        if proj_dir.exists():
+            return (False, f"Project '{cleaned_or_err}' already exists.")
+        self.ensure_project_dir(cleaned_or_err)
+        return (True, cleaned_or_err)
+
+    def rename_project_folder(
+        self, old_name: str, new_name: str
+    ) -> Tuple[bool, str]:
+        """Rename an existing project folder inside /storage and update active project if needed."""
+        src_dir, err = self._resolve_user_project_dir(old_name)
+        if src_dir is None:
+            return (False, err)
+        ok, cleaned_or_err = self.validate_new_project_name(new_name)
+        if not ok:
+            return (False, cleaned_or_err)
+        dst_dir = self.get_project_dir(cleaned_or_err)
+        if dst_dir == src_dir:
+            return (True, cleaned_or_err)
+        if dst_dir.exists():
+            return (False, f"Project '{cleaned_or_err}' already exists.")
+        try:
+            src_dir.rename(dst_dir)
+            self.enforce_storage_permissions()
+            self._fsync_directory(self.storage_dir)
+            if sanitize_project_name(self.settings.project_name) == src_dir.name:
+                self.settings.project_name = cleaned_or_err
+                self.save(commit_lbu=True)
+            return (True, cleaned_or_err)
+        except OSError as exc:
+            logger.warning("Failed to rename project %s -> %s: %s", src_dir, dst_dir, exc)
+            return (False, f"Could not rename project folder: {exc}")
+
+    def get_project_script_path(self, project_name: Optional[str] = None) -> Path:
+        """Return the rich-text script file path (/storage/<ProjectName>/script.html)."""
+        return self.get_project_dir(project_name) / "script.html"
+
+    def has_project_script(self, project_name: Optional[str] = None) -> bool:
+        """Return True if a non-empty script.html exists in the project directory."""
+        script_path = self.get_project_script_path(project_name)
+        try:
+            return script_path.is_file() and script_path.stat().st_size > 0
+        except OSError:
+            return False
+
+    def load_project_script(
+        self, project_name: Optional[str] = None
+    ) -> Tuple[str, float]:
+        """Load rich-text HTML script from /storage/<ProjectName>/script.html."""
+        script_path = self.get_project_script_path(project_name)
+        if not script_path.is_file():
+            return ("", 0.0)
+        try:
+            content = script_path.read_text(encoding="utf-8", errors="replace")
+            mtime = float(script_path.stat().st_mtime)
+            return (content, mtime)
+        except OSError as exc:
+            logger.warning("Could not read script %s: %s", script_path, exc)
+            return ("", 0.0)
+
+    def save_project_script(
+        self,
+        html_content: str,
+        project_name: Optional[str] = None,
+    ) -> Tuple[bool, str, Optional[Path], float]:
+        """Atomically save sanitized rich-text HTML script into /storage/<ProjectName>/script.html."""
+        proj_dir = self.ensure_project_dir(project_name)
+        if not self._is_valid_user_path_in_storage(proj_dir):
+            return (False, "Invalid project directory.", None, 0.0)
+        script_path = proj_dir / "script.html"
+        tmp_path = proj_dir / ".script.html.tmp"
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                f.write(str(html_content or ""))
+                f.flush()
+                if hasattr(os, "fsync"):
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+            tmp_path.replace(script_path)
+            try:
+                os.chmod(script_path, 0o666)
+            except OSError:
+                pass
+            self.enforce_storage_permissions()
+            self._fsync_directory(proj_dir)
+            mtime = float(script_path.stat().st_mtime)
+            return (True, f"Script saved to {proj_dir.name}/script.html", script_path, mtime)
+        except OSError as exc:
+            logger.warning("Could not save script %s: %s", script_path, exc)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return (False, f"Could not save script: {exc}", None, 0.0)
+

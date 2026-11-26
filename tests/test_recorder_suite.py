@@ -657,6 +657,74 @@ class TestOnScreenKeyboard(unittest.TestCase):
         self.assertEqual(pw_edit.text(), "pass99")
         _ = app
 
+    def test_on_screen_keyboard_fills_root_window_from_nested_dialogs(self) -> None:
+        try:
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PyQt6.QtWidgets import QApplication, QWidget
+            from app.ui.main_window import ProjectPrefixDialog, RenameRecordingDialog
+            from app.ui.on_screen_keyboard import OnScreenKeyboardDialog
+            from app.ui.styles import compute_scale_factor
+        except Exception:
+            self.skipTest("PyQt6 not available in test environment")
+            return
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cm = ConfigManager(
+                storage_dir=str(base / "storage"),
+                etc_config_dir=str(base / "etc"),
+            )
+            sample_wav = cm.ensure_project_dir("Session") / "Session_Take001.wav"
+            w = WavFileWriter(sample_wav, sample_rate=48000, channels=1, bit_depth=24)
+            w.write_float_frames(np.zeros((2400, 1), dtype=np.float64))
+            w.close()
+
+            for root_w, root_h in ((1024, 600), (1280, 720)):
+                root_win = QWidget()
+                root_win.resize(root_w, root_h)
+                prefix_dlg = ProjectPrefixDialog(config_manager=cm, parent=root_win)
+                rename_dlg = RenameRecordingDialog(
+                    config_manager=cm,
+                    filepath=sample_wav,
+                    parent=root_win,
+                )
+                try:
+                    self.assertLess(prefix_dlg.width(), root_w)
+                    self.assertLess(prefix_dlg.height(), root_h)
+                    self.assertLess(rename_dlg.width(), root_w)
+                    self.assertLess(rename_dlg.height(), root_h)
+
+                    osk_prefix = OnScreenKeyboardDialog(
+                        target=prefix_dlg.prefix_edit,
+                        title="Project Name",
+                        parent=prefix_dlg,
+                    )
+                    osk_rename = OnScreenKeyboardDialog(
+                        target=rename_dlg.name_edit,
+                        title="Rename Recording",
+                        parent=rename_dlg,
+                    )
+                    try:
+                        expected_scale = compute_scale_factor(root_w, root_h)
+                        self.assertIs(osk_prefix._reference_window, root_win)
+                        self.assertIs(osk_rename._reference_window, root_win)
+                        self.assertEqual(osk_prefix.width(), root_w)
+                        self.assertEqual(osk_prefix.height(), root_h)
+                        self.assertEqual(osk_rename.width(), root_w)
+                        self.assertEqual(osk_rename.height(), root_h)
+                        self.assertEqual(osk_prefix.size(), osk_rename.size())
+                        self.assertAlmostEqual(osk_prefix._scale, expected_scale, places=6)
+                        self.assertAlmostEqual(osk_rename._scale, expected_scale, places=6)
+                    finally:
+                        osk_prefix.close()
+                        osk_rename.close()
+                finally:
+                    prefix_dlg.close()
+                    rename_dlg.close()
+                    root_win.close()
+        _ = app
+
 
 class TestPostBootServiceAndRecoveryConfig(unittest.TestCase):
     def test_scripts_have_lf_line_endings_and_post_boot_vt7_service(self) -> None:

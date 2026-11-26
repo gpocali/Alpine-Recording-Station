@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QTimer
-from PyQt6.QtGui import QKeyEvent
+from PyQt6.QtGui import QGuiApplication, QKeyEvent, QResizeEvent
 from PyQt6.QtWidgets import (
+    QApplication,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -216,6 +217,7 @@ class OnScreenKeyboardDialog(QDialog):
         live_update: bool = True,
         on_committed: Optional[Callable[[QLineEdit, str], None]] = None,
         parent: Optional[QWidget] = None,
+        fullscreen: Optional[bool] = None,
     ) -> None:
         super().__init__(parent or target.window())
         self._target: QLineEdit = target
@@ -231,25 +233,146 @@ class OnScreenKeyboardDialog(QDialog):
         self._symbols_mode: bool = False
         self._password_revealed: bool = False
         self._char_buttons: List[_CharKeyButton] = []
+        self._ui_built: bool = False
 
         self.setWindowTitle(f"On-Screen Keyboard — {title}")
         self.setModal(True)
+        self.setMinimumSize(640, 420)
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
-        # Size responsively to parent window / screen
-        parent_win = parent or target.window()
-        if parent_win is not None and parent_win.width() >= 480:
-            pw, ph = parent_win.width(), parent_win.height()
+        self._reference_window = self._resolve_reference_window(parent, target)
+        self._fullscreen_requested: bool = bool(
+            fullscreen
+            if fullscreen is not None
+            else (
+                self._reference_window is not None
+                and self._reference_window.isFullScreen()
+            )
+        )
+
+        # Fill the full root application window / screen for maximum touch target size
+        if (
+            self._reference_window is not None
+            and self._reference_window.width() >= 480
+            and self._reference_window.height() >= 360
+        ):
+            pw, ph = self._reference_window.width(), self._reference_window.height()
             self._scale = compute_scale_factor(pw, ph)
-            dlg_w = max(620, min(pw - 24, int(round(pw * 0.94))))
-            dlg_h = max(380, min(ph - 20, int(round(ph * 0.78))))
-            self.resize(dlg_w, dlg_h)
+            self.resize(pw, ph)
+            ref_top_left = (
+                self._reference_window.geometry().topLeft()
+                if self._reference_window.isWindow()
+                else self._reference_window.mapToGlobal(
+                    self._reference_window.rect().topLeft()
+                )
+            )
+            self.move(ref_top_left)
         else:
-            self._scale = 1.0
-            self.resize(860, 460)
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                if avail.width() >= 640 and avail.height() >= 420:
+                    pw, ph = avail.width(), avail.height()
+                    self._scale = compute_scale_factor(pw, ph)
+                    self.resize(pw, ph)
+                    self.move(avail.topLeft())
+                else:
+                    self._scale = 1.0
+                    self.resize(1280, 720)
+            else:
+                self._scale = 1.0
+                self.resize(1280, 720)
 
         self._build_ui()
+        self._ui_built = True
         self._load_target_into_display(self._target, self._title, self._hint)
+        self._apply_styles()
+
+    @staticmethod
+    def _resolve_reference_window(
+        parent: Optional[QWidget], target: Optional[QWidget]
+    ) -> Optional[QWidget]:
+        """Find the largest ancestor/top-level application window to size the keyboard against."""
+        candidates: Dict[int, Tuple[QWidget, int]] = {}
+
+        def _walk_chain(start: Optional[QWidget]) -> None:
+            curr = start
+            depth = 0
+            seen_in_chain: set[int] = set()
+            while curr is not None and id(curr) not in seen_in_chain:
+                seen_in_chain.add(id(curr))
+                existing = candidates.get(id(curr))
+                if existing is None or depth > existing[1]:
+                    candidates[id(curr)] = (curr, depth)
+                parent_w = curr.parentWidget()
+                if parent_w is None:
+                    win_w = curr.window()
+                    if (
+                        win_w is not None
+                        and win_w is not curr
+                        and id(win_w) not in seen_in_chain
+                    ):
+                        curr = win_w
+                        depth += 1
+                        continue
+                curr = parent_w
+                depth += 1
+
+        _walk_chain(parent)
+        if target is not None:
+            _walk_chain(target.window())
+            _walk_chain(target)
+
+        for top_w in QApplication.topLevelWidgets():
+            if (
+                top_w is not None
+                and top_w.isVisible()
+                and not isinstance(top_w, OnScreenKeyboardDialog)
+                and id(top_w) not in candidates
+            ):
+                candidates[id(top_w)] = (top_w, 100)
+
+        best_win: Optional[QWidget] = None
+        best_key: Tuple[int, int, int] = (-1, -1, -1)
+        for cand, depth in candidates.values():
+            if isinstance(cand, OnScreenKeyboardDialog):
+                continue
+            w = cand.width()
+            h = cand.height()
+            if w >= 480 and h >= 360:
+                is_root = 1 if cand.parentWidget() is None else 0
+                key = (w * h, depth, is_root)
+                if key > best_key:
+                    best_key = key
+                    best_win = cand
+        return best_win
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        ref = self._reference_window
+        if ref is not None and ref.width() >= 480 and ref.height() >= 360:
+            ref_geom = ref.geometry()
+            top_left = (
+                ref_geom.topLeft()
+                if ref.isWindow()
+                else ref.mapToGlobal(ref.rect().topLeft())
+            )
+            self.resize(ref_geom.size())
+            self.move(top_left)
+        if self._fullscreen_requested:
+            self.showFullScreen()
+            self._fullscreen_requested = False
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._apply_responsive_scaling()
+
+    def _apply_responsive_scaling(self) -> None:
+        if not getattr(self, "_ui_built", False):
+            return
+        w = max(640, self.width())
+        h = max(420, self.height())
+        self._scale = compute_scale_factor(w, h)
         self._apply_styles()
 
     @property
@@ -478,9 +601,11 @@ class OnScreenKeyboardDialog(QDialog):
 
     def _apply_styles(self) -> None:
         base_style = build_main_stylesheet(self._scale)
-        key_font_px = max(13, int(round(17 * self._scale)))
-        input_font_px = max(15, int(round(20 * self._scale)))
-        key_min_h = max(36, int(round(46 * self._scale)))
+        key_font_px = max(15, int(round(20 * self._scale)))
+        input_font_px = max(17, int(round(22 * self._scale)))
+        header_btn_font_px = max(13, int(round(16 * self._scale)))
+        header_min_h = max(38, int(round(48 * self._scale)))
+        key_min_h = max(40, int(round(54 * self._scale)))
 
         extra_style = f"""
         QFrame#OskHeaderFrame {{
@@ -496,10 +621,17 @@ class OnScreenKeyboardDialog(QDialog):
         QFrame#OskHeaderFrame QLineEdit {{
             font-size: {input_font_px}px;
             font-weight: bold;
+            min-height: {header_min_h}px;
             padding: 8px 12px;
             background-color: #090C10;
             border: 2px solid #388BFD;
             color: #F0F6FC;
+        }}
+        QFrame#OskHeaderFrame QPushButton {{
+            font-size: {header_btn_font_px}px;
+            font-weight: bold;
+            min-height: {header_min_h}px;
+            padding: 6px 14px;
         }}
         QFrame#OskKeysFrame QPushButton {{
             font-size: {key_font_px}px;

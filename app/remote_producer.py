@@ -48,9 +48,11 @@ import numpy as np
 from app.audio_engine import AudioEngine, linear_to_dbfs, resample_mono_signal
 from app.config_manager import MAX_PROJECT_NAME_LENGTH, ConfigManager, sanitize_project_name
 from app.network_info import get_lan_ip_addresses
+from app.prompter_engine import sanitize_script_html
 from app.qr_code import encode_qr_matrix, qr_matrix_to_svg
 from app.session_cli import SessionControlServer, build_session_urls, resolve_runtime_dir
 from app.ssl_manager import CertificateInfo, SslCertificateManager
+from app.web_auth import WebUserAccount, WebUserManager
 
 logger = logging.getLogger("AlpineRecorder.RemoteProducer")
 
@@ -59,6 +61,7 @@ STREAM_SAMPLE_RATE = 24000  # 24 kHz low-latency wideband voice stream
 MAX_HTTP_CONNECTIONS = 32
 MAX_WS_CLIENTS = 10
 MAX_HTTP_POST_BYTES = 16384
+MAX_SCRIPT_POST_BYTES = 524288
 HTTP_SOCKET_TIMEOUT_SEC = 10.0
 WS_IDLE_TIMEOUT_SEC = 35.0
 
@@ -433,13 +436,36 @@ class ProducerSession:
         return False
 
 
+@dataclass(frozen=True)
+class AuthPrincipal:
+    """Authenticated Web UI caller identity (temporary session guest or standing local login)."""
+
+    kind: str  # "session" or "local"
+    username: str
+    role: str  # "guest" or "admin"/"producer"
+    session_id: str
+
+    @property
+    def is_local(self) -> bool:
+        return self.kind == "local"
+
+
 class WebSocketConnection:
     """Minimal, thread-safe RFC 6455 WebSocket connection wrapper."""
 
-    def __init__(self, sock: socket.socket, client_address: Tuple[str, int], session_id: str):
+    def __init__(
+        self,
+        sock: socket.socket,
+        client_address: Tuple[str, int],
+        session_id: str,
+        auth_kind: str = "session",
+        username: str = "",
+    ):
         self.sock = sock
         self.client_address = client_address
         self.session_id = session_id
+        self.auth_kind = auth_kind
+        self.username = username
         self.client_id = secrets.token_hex(4)
         self.connected_at = time.time()
         self.send_lock = threading.Lock()
@@ -649,6 +675,8 @@ class RemoteProducerServer:
         ssl_manager: Optional[SslCertificateManager] = None,
         status_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         on_project_name_changed: Optional[Callable[[str], None]] = None,
+        on_script_updated: Optional[Callable[[str, str], None]] = None,
+        web_user_manager: Optional[WebUserManager] = None,
         host: str = "0.0.0.0",
         port: Optional[int] = None,
         runtime_dir: Optional[Path | str] = None,
@@ -662,6 +690,12 @@ class RemoteProducerServer:
         )
         self.status_provider = status_provider
         self.on_project_name_changed = on_project_name_changed
+        self.on_script_updated = on_script_updated
+        self.web_user_manager = web_user_manager or WebUserManager(
+            etc_config_dir=config_manager.etc_config_dir,
+            storage_dir=config_manager.storage_dir,
+            on_persist_lbu=config_manager.trigger_lbu_commit_async,
+        )
         self.host = host
         self._configured_port = (
             port if port is not None else int(getattr(config_manager.settings, "remote_producer_port", 8443))
@@ -982,16 +1016,25 @@ class RemoteProducerServer:
     def rotate_session(self) -> ProducerSession:
         """
         Rotate session ID, passcode, and invite token, disconnecting any
-        existing remote producer clients and releasing remote talkback.
+        temporary session-based clients while keeping standing local logins active.
         """
         with self._session_lock:
             self.session.rotate()
             sid = self.session.session_id
-        self._disconnect_all_clients()
-        self.audio_engine.set_remote_talkback(False, latched=False)
+        self._disconnect_session_clients()
+        self._recompute_remote_talkback_state()
+        self.broadcast_state_snapshot()
         self._control_server.sync_state()
         logger.info("Rotated remote producer session -> %s", sid)
         return self.session
+
+    def _disconnect_session_clients(self) -> None:
+        with self._clients_lock:
+            to_close = [c for c in self._clients.values() if c.auth_kind != "local"]
+            for c in to_close:
+                self._clients.pop(c.client_id, None)
+        for client in to_close:
+            client.close()
 
     def reload_ssl_certificates(self) -> CertificateInfo:
         """Reload SSL certificates (and restart listener if running)."""
@@ -1452,48 +1495,58 @@ class RemoteProducerServer:
             except Exception:
                 pass
 
-    def update_project_name(self, new_name: str) -> Tuple[bool, str]:
-        """Update the active project name on behalf of an authenticated remote producer."""
-        if not bool(getattr(self.config_manager.settings, "remote_producer_allow_project_rename", False)):
+    def broadcast_script_update(
+        self, project_name: str, html_content: str, mtime: float = 0.0
+    ) -> None:
+        """Push a live script update to all connected WebSocket clients."""
+        with self._clients_lock:
+            clients = [c for c in self._clients.values() if not c.closed]
+        if not clients:
+            return
+        try:
+            msg = json.dumps(
+                {
+                    "type": "script_updated",
+                    "project_name": sanitize_project_name(project_name),
+                    "html": str(html_content or ""),
+                    "mtime": float(mtime or time.time()),
+                }
+            )
+        except Exception:
+            return
+        for client in clients:
+            try:
+                client.send_text(msg)
+            except Exception:
+                pass
+
+    def switch_active_project(self, new_name: str, *, require_permission_setting: bool = False) -> Tuple[bool, str]:
+        """Switch the active project folder (when idle) and notify the local UI."""
+        if require_permission_setting and not bool(
+            getattr(self.config_manager.settings, "remote_producer_allow_project_rename", False)
+        ):
             return (False, "Project name editing is disabled in studio settings.")
         if self.audio_engine.is_recording or self.audio_engine.is_record_paused:
             return (False, "Cannot change project name while recording is in progress.")
-        raw = (new_name or "").strip()
-        if not raw:
-            return (False, "Please enter a valid project name.")
-        if (
-            "/" in raw
-            or "\\" in raw
-            or "\x00" in raw
-            or any(ord(ch) < 32 for ch in raw)
-            or raw.startswith(".")
-        ):
-            return (False, "Project name cannot contain path separators, control characters, or start with a dot.")
-        if len(raw) > MAX_PROJECT_NAME_LENGTH:
-            return (False, f"Project name must be {MAX_PROJECT_NAME_LENGTH} characters or fewer.")
-        if self.config_manager.is_protected_storage_name(raw):
-            return (False, "That project name is reserved by the studio system.")
+        ok_name, cleaned_or_err = self.config_manager.validate_new_project_name(new_name)
+        if not ok_name:
+            return (False, cleaned_or_err)
 
-        cleaned = sanitize_project_name(raw)
-        if (
-            self.config_manager.is_protected_storage_name(cleaned)
-            or not self.config_manager._is_valid_user_path_in_storage(
-                self.config_manager.get_project_dir(cleaned)
-            )
-        ):
-            return (False, "Please enter a valid non-reserved project name.")
-
-        self.config_manager.settings.project_name = cleaned
+        self.config_manager.settings.project_name = cleaned_or_err
         self.config_manager.save(commit_lbu=True)
-        self.config_manager.ensure_project_dir(cleaned)
+        self.config_manager.ensure_project_dir(cleaned_or_err)
         if self.on_project_name_changed is not None:
             try:
-                self.on_project_name_changed(cleaned)
+                self.on_project_name_changed(cleaned_or_err)
             except Exception as exc:
                 logger.warning("on_project_name_changed callback failed: %s", exc)
         self.broadcast_state_snapshot()
         self._control_server.sync_state()
-        return (True, cleaned)
+        return (True, cleaned_or_err)
+
+    def update_project_name(self, new_name: str) -> Tuple[bool, str]:
+        """Update the active project name on behalf of an authenticated remote producer."""
+        return self.switch_active_project(new_name, require_permission_setting=True)
 
     def _on_engine_talkback_state_changed(self) -> None:
         """Immediately push updated status snapshot to connected producers when Talkback state changes."""
@@ -1610,13 +1663,33 @@ class RemoteProducerServer:
             return query_params["auth"][0]
         return ""
 
+    def _authenticate_request(
+        self, handler: BaseHTTPRequestHandler, query_params: Dict[str, List[str]]
+    ) -> Optional[AuthPrincipal]:
+        token = self._extract_auth_token(handler, query_params)
+        if not token:
+            return None
+        if self.session.verify_auth_token(token):
+            return AuthPrincipal(
+                kind="session",
+                username=self.session.session_id,
+                role="guest",
+                session_id=self.session.session_id,
+            )
+        local_user = self.web_user_manager.verify_auth_token(token)
+        if local_user is not None:
+            return AuthPrincipal(
+                kind="local",
+                username=local_user.username,
+                role=local_user.role,
+                session_id=self.session.session_id,
+            )
+        return None
+
     def _is_request_authenticated(
         self, handler: BaseHTTPRequestHandler, query_params: Dict[str, List[str]]
     ) -> bool:
-        token = self._extract_auth_token(handler, query_params)
-        if token and self.session.verify_auth_token(token):
-            return True
-        return False
+        return self._authenticate_request(handler, query_params) is not None
 
     def _handle_http_get(self, handler: BaseHTTPRequestHandler) -> None:
         parsed = urllib.parse.urlsplit(handler.path)
@@ -1631,12 +1704,111 @@ class RemoteProducerServer:
             if not self._is_same_origin_request(handler):
                 self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "Cross-origin request rejected"})
                 return
-            if not self._is_request_authenticated(handler, query):
+            principal = self._authenticate_request(handler, query)
+            if principal is None:
                 self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"authenticated": False})
                 return
             snap = self.build_status_snapshot()
             snap["authenticated"] = True
+            snap["auth_kind"] = principal.kind
+            snap["auth_user"] = principal.username
+            snap["auth_role"] = principal.role
             self._send_json(handler, HTTPStatus.OK, snap)
+            return
+
+        if path == "/api/projects":
+            if not self._is_same_origin_request(handler):
+                self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "Cross-origin request rejected"})
+                return
+            principal = self._authenticate_request(handler, query)
+            if principal is None:
+                self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Authentication required"})
+                return
+            if not principal.is_local:
+                self._send_json(
+                    handler,
+                    HTTPStatus.FORBIDDEN,
+                    {"ok": False, "error": "Standing local account login required to browse all projects."},
+                )
+                return
+            active_clean = sanitize_project_name(self.config_manager.settings.project_name)
+            folders = self.config_manager.list_project_folders()
+            items = []
+            seen_active = False
+            for f in folders:
+                if f.project_name == active_clean:
+                    seen_active = True
+                items.append(
+                    {
+                        "project_name": f.project_name,
+                        "recording_count": int(f.recording_count),
+                        "other_file_count": int(f.other_file_count),
+                        "total_size_bytes": int(f.total_size_bytes),
+                        "formatted_size": f.formatted_size,
+                        "is_active_project": bool(f.is_active_project),
+                        "has_script": bool(self.config_manager.has_project_script(f.project_name)),
+                    }
+                )
+            if not seen_active:
+                items.insert(
+                    0,
+                    {
+                        "project_name": active_clean,
+                        "recording_count": 0,
+                        "other_file_count": 0,
+                        "total_size_bytes": 0,
+                        "formatted_size": "0 B",
+                        "is_active_project": True,
+                        "has_script": bool(self.config_manager.has_project_script(active_clean)),
+                    },
+                )
+            self._send_json(
+                handler,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "active_project": active_clean,
+                    "is_recording": bool(self.audio_engine.is_recording or self.audio_engine.is_record_paused),
+                    "projects": items,
+                },
+            )
+            return
+
+        if path == "/api/script":
+            if not self._is_same_origin_request(handler):
+                self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "Cross-origin request rejected"})
+                return
+            principal = self._authenticate_request(handler, query)
+            if principal is None:
+                self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Authentication required"})
+                return
+            active_clean = sanitize_project_name(self.config_manager.settings.project_name)
+            requested_proj = (query.get("project") or [""])[0].strip()
+            if requested_proj:
+                if not principal.is_local and sanitize_project_name(requested_proj) != active_clean:
+                    self._send_json(
+                        handler,
+                        HTTPStatus.FORBIDDEN,
+                        {"ok": False, "error": "Session guests can only access the active project script."},
+                    )
+                    return
+                ok_name, target_proj = self.config_manager.validate_new_project_name(requested_proj)
+                if not ok_name:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": target_proj})
+                    return
+            else:
+                target_proj = active_clean
+            html_content, mtime = self.config_manager.load_project_script(target_proj)
+            self._send_json(
+                handler,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "project_name": target_proj,
+                    "html": sanitize_script_html(html_content),
+                    "mtime": mtime,
+                },
+            )
             return
 
         if path == "/api/qr.svg":
@@ -1663,7 +1835,8 @@ class RemoteProducerServer:
             invite = (query.get("token") or [""])[0]
             prefill_session = (query.get("session") or [""])[0].strip()[:32]
             set_cookie_header: Optional[str] = None
-            authenticated = self._is_request_authenticated(handler, query)
+            principal = self._authenticate_request(handler, query)
+            authenticated = principal is not None
             client_ip = self._resolve_client_ip(handler)
             allowed, retry_after = self.rate_limiter.check_allowed(client_ip)
 
@@ -1687,6 +1860,12 @@ class RemoteProducerServer:
                     )
                     self.rate_limiter.record_success(client_ip)
                     authenticated = True
+                    principal = AuthPrincipal(
+                        kind="session",
+                        username=self.session.session_id,
+                        role="guest",
+                        session_id=self.session.session_id,
+                    )
                 else:
                     banned, ban_retry, _rem = self.rate_limiter.record_failure(client_ip)
                     if banned:
@@ -1709,6 +1888,8 @@ class RemoteProducerServer:
             html = self._render_producer_html(
                 csp_nonce=nonce,
                 authenticated=authenticated,
+                auth_kind=principal.kind if principal is not None else "",
+                auth_user=principal.username if principal is not None else "",
                 prefill_session=prefill_session if not authenticated else "",
                 prefill_token=clean_prefill_token,
                 initial_error=initial_error,
@@ -1725,6 +1906,19 @@ class RemoteProducerServer:
 
         self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
+    def _parse_post_json(self, handler: BaseHTTPRequestHandler, raw_body: bytes) -> Dict[str, Any]:
+        ctype = handler.headers.get("Content-Type", "")
+        if "application/json" in ctype:
+            try:
+                parsed_json = json.loads(raw_body.decode("utf-8"))
+                if isinstance(parsed_json, dict):
+                    return parsed_json
+            except Exception:
+                return {}
+            return {}
+        form = urllib.parse.parse_qs(raw_body.decode("utf-8", errors="ignore"))
+        return {k: v[0] for k, v in form.items() if v}
+
     def _handle_http_post(self, handler: BaseHTTPRequestHandler) -> None:
         if not self._is_same_origin_request(handler):
             self._send_json(handler, HTTPStatus.FORBIDDEN, {"ok": False, "error": "Cross-origin request rejected"})
@@ -1732,6 +1926,7 @@ class RemoteProducerServer:
 
         parsed = urllib.parse.urlsplit(handler.path)
         path = parsed.path or "/"
+        query = urllib.parse.parse_qs(parsed.query)
 
         raw_cl = (handler.headers.get("Content-Length") or "0").strip()
         try:
@@ -1742,7 +1937,8 @@ class RemoteProducerServer:
         if content_len < 0:
             self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Invalid Content-Length header"})
             return
-        if content_len > MAX_HTTP_POST_BYTES:
+        max_bytes = MAX_SCRIPT_POST_BYTES if path == "/api/script" else MAX_HTTP_POST_BYTES
+        if content_len > max_bytes:
             self._send_json(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Request payload too large"})
             return
 
@@ -1755,63 +1951,94 @@ class RemoteProducerServer:
                 self._send_rate_limited(handler, retry_after)
                 return
 
-            data: Dict[str, Any] = {}
-            ctype = handler.headers.get("Content-Type", "")
-            if "application/json" in ctype:
-                try:
-                    parsed_json = json.loads(raw_body.decode("utf-8"))
-                    if isinstance(parsed_json, dict):
-                        data = parsed_json
-                except Exception:
-                    data = {}
-            else:
-                form = urllib.parse.parse_qs(raw_body.decode("utf-8", errors="ignore"))
-                data = {k: v[0] for k, v in form.items() if v}
-
+            data = self._parse_post_json(handler, raw_body)
+            login_mode = str(data.get("login_mode") or "").strip().lower()
             passcode = str(data.get("password") or data.get("passcode") or "")
             invite_token = str(data.get("invite_token") or data.get("token") or "")
-            submitted_session = str(data.get("session_id") or data.get("username") or "").strip()
+            submitted_id = str(data.get("session_id") or data.get("username") or "").strip()
 
-            expected_sid = self.session.session_id.upper().encode("utf-8")
-            provided_sid = submitted_session.upper().encode("utf-8")
-            sid_matches = bool(submitted_session) and hmac.compare_digest(provided_sid, expected_sid)
-            sid_conflict = bool(submitted_session) and not sid_matches
+            # 1. Check defined local account login (explicit local mode or non-session username)
+            local_user: Optional[WebUserAccount] = None
+            if login_mode == "local" or (
+                submitted_id
+                and passcode
+                and not invite_token.strip()
+                and not submitted_id.upper().startswith("ARS-")
+            ):
+                local_user = self.web_user_manager.verify_credentials(submitted_id, passcode)
 
-            invite_clean = invite_token.strip()
-            pass_clean = passcode.strip()
-            invite_ok = bool(invite_clean) and self.session.verify_credentials(invite_token=invite_clean) and not sid_conflict
-            pin_ok = bool(pass_clean) and self.session.verify_credentials(passcode=pass_clean) and sid_matches
-
-            if pin_ok or invite_ok:
+            if local_user is not None:
                 self.rate_limiter.record_success(client_ip)
-                auth_token = self.session.create_auth_token()
+                auth_token = self.web_user_manager.create_auth_token(local_user)
                 cookie_val = (
-                    f"__Host-ars_session={auth_token}; SameSite=Lax; HttpOnly; Secure; Path=/; Max-Age=43200"
+                    f"__Host-ars_session={auth_token}; SameSite=Lax; HttpOnly; Secure; Path=/; Max-Age=604800"
                 )
                 self._send_json(
                     handler,
                     HTTPStatus.OK,
                     {
                         "ok": True,
+                        "auth_kind": "local",
+                        "username": local_user.username,
+                        "role": local_user.role,
                         "session_id": self.session.session_id,
                         "auth_token": auth_token,
                     },
                     extra_headers={"Set-Cookie": cookie_val},
                 )
-            else:
-                banned, ban_retry, remaining = self.rate_limiter.record_failure(client_ip)
-                if banned:
-                    self._send_rate_limited(handler, ban_retry)
-                else:
+                return
+
+            # 2. Check temporary session login (Session ID + 6-digit PIN or invite token)
+            if login_mode != "local":
+                expected_sid = self.session.session_id.upper().encode("utf-8")
+                provided_sid = submitted_id.upper().encode("utf-8")
+                sid_matches = bool(submitted_id) and hmac.compare_digest(provided_sid, expected_sid)
+                sid_conflict = bool(submitted_id) and not sid_matches
+
+                invite_clean = invite_token.strip()
+                pass_clean = passcode.strip()
+                invite_ok = bool(invite_clean) and self.session.verify_credentials(invite_token=invite_clean) and not sid_conflict
+                pin_ok = bool(pass_clean) and self.session.verify_credentials(passcode=pass_clean) and sid_matches
+
+                if pin_ok or invite_ok:
+                    self.rate_limiter.record_success(client_ip)
+                    auth_token = self.session.create_auth_token()
+                    cookie_val = (
+                        f"__Host-ars_session={auth_token}; SameSite=Lax; HttpOnly; Secure; Path=/; Max-Age=43200"
+                    )
                     self._send_json(
                         handler,
-                        HTTPStatus.UNAUTHORIZED,
+                        HTTPStatus.OK,
                         {
-                            "ok": False,
-                            "error": "Invalid Session ID, passcode, or invite token.",
-                            "attempts_remaining": remaining,
+                            "ok": True,
+                            "auth_kind": "session",
+                            "username": self.session.session_id,
+                            "role": "guest",
+                            "session_id": self.session.session_id,
+                            "auth_token": auth_token,
                         },
+                        extra_headers={"Set-Cookie": cookie_val},
                     )
+                    return
+
+            banned, ban_retry, remaining = self.rate_limiter.record_failure(client_ip)
+            if banned:
+                self._send_rate_limited(handler, ban_retry)
+            else:
+                err_msg = (
+                    "Invalid username or password."
+                    if login_mode == "local"
+                    else "Invalid Session ID, passcode, or invite token."
+                )
+                self._send_json(
+                    handler,
+                    HTTPStatus.UNAUTHORIZED,
+                    {
+                        "ok": False,
+                        "error": err_msg,
+                        "attempts_remaining": remaining,
+                    },
+                )
             return
 
         if path == "/api/logout":
@@ -1825,6 +2052,130 @@ class RemoteProducerServer:
                 extra_headers={
                     "Set-Cookie": expired_cookie,
                     "Clear-Site-Data": '"cookies", "storage", "cache"',
+                },
+            )
+            return
+
+        if path == "/api/projects":
+            principal = self._authenticate_request(handler, query)
+            if principal is None:
+                self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Authentication required"})
+                return
+            if not principal.is_local:
+                self._send_json(handler, HTTPStatus.FORBIDDEN, {"ok": False, "error": "Local account login required."})
+                return
+            data = self._parse_post_json(handler, raw_body)
+            proj_name = str(data.get("project_name") or "").strip()
+            set_active = bool(data.get("set_active", False))
+            ok, detail = self.config_manager.create_project_folder(proj_name)
+            if not ok:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": detail})
+                return
+            if set_active and not (self.audio_engine.is_recording or self.audio_engine.is_record_paused):
+                self.switch_active_project(detail, require_permission_setting=False)
+            self._send_json(
+                handler,
+                HTTPStatus.OK,
+                {"ok": True, "project_name": detail, "active_project": sanitize_project_name(self.config_manager.settings.project_name)},
+            )
+            return
+
+        if path == "/api/projects/select":
+            principal = self._authenticate_request(handler, query)
+            if principal is None:
+                self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Authentication required"})
+                return
+            if not principal.is_local:
+                self._send_json(handler, HTTPStatus.FORBIDDEN, {"ok": False, "error": "Local account login required."})
+                return
+            data = self._parse_post_json(handler, raw_body)
+            proj_name = str(data.get("project_name") or "").strip()
+            ok, detail = self.switch_active_project(proj_name, require_permission_setting=False)
+            if not ok:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": detail})
+                return
+            self._send_json(handler, HTTPStatus.OK, {"ok": True, "project_name": detail})
+            return
+
+        if path == "/api/projects/rename":
+            principal = self._authenticate_request(handler, query)
+            if principal is None:
+                self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Authentication required"})
+                return
+            if not principal.is_local:
+                self._send_json(handler, HTTPStatus.FORBIDDEN, {"ok": False, "error": "Local account login required."})
+                return
+            if self.audio_engine.is_recording or self.audio_engine.is_record_paused:
+                self._send_json(
+                    handler,
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "error": "Cannot rename projects while recording is in progress."},
+                )
+                return
+            data = self._parse_post_json(handler, raw_body)
+            old_name = str(data.get("old_name") or "").strip()
+            new_name = str(data.get("new_name") or "").strip()
+            was_active = sanitize_project_name(self.config_manager.settings.project_name) == old_name
+            ok, detail = self.config_manager.rename_project_folder(old_name, new_name)
+            if not ok:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": detail})
+                return
+            if was_active and self.on_project_name_changed is not None:
+                try:
+                    self.on_project_name_changed(detail)
+                except Exception as exc:
+                    logger.warning("on_project_name_changed callback failed: %s", exc)
+            self.broadcast_state_snapshot()
+            self._control_server.sync_state()
+            self._send_json(handler, HTTPStatus.OK, {"ok": True, "project_name": detail})
+            return
+
+        if path == "/api/script":
+            principal = self._authenticate_request(handler, query)
+            if principal is None:
+                self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Authentication required"})
+                return
+            data = self._parse_post_json(handler, raw_body)
+            active_clean = sanitize_project_name(self.config_manager.settings.project_name)
+            requested_proj = str(data.get("project_name") or "").strip()
+            if requested_proj:
+                if not principal.is_local and sanitize_project_name(requested_proj) != active_clean:
+                    self._send_json(
+                        handler,
+                        HTTPStatus.FORBIDDEN,
+                        {"ok": False, "error": "Session guests can only edit the active project script."},
+                    )
+                    return
+                ok_name, target_proj = self.config_manager.validate_new_project_name(requested_proj)
+                if not ok_name:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": target_proj})
+                    return
+            else:
+                target_proj = active_clean
+
+            raw_html = str(data.get("html") or "")
+            sanitized = sanitize_script_html(raw_html)
+            ok, msg, _saved_path, mtime = self.config_manager.save_project_script(
+                sanitized, project_name=target_proj
+            )
+            if not ok:
+                self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": msg})
+                return
+            if self.on_script_updated is not None:
+                try:
+                    self.on_script_updated(target_proj, sanitized)
+                except Exception as exc:
+                    logger.warning("on_script_updated callback failed: %s", exc)
+            self.broadcast_script_update(target_proj, sanitized, mtime=mtime)
+            self._send_json(
+                handler,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "project_name": target_proj,
+                    "html": sanitized,
+                    "mtime": mtime,
+                    "message": msg,
                 },
             )
             return
@@ -1861,7 +2212,8 @@ class RemoteProducerServer:
             self._send_rate_limited(handler, retry_after)
             return
 
-        if not self._is_request_authenticated(handler, query):
+        principal = self._authenticate_request(handler, query)
+        if principal is None:
             self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"error": "Session authentication required"})
             return
 
@@ -1886,21 +2238,32 @@ class RemoteProducerServer:
 
         sock = handler.connection
         sock.settimeout(1.0)
-        ws_conn = WebSocketConnection(sock, handler.client_address, self.session.session_id)
+        ws_conn = WebSocketConnection(
+            sock,
+            handler.client_address,
+            self.session.session_id,
+            auth_kind=principal.kind,
+            username=principal.username,
+        )
 
         with self._clients_lock:
             self._clients[ws_conn.client_id] = ws_conn
 
         self._control_server.sync_state()
-        logger.info("Remote producer connected (%s, client=%s)", client_ip, ws_conn.client_id)
+        logger.info(
+            "Remote producer connected (%s, client=%s, auth=%s)",
+            client_ip,
+            ws_conn.client_id,
+            principal.kind,
+        )
 
         try:
             # Send initial state snapshot immediately
             ws_conn.send_text(json.dumps(self.build_status_snapshot()))
 
             while self._running.is_set() and not ws_conn.closed:
-                # Verify session was not rotated
-                if ws_conn.session_id != self.session.session_id:
+                # Verify temporary session was not rotated (standing local accounts persist)
+                if ws_conn.auth_kind != "local" and ws_conn.session_id != self.session.session_id:
                     ws_conn.send_text(json.dumps({"type": "session_revoked"}))
                     break
 
@@ -2010,6 +2373,8 @@ class RemoteProducerServer:
         self,
         csp_nonce: str,
         authenticated: bool,
+        auth_kind: str = "",
+        auth_user: str = "",
         prefill_session: str = "",
         prefill_token: str = "",
         initial_error: str = "",
@@ -2018,11 +2383,14 @@ class RemoteProducerServer:
         session_id = self.session.session_id
         project_name = self.config_manager.settings.project_name or "Session"
         auth_str = "true" if authenticated else "false"
+        has_local_users_str = "true" if self.web_user_manager.has_users() else "false"
         safe_prefill = html_escape(prefill_token)
         safe_prefill_session = html_escape(prefill_session) if (not authenticated and prefill_session) else ""
         safe_hdr_session = html_escape(session_id) if authenticated else "Auth Required"
         safe_hdr_project = html_escape(project_name) if authenticated else "--"
         safe_js_project = json.dumps(project_name if authenticated else "").replace("</", "<\\/")
+        safe_js_auth_kind = json.dumps(auth_kind if authenticated else "").replace("</", "<\\/")
+        safe_js_auth_user = json.dumps(auth_user if authenticated else "").replace("</", "<\\/")
         safe_js_initial_error = json.dumps(initial_error or "").replace("</", "<\\/")
         safe_js_retry_after = max(0, int(initial_retry_after or 0))
 
@@ -2544,6 +2912,120 @@ input[type="range"].brand-slider {{
   color: #7EE787;
   font-weight: 700;
 }}
+/* Login Mode Switcher & Console Nav Tabs */
+.login-mode-tabs, .nav-tabs {{
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: 8px;
+  flex-wrap: wrap;
+}}
+.tab-btn {{
+  background: #21262D;
+  border: 1px solid #30363D;
+  color: #C9D1D9;
+  border-radius: 7px;
+  padding: 7px 14px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}}
+.tab-btn:hover {{
+  border-color: #58A6FF;
+}}
+.tab-btn.active {{
+  background: #1F6FEB;
+  border-color: #388BFD;
+  color: #FFFFFF;
+}}
+/* Rich-Text Script Editor */
+.rte-toolbar {{
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  background: #0D1014;
+  border: 1px solid #30363D;
+  border-radius: 8px 8px 0 0;
+}}
+.rte-btn {{
+  background: #21262D;
+  border: 1px solid #30363D;
+  color: #E6EDF3;
+  border-radius: 5px;
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}}
+.rte-btn:hover {{
+  background: #292E36;
+  border-color: #58A6FF;
+}}
+.rte-sep {{
+  width: 1px;
+  height: 20px;
+  background: #30363D;
+  margin: 0 2px;
+}}
+.rte-editor {{
+  min-height: 340px;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: #090C10;
+  color: #F0F6FC;
+  border: 1px solid #30363D;
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  padding: 18px 22px;
+  font-size: 18px;
+  line-height: 1.65;
+  outline: none;
+}}
+.rte-editor:focus {{
+  border-color: #58A6FF;
+}}
+.script-actions-row {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}}
+/* Projects Table */
+.projects-table {{
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+  font-size: 13px;
+}}
+.projects-table th, .projects-table td {{
+  text-align: left;
+  padding: 10px 10px;
+  border-bottom: 1px solid #21262D;
+}}
+.projects-table th {{
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+}}
+.proj-actions {{
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}}
+.select-input {{
+  background: var(--bg-deck);
+  border: 1px solid #30363D;
+  border-radius: 6px;
+  color: var(--text-primary);
+  padding: 6px 10px;
+  font-size: 13px;
+}}
 </style>
 </head>
 <body>
@@ -2563,14 +3045,19 @@ input[type="range"].brand-slider {{
 </header>
 
 <main class="main-wrap">
-  <!-- SESSION-TIED LOGIN VIEW -->
+  <!-- SESSION-TIED & LOCAL ACCOUNT LOGIN VIEW -->
   <section class="login-card" id="login-view" style="display:none;">
-    <h1>Join Guided VO Session</h1>
-    <p>Authenticate with the Studio Session ID and 6-digit Session Passcode displayed on the studio's Remote Producer setup screen, or scan the session QR code.</p>
+    <h1 id="login-heading">Join Guided VO Session</h1>
+    <div class="login-mode-tabs" role="tablist" aria-label="Login method">
+      <button type="button" class="tab-btn active" id="btn-mode-session" role="tab" aria-selected="true">Session PIN</button>
+      <button type="button" class="tab-btn" id="btn-mode-local" role="tab" aria-selected="false">Local Account</button>
+    </div>
+    <p id="login-desc">Authenticate with the Studio Session ID and 6-digit Session Passcode displayed on the studio's Remote Producer setup screen, or scan the session QR code.</p>
     <div class="login-error" id="login-error" role="alert"></div>
     <form id="login-form" action="/api/login" method="post">
+      <input type="hidden" id="login-mode-input" name="login_mode" value="session">
       <div class="form-field">
-        <label for="session-id-input">STUDIO SESSION ID</label>
+        <label for="session-id-input" id="lbl-login-id">STUDIO SESSION ID</label>
         <input
           type="text"
           id="session-id-input"
@@ -2588,7 +3075,7 @@ input[type="range"].brand-slider {{
         >
       </div>
       <div class="form-field">
-        <label for="session-passcode">SESSION PASSCODE (6-DIGIT PIN)</label>
+        <label for="session-passcode" id="lbl-login-pass">SESSION PASSCODE (6-DIGIT PIN)</label>
         <div class="input-row">
           <input
             type="password"
@@ -2598,7 +3085,7 @@ input[type="range"].brand-slider {{
             autocomplete="current-password"
             inputmode="numeric"
             enterkeyhint="done"
-            maxlength="64"
+            maxlength="128"
             placeholder="Enter 6-digit passcode"
             required
           >
@@ -2616,8 +3103,15 @@ input[type="range"].brand-slider {{
     </form>
   </section>
 
-  <!-- STRIPPED-DOWN PRODUCER CONSOLE VIEW -->
+  <!-- PRODUCER CONSOLE, SCRIPT EDITOR & PROJECTS VIEW -->
   <section id="console-view" style="display:none;">
+    <nav class="nav-tabs" role="tablist" aria-label="Producer console sections">
+      <button type="button" class="tab-btn active" id="nav-tab-console" role="tab" aria-selected="true" aria-controls="panel-console">◉ Studio Console</button>
+      <button type="button" class="tab-btn" id="nav-tab-script" role="tab" aria-selected="false" aria-controls="panel-script">▤ Script &amp; Prompter</button>
+      <button type="button" class="tab-btn" id="nav-tab-projects" role="tab" aria-selected="false" aria-controls="panel-projects" style="display:none;">◈ Projects</button>
+    </nav>
+
+    <div id="panel-console" role="tabpanel">
     <!-- Optional Remote Project Rename Bar (shown only when enabled in studio settings) -->
     <div class="project-edit-bar" id="project-edit-bar">
       <div class="project-edit-row">
@@ -2704,6 +3198,76 @@ input[type="range"].brand-slider {{
         <span id="rtt-readout">Link Latency: -- ms</span>
       </div>
     </div>
+    </div><!-- /panel-console -->
+
+    <!-- SCRIPT & TELEPROMPTER EDITOR PANEL -->
+    <div id="panel-script" role="tabpanel" style="display:none;">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">PROJECT SCRIPT &amp; LIVE TELEPROMPTER SYNC</span>
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <label for="script-project-select" style="font-size:12px; color:#8B949E;">Project:</label>
+            <select id="script-project-select" class="select-input"></select>
+            <button type="button" class="btn-subtle" id="btn-reload-script">↻ Reload</button>
+          </div>
+        </div>
+        <div class="rte-toolbar" role="toolbar" aria-label="Script formatting">
+          <button type="button" class="rte-btn" data-cmd="bold" title="Bold"><b>B</b></button>
+          <button type="button" class="rte-btn" data-cmd="italic" title="Italic"><i>I</i></button>
+          <button type="button" class="rte-btn" data-cmd="underline" title="Underline"><u>U</u></button>
+          <span class="rte-sep"></span>
+          <button type="button" class="rte-btn" data-block="H2" title="Section Heading">H2</button>
+          <button type="button" class="rte-btn" data-block="P" title="Paragraph">P</button>
+          <button type="button" class="rte-btn" data-cmd="insertUnorderedList" title="Bullet List">• List</button>
+          <span class="rte-sep"></span>
+          <button type="button" class="rte-btn" data-color="#F0F6FC" title="Default White Text">White</button>
+          <button type="button" class="rte-btn" data-color="#FFDF5D" style="color:#FFDF5D;" title="Amber Emphasis">Amber</button>
+          <button type="button" class="rte-btn" data-color="#79C0FF" style="color:#79C0FF;" title="Cyan Note">Cyan</button>
+          <button type="button" class="rte-btn" data-color="#7EE787" style="color:#7EE787;" title="Green Cue">Green</button>
+          <button type="button" class="rte-btn" data-color="#FF7B72" style="color:#FF7B72;" title="Red Warning">Red</button>
+          <span class="rte-sep"></span>
+          <button type="button" class="rte-btn" data-insert="(pause)" title="Insert non-spoken (cue) excluded from AI lookahead">(Cue)</button>
+          <button type="button" class="rte-btn" data-insert="[direction]" title="Insert non-spoken [note] excluded from AI lookahead">[Note]</button>
+          <button type="button" class="rte-btn" data-insert="{{SFX}}" title="Insert non-spoken {{SFX}} excluded from AI lookahead">{{SFX}}</button>
+          <span class="rte-sep"></span>
+          <button type="button" class="rte-btn" data-cmd="removeFormat" title="Clear Formatting">Clear</button>
+        </div>
+        <div id="script-editor" class="rte-editor" contenteditable="true" spellcheck="true" aria-label="Rich text teleprompter script editor"></div>
+        <div class="script-actions-row">
+          <span id="script-status-msg" style="font-size:12px; color:#8B949E;">Saved to /storage/&lt;Project&gt;/script.html. Text in (...), [...], and {{...}} is excluded from Whisper AI lookahead. Edits preserve talent reading position.</span>
+          <button type="button" class="btn-save-inline" id="btn-save-script">Save &amp; Sync to Prompter</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- STANDING LOCAL ACCOUNT PROJECTS MANAGER PANEL -->
+    <div id="panel-projects" role="tabpanel" style="display:none;">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">STUDIO PROJECTS &amp; SCRIPTS (STANDING LOCAL ACCESS)</span>
+          <button type="button" class="btn-subtle" id="btn-refresh-projects">↻ Refresh Projects</button>
+        </div>
+        <div class="project-edit-row" style="margin-bottom:10px;">
+          <label for="new-project-name">NEW PROJECT</label>
+          <input type="text" id="new-project-name" class="text-input" placeholder="Enter new project name..." maxlength="{MAX_PROJECT_NAME_LENGTH}">
+          <button type="button" class="btn-save-inline" id="btn-create-project">Create Project</button>
+          <button type="button" class="btn-subtle" id="btn-create-activate-project">Create &amp; Set Active</button>
+        </div>
+        <div class="project-edit-feedback" id="projects-feedback" role="alert"></div>
+        <table class="projects-table" aria-label="Available studio projects">
+          <thead>
+            <tr>
+              <th>Project Name</th>
+              <th>Takes</th>
+              <th>Size</th>
+              <th>Script</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="projects-tbody"></tbody>
+        </table>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -2712,10 +3276,16 @@ input[type="range"].brand-slider {{
   "use strict";
 
   let isAuthenticated = {auth_str};
+  let authKind = {safe_js_auth_kind};
+  let authUser = {safe_js_auth_user};
+  const hasLocalUsers = {has_local_users_str};
   const initialError = {safe_js_initial_error};
   const initialRetryAfter = {safe_js_retry_after};
   let lockoutTimer = null;
   let lockoutUntilMs = 0;
+  let activeNavTab = "console";
+  let editingScriptProject = "";
+  let cachedProjects = [];
 
   // Immediately strip sensitive URL query parameters (e.g. ?token= or ?session=) from browser bar/history
   if (window.location.search && window.history && window.history.replaceState) {{
@@ -2773,11 +3343,36 @@ input[type="range"].brand-slider {{
   const consoleView = document.getElementById("console-view");
   const loginForm = document.getElementById("login-form");
   const loginError = document.getElementById("login-error");
+  const loginModeInput = document.getElementById("login-mode-input");
+  const btnModeSession = document.getElementById("btn-mode-session");
+  const btnModeLocal = document.getElementById("btn-mode-local");
+  const loginHeading = document.getElementById("login-heading");
+  const loginDesc = document.getElementById("login-desc");
+  const lblLoginId = document.getElementById("lbl-login-id");
+  const lblLoginPass = document.getElementById("lbl-login-pass");
   const sessionInput = document.getElementById("session-id-input");
   const passInput = document.getElementById("session-passcode");
   const btnTogglePass = document.getElementById("btn-toggle-pass");
   const btnLoginSubmit = document.getElementById("btn-login-submit");
   const btnLogout = document.getElementById("btn-logout");
+
+  const navTabConsole = document.getElementById("nav-tab-console");
+  const navTabScript = document.getElementById("nav-tab-script");
+  const navTabProjects = document.getElementById("nav-tab-projects");
+  const panelConsole = document.getElementById("panel-console");
+  const panelScript = document.getElementById("panel-script");
+  const panelProjects = document.getElementById("panel-projects");
+  const scriptProjectSelect = document.getElementById("script-project-select");
+  const btnReloadScript = document.getElementById("btn-reload-script");
+  const scriptEditor = document.getElementById("script-editor");
+  const btnSaveScript = document.getElementById("btn-save-script");
+  const scriptStatusMsg = document.getElementById("script-status-msg");
+  const newProjectNameInput = document.getElementById("new-project-name");
+  const btnCreateProject = document.getElementById("btn-create-project");
+  const btnCreateActivateProject = document.getElementById("btn-create-activate-project");
+  const btnRefreshProjects = document.getElementById("btn-refresh-projects");
+  const projectsFeedback = document.getElementById("projects-feedback");
+  const projectsTbody = document.getElementById("projects-tbody");
 
   const hdrConn = document.getElementById("hdr-conn");
   const hdrSession = document.getElementById("hdr-session");
@@ -2858,6 +3453,60 @@ input[type="range"].brand-slider {{
     lockoutTimer = setInterval(tick, 1000);
   }}
 
+  function setLoginMode(mode) {{
+    const isLocal = mode === "local";
+    loginModeInput.value = isLocal ? "local" : "session";
+    btnModeSession.className = isLocal ? "tab-btn" : "tab-btn active";
+    btnModeSession.setAttribute("aria-selected", isLocal ? "false" : "true");
+    btnModeLocal.className = isLocal ? "tab-btn active" : "tab-btn";
+    btnModeLocal.setAttribute("aria-selected", isLocal ? "true" : "false");
+    if (isLocal) {{
+      loginHeading.textContent = "Local Studio Account Login";
+      loginDesc.textContent = "Sign in with a defined local Web UI account for standing access to all studio projects, script editing, and live producer monitoring.";
+      lblLoginId.textContent = "USERNAME";
+      sessionInput.placeholder = "Enter local username";
+      lblLoginPass.textContent = "PASSWORD";
+      passInput.placeholder = "Enter account password";
+      passInput.inputMode = "text";
+      btnLoginSubmit.textContent = "Sign In to Studio";
+    }} else {{
+      loginHeading.textContent = "Join Guided VO Session";
+      loginDesc.textContent = "Authenticate with the Studio Session ID and 6-digit Session Passcode displayed on the studio's Remote Producer setup screen, or scan the session QR code.";
+      lblLoginId.textContent = "STUDIO SESSION ID";
+      sessionInput.placeholder = "e.g. ARS-1A2B";
+      lblLoginPass.textContent = "SESSION PASSCODE (6-DIGIT PIN)";
+      passInput.placeholder = "Enter 6-digit passcode";
+      passInput.inputMode = "numeric";
+      btnLoginSubmit.textContent = "Connect to Studio Session";
+    }}
+  }}
+  btnModeSession.addEventListener("click", function() {{ setLoginMode("session"); }});
+  btnModeLocal.addEventListener("click", function() {{ setLoginMode("local"); }});
+
+  function switchNavTab(tabName) {{
+    activeNavTab = tabName;
+    const isConsole = tabName === "console";
+    const isScript = tabName === "script";
+    const isProjects = tabName === "projects";
+    panelConsole.style.display = isConsole ? "block" : "none";
+    panelScript.style.display = isScript ? "block" : "none";
+    panelProjects.style.display = isProjects ? "block" : "none";
+    navTabConsole.className = isConsole ? "tab-btn active" : "tab-btn";
+    navTabConsole.setAttribute("aria-selected", isConsole ? "true" : "false");
+    navTabScript.className = isScript ? "tab-btn active" : "tab-btn";
+    navTabScript.setAttribute("aria-selected", isScript ? "true" : "false");
+    navTabProjects.className = isProjects ? "tab-btn active" : "tab-btn";
+    navTabProjects.setAttribute("aria-selected", isProjects ? "true" : "false");
+    if (isScript) {{
+      loadScriptForProject(editingScriptProject || latestProjectName || "");
+    }} else if (isProjects && authKind === "local") {{
+      refreshProjectsList();
+    }}
+  }}
+  navTabConsole.addEventListener("click", function() {{ switchNavTab("console"); }});
+  navTabScript.addEventListener("click", function() {{ switchNavTab("script"); }});
+  navTabProjects.addEventListener("click", function() {{ switchNavTab("projects"); }});
+
   function showView(authenticated) {{
     isAuthenticated = authenticated;
     if (authenticated) {{
@@ -2866,11 +3515,19 @@ input[type="range"].brand-slider {{
       loginView.style.display = "none";
       consoleView.style.display = "block";
       btnLogout.style.display = "inline-block";
+      navTabProjects.style.display = (authKind === "local") ? "inline-block" : "none";
+      if (authKind === "local") {{
+        refreshProjectsList();
+      }}
+      populateScriptProjectSelect();
       connectWebSocket();
     }} else {{
+      authKind = "";
+      authUser = "";
       loginView.style.display = "block";
       consoleView.style.display = "none";
       btnLogout.style.display = "none";
+      navTabProjects.style.display = "none";
       hdrSession.textContent = "Session: Auth Required";
       hdrProject.textContent = "Project: --";
       hdrConn.textContent = "● Auth Required";
@@ -2903,6 +3560,7 @@ input[type="range"].brand-slider {{
     }}
     loginError.style.display = "none";
     btnLoginSubmit.disabled = true;
+    const modeVal = loginModeInput.value || "session";
     const sessionVal = sessionInput.value;
     const passVal = passInput.value;
     const inviteVal = document.getElementById("invite-token-input").value;
@@ -2911,7 +3569,9 @@ input[type="range"].brand-slider {{
         method: "POST",
         headers: {{ "Content-Type": "application/json" }},
         body: JSON.stringify({{
+          login_mode: modeVal,
           session_id: sessionVal,
+          username: sessionVal,
           password: passVal,
           invite_token: inviteVal
         }})
@@ -2922,6 +3582,8 @@ input[type="range"].brand-slider {{
       }} catch (_e) {{}}
 
       if (resp.ok && data.ok) {{
+        authKind = data.auth_kind || "session";
+        authUser = data.username || "";
         // Clean token from URL bar for security
         if (window.history && window.history.replaceState) {{
           window.history.replaceState({{}}, document.title, "/");
@@ -3260,7 +3922,7 @@ input[type="range"].brand-slider {{
   window.addEventListener("keydown", function(ev) {{
     if (!isAuthenticated) return;
     const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : "";
-    if (tag === "input" || tag === "textarea") return;
+    if (tag === "input" || tag === "textarea" || tag === "select" || (ev.target && ev.target.isContentEditable)) return;
 
     if ((ev.code === "KeyT" || ev.code === "Space") && !ev.repeat) {{
       ev.preventDefault();
@@ -3271,7 +3933,7 @@ input[type="range"].brand-slider {{
   window.addEventListener("keyup", function(ev) {{
     if (!isAuthenticated) return;
     const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : "";
-    if (tag === "input" || tag === "textarea") return;
+    if (tag === "input" || tag === "textarea" || tag === "select" || (ev.target && ev.target.isContentEditable)) return;
     if (ev.code === "KeyT" || ev.code === "Space") {{
       handleTalkbackRelease();
     }}
@@ -3430,6 +4092,14 @@ input[type="range"].brand-slider {{
       lastObservedLocalTbActive = false;
       latestIsRecording = true;
       refreshMicAndTalkbackUi();
+      return;
+    }}
+    if (msg.type === "script_updated") {{
+      if (msg.project_name && msg.project_name === editingScriptProject && document.activeElement !== scriptEditor) {{
+        scriptEditor.innerHTML = msg.html || "";
+        scriptStatusMsg.textContent = "✓ Script updated from studio (" + msg.project_name + "/script.html).";
+        scriptStatusMsg.style.color = "#7EE787";
+      }}
       return;
     }}
     if (msg.type === "project_rename_result") {{
@@ -3722,6 +4392,276 @@ input[type="range"].brand-slider {{
 
     requestAnimationFrame(drawVuMeter);
   }}
+
+  // ------------------------------------------------------------------
+  // Rich-Text Script Editor & Standing Projects Management
+  // ------------------------------------------------------------------
+  function populateScriptProjectSelect() {{
+    const currentVal = editingScriptProject || latestProjectName || "Session";
+    scriptProjectSelect.innerHTML = "";
+    const names = [];
+    if (authKind === "local" && cachedProjects.length > 0) {{
+      cachedProjects.forEach(function(p) {{
+        if (p && p.project_name && names.indexOf(p.project_name) === -1) {{
+          names.push(p.project_name);
+        }}
+      }});
+    }}
+    if (latestProjectName && names.indexOf(latestProjectName) === -1) {{
+      names.unshift(latestProjectName);
+    }}
+    if (names.length === 0) {{
+      names.push(currentVal);
+    }}
+    names.forEach(function(name) {{
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name + (name === latestProjectName ? " (Active)" : "");
+      scriptProjectSelect.appendChild(opt);
+    }});
+    if (names.indexOf(currentVal) !== -1) {{
+      scriptProjectSelect.value = currentVal;
+    }} else {{
+      scriptProjectSelect.value = names[0];
+    }}
+    editingScriptProject = scriptProjectSelect.value;
+    scriptProjectSelect.disabled = (authKind !== "local");
+  }}
+
+  async function loadScriptForProject(projName) {{
+    const target = (projName || latestProjectName || "").trim();
+    if (!target) return;
+    editingScriptProject = target;
+    populateScriptProjectSelect();
+    scriptStatusMsg.textContent = "Loading script for " + target + "...";
+    scriptStatusMsg.style.color = "#8B949E";
+    try {{
+      const resp = await fetch("/api/script?project=" + encodeURIComponent(target), {{ cache: "no-store" }});
+      const data = await resp.json();
+      if (resp.ok && data.ok) {{
+        editingScriptProject = data.project_name || target;
+        scriptEditor.innerHTML = data.html || "";
+        scriptStatusMsg.textContent = "Loaded /storage/" + editingScriptProject + "/script.html";
+        scriptStatusMsg.style.color = "#8B949E";
+      }} else {{
+        scriptStatusMsg.textContent = data.error || "Could not load script.";
+        scriptStatusMsg.style.color = "#FFA198";
+      }}
+    }} catch (_e) {{
+      scriptStatusMsg.textContent = "Network error loading script.";
+      scriptStatusMsg.style.color = "#FFA198";
+    }}
+  }}
+
+  async function saveCurrentScript() {{
+    const target = (scriptProjectSelect.value || editingScriptProject || latestProjectName || "").trim();
+    if (!target) return;
+    btnSaveScript.disabled = true;
+    scriptStatusMsg.textContent = "Saving & syncing to Prompter...";
+    scriptStatusMsg.style.color = "#79C0FF";
+    try {{
+      const resp = await fetch("/api/script", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          project_name: target,
+          html: scriptEditor.innerHTML
+        }})
+      }});
+      const data = await resp.json();
+      if (resp.ok && data.ok) {{
+        scriptStatusMsg.textContent = "✓ Saved to /storage/" + data.project_name + "/script.html & synced live to Prompter.";
+        scriptStatusMsg.style.color = "#7EE787";
+        if (authKind === "local") {{
+          refreshProjectsList();
+        }}
+      }} else {{
+        scriptStatusMsg.textContent = data.error || "Failed to save script.";
+        scriptStatusMsg.style.color = "#FFA198";
+      }}
+    }} catch (_e) {{
+      scriptStatusMsg.textContent = "Network error saving script.";
+      scriptStatusMsg.style.color = "#FFA198";
+    }} finally {{
+      btnSaveScript.disabled = false;
+    }}
+  }}
+
+  document.querySelectorAll(".rte-btn").forEach(function(btn) {{
+    btn.addEventListener("click", function() {{
+      scriptEditor.focus();
+      const cmd = btn.getAttribute("data-cmd");
+      const block = btn.getAttribute("data-block");
+      const color = btn.getAttribute("data-color");
+      const ins = btn.getAttribute("data-insert");
+      if (cmd) {{
+        document.execCommand(cmd, false, null);
+      }} else if (block) {{
+        document.execCommand("formatBlock", false, block);
+      }} else if (color) {{
+        document.execCommand("foreColor", false, color);
+      }} else if (ins) {{
+        document.execCommand("insertText", false, " " + ins + " ");
+      }}
+    }});
+  }});
+
+  scriptProjectSelect.addEventListener("change", function() {{
+    loadScriptForProject(scriptProjectSelect.value);
+  }});
+  btnReloadScript.addEventListener("click", function() {{
+    loadScriptForProject(scriptProjectSelect.value || editingScriptProject || latestProjectName);
+  }});
+  btnSaveScript.addEventListener("click", saveCurrentScript);
+
+  function showProjectsFeedback(msg, isError) {{
+    if (!msg) {{
+      projectsFeedback.style.display = "none";
+      projectsFeedback.textContent = "";
+      return;
+    }}
+    projectsFeedback.textContent = msg;
+    projectsFeedback.style.color = isError ? "#FFA198" : "#7EE787";
+    projectsFeedback.style.display = "block";
+  }}
+
+  async function refreshProjectsList() {{
+    if (authKind !== "local") return;
+    try {{
+      const resp = await fetch("/api/projects", {{ cache: "no-store" }});
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {{
+        showProjectsFeedback(data.error || "Could not load projects.", true);
+        return;
+      }}
+      cachedProjects = Array.isArray(data.projects) ? data.projects : [];
+      populateScriptProjectSelect();
+      renderProjectsTable(cachedProjects, Boolean(data.is_recording));
+    }} catch (_e) {{
+      showProjectsFeedback("Network error loading projects.", true);
+    }}
+  }}
+
+  function renderProjectsTable(projects, isRecording) {{
+    projectsTbody.innerHTML = "";
+    projects.forEach(function(proj) {{
+      const tr = document.createElement("tr");
+
+      const tdName = document.createElement("td");
+      tdName.style.fontWeight = "700";
+      tdName.textContent = proj.project_name + (proj.is_active_project ? "  ★ ACTIVE" : "");
+      if (proj.is_active_project) {{
+        tdName.style.color = "#7EE787";
+      }}
+      tr.appendChild(tdName);
+
+      const tdTakes = document.createElement("td");
+      tdTakes.textContent = String(proj.recording_count || 0);
+      tr.appendChild(tdTakes);
+
+      const tdSize = document.createElement("td");
+      tdSize.textContent = proj.formatted_size || "0 B";
+      tr.appendChild(tdSize);
+
+      const tdScript = document.createElement("td");
+      tdScript.textContent = proj.has_script ? "✓ Script" : "—";
+      tdScript.style.color = proj.has_script ? "#79C0FF" : "#6E7681";
+      tr.appendChild(tdScript);
+
+      const tdAct = document.createElement("td");
+      const wrap = document.createElement("div");
+      wrap.className = "proj-actions";
+
+      const btnEdit = document.createElement("button");
+      btnEdit.type = "button";
+      btnEdit.className = "btn-subtle";
+      btnEdit.textContent = "▤ Edit Script";
+      btnEdit.addEventListener("click", function() {{
+        editingScriptProject = proj.project_name;
+        switchNavTab("script");
+      }});
+      wrap.appendChild(btnEdit);
+
+      if (!proj.is_active_project) {{
+        const btnAct = document.createElement("button");
+        btnAct.type = "button";
+        btnAct.className = "btn-subtle";
+        btnAct.textContent = "Set Active";
+        btnAct.disabled = isRecording;
+        btnAct.addEventListener("click", async function() {{
+          const r = await fetch("/api/projects/select", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ project_name: proj.project_name }})
+          }});
+          const d = await r.json();
+          if (r.ok && d.ok) {{
+            showProjectsFeedback("Active project switched to '" + d.project_name + "'.", false);
+            refreshProjectsList();
+          }} else {{
+            showProjectsFeedback(d.error || "Could not switch project.", true);
+          }}
+        }});
+        wrap.appendChild(btnAct);
+      }}
+
+      const btnRen = document.createElement("button");
+      btnRen.type = "button";
+      btnRen.className = "btn-subtle";
+      btnRen.textContent = "✎ Rename";
+      btnRen.disabled = isRecording;
+      btnRen.addEventListener("click", async function() {{
+        const nextName = window.prompt("Rename project '" + proj.project_name + "' to:", proj.project_name);
+        if (!nextName || nextName.trim() === proj.project_name) return;
+        const r = await fetch("/api/projects/rename", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ old_name: proj.project_name, new_name: nextName.trim() }})
+        }});
+        const d = await r.json();
+        if (r.ok && d.ok) {{
+          showProjectsFeedback("Renamed project to '" + d.project_name + "'.", false);
+          refreshProjectsList();
+        }} else {{
+          showProjectsFeedback(d.error || "Could not rename project.", true);
+        }}
+      }});
+      wrap.appendChild(btnRen);
+
+      tdAct.appendChild(wrap);
+      tr.appendChild(tdAct);
+      projectsTbody.appendChild(tr);
+    }});
+  }}
+
+  async function createProjectFromBar(setActive) {{
+    const name = (newProjectNameInput.value || "").trim();
+    if (!name) {{
+      showProjectsFeedback("Please enter a project name.", true);
+      return;
+    }}
+    try {{
+      const r = await fetch("/api/projects", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ project_name: name, set_active: Boolean(setActive) }})
+      }});
+      const d = await r.json();
+      if (r.ok && d.ok) {{
+        newProjectNameInput.value = "";
+        showProjectsFeedback("Created project '" + d.project_name + "'.", false);
+        refreshProjectsList();
+      }} else {{
+        showProjectsFeedback(d.error || "Could not create project.", true);
+      }}
+    }} catch (_e) {{
+      showProjectsFeedback("Network error creating project.", true);
+    }}
+  }}
+
+  btnCreateProject.addEventListener("click", function() {{ createProjectFromBar(false); }});
+  btnCreateActivateProject.addEventListener("click", function() {{ createProjectFromBar(true); }});
+  btnRefreshProjects.addEventListener("click", refreshProjectsList);
 
   showView(isAuthenticated);
   if (!isAuthenticated) {{

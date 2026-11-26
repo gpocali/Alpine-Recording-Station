@@ -22,11 +22,15 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QMessageBox,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -177,8 +181,14 @@ class RemoteProducerDialog(QDialog):
         hdr_row.addWidget(self.status_badge)
         root.addLayout(hdr_row)
 
+        # Tabbed Container: Session/SSL + Standing Local Web UI Logins
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, stretch=1)
+
+        session_tab = QWidget()
         # Main Two-Column Grid
-        grid = QGridLayout()
+        grid = QGridLayout(session_tab)
+        grid.setContentsMargins(6, 8, 6, 6)
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(10)
 
@@ -439,7 +449,12 @@ class RemoteProducerDialog(QDialog):
         grid.addLayout(right_col, 0, 1)
         grid.setColumnStretch(0, 11)
         grid.setColumnStretch(1, 10)
-        root.addLayout(grid, stretch=1)
+        self.tabs.addTab(session_tab, "Session, QR && SSL Setup")
+
+        # Tab 2: Defined Local Web UI Logins (Standing Access)
+        self.local_users_tab = QWidget()
+        self._build_local_users_tab(self.local_users_tab)
+        self.tabs.addTab(self.local_users_tab, "Web UI Local Logins")
 
         # Feedback Banner + Close Button
         self.feedback_label = QLabel(
@@ -467,6 +482,151 @@ class RemoteProducerDialog(QDialog):
         self._refresh_qr_and_link()
         self._refresh_ssl_info()
         self._refresh_live_status()
+        self._refresh_local_users()
+
+    def _build_local_users_tab(self, container: QWidget) -> None:
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
+
+        desc = QLabel(
+            "Define local Web UI accounts for standing access without needing the temporary Session ID "
+            "and 6-digit PIN. Standing accounts can view all projects in /storage, create/rename/switch "
+            "projects, and update teleprompter scripts live."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #8B949E; font-size: 12px;")
+        layout.addWidget(desc)
+
+        row = QHBoxLayout()
+        row.setSpacing(14)
+
+        left_box = QGroupBox("Defined Local Web UI Accounts")
+        left_layout = QVBoxLayout(left_box)
+        self.web_users_list = QListWidget()
+        self.web_users_list.currentTextChanged.connect(self._on_web_user_selected)
+        left_layout.addWidget(self.web_users_list, stretch=1)
+
+        self.btn_remove_web_user = QPushButton("✕ Remove Selected Account")
+        self.btn_remove_web_user.setMinimumHeight(34)
+        self.btn_remove_web_user.clicked.connect(self._on_remove_web_user)
+        left_layout.addWidget(self.btn_remove_web_user)
+        row.addWidget(left_box, stretch=1)
+
+        right_box = QGroupBox("Add Account / Update Password")
+        right_layout = QVBoxLayout(right_box)
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self.web_username_edit = QLineEdit()
+        self.web_username_edit.setPlaceholderText("e.g. producer")
+        self.osk_controller.register_line_edit(
+            self.web_username_edit, title="Web UI Local Login Username"
+        )
+        form.addRow("Username:", self.web_username_edit)
+
+        self.web_password_edit = QLineEdit()
+        self.web_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.web_password_edit.setPlaceholderText("Minimum 6 characters")
+        self.osk_controller.register_line_edit(
+            self.web_password_edit, title="Web UI Local Login Password", is_password=True
+        )
+        form.addRow("Password:", self.web_password_edit)
+
+        self.web_password_confirm_edit = QLineEdit()
+        self.web_password_confirm_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.web_password_confirm_edit.setPlaceholderText("Confirm password")
+        self.osk_controller.register_line_edit(
+            self.web_password_confirm_edit, title="Confirm Web UI Password", is_password=True
+        )
+        form.addRow("Confirm Password:", self.web_password_confirm_edit)
+        right_layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.btn_add_web_user = QPushButton("+ Add Local Login")
+        self.btn_add_web_user.setMinimumHeight(36)
+        self.btn_add_web_user.setStyleSheet(
+            "background-color: #238636; color: #FFFFFF; font-weight: bold;"
+        )
+        self.btn_add_web_user.clicked.connect(self._on_add_web_user)
+        btn_row.addWidget(self.btn_add_web_user)
+
+        self.btn_change_web_pw = QPushButton("Update Password")
+        self.btn_change_web_pw.setMinimumHeight(36)
+        self.btn_change_web_pw.clicked.connect(self._on_change_web_password)
+        btn_row.addWidget(self.btn_change_web_pw)
+        right_layout.addLayout(btn_row)
+
+        self.web_users_status_label = QLabel("")
+        self.web_users_status_label.setWordWrap(True)
+        right_layout.addWidget(self.web_users_status_label)
+        right_layout.addStretch(1)
+        row.addWidget(right_box, stretch=1)
+
+        layout.addLayout(row, stretch=1)
+
+    def _refresh_local_users(self) -> None:
+        if not hasattr(self, "web_users_list"):
+            return
+        self.web_users_list.clear()
+        for entry in self.remote_server.web_user_manager.list_users():
+            self.web_users_list.addItem(str(entry.get("username") or ""))
+
+    def _on_web_user_selected(self, username: str) -> None:
+        if username:
+            self.web_username_edit.setText(username)
+
+    def _set_web_users_status(self, msg: str, error: bool = False) -> None:
+        color = "#F85149" if error else "#3FB950"
+        self.web_users_status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+        self.web_users_status_label.setText(msg)
+
+    def _on_add_web_user(self) -> None:
+        uname = self.web_username_edit.text().strip()
+        pw = self.web_password_edit.text()
+        pw2 = self.web_password_confirm_edit.text()
+        if pw != pw2:
+            self._set_web_users_status("Passwords do not match.", error=True)
+            return
+        ok, msg = self.remote_server.web_user_manager.add_user(uname, pw)
+        self._set_web_users_status(msg, error=not ok)
+        if ok:
+            self.web_password_edit.clear()
+            self.web_password_confirm_edit.clear()
+            self._refresh_local_users()
+
+    def _on_change_web_password(self) -> None:
+        uname = self.web_username_edit.text().strip()
+        pw = self.web_password_edit.text()
+        pw2 = self.web_password_confirm_edit.text()
+        if pw != pw2:
+            self._set_web_users_status("Passwords do not match.", error=True)
+            return
+        ok, msg = self.remote_server.web_user_manager.change_password(uname, pw)
+        self._set_web_users_status(msg, error=not ok)
+        if ok:
+            self.web_password_edit.clear()
+            self.web_password_confirm_edit.clear()
+
+    def _on_remove_web_user(self) -> None:
+        item = self.web_users_list.currentItem()
+        uname = item.text() if item else self.web_username_edit.text().strip()
+        if not uname:
+            self._set_web_users_status("Select a local account to remove first.", error=True)
+            return
+        reply = QMessageBox.question(
+            self,
+            "Confirm Remove Local Login",
+            f"Remove standing Web UI access for '{uname}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        ok, msg = self.remote_server.web_user_manager.remove_user(uname)
+        self._set_web_users_status(msg, error=not ok)
+        if ok:
+            self.web_username_edit.clear()
+            self._refresh_local_users()
 
     def _refresh_qr_and_link(self) -> None:
         host = self.host_combo.currentData() or self.remote_server.get_primary_host()
