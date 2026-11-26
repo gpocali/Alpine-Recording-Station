@@ -491,6 +491,10 @@ case "$cmd" in
         PYTHON_BIN="$(command -v python3 2>/dev/null || echo /usr/bin/python3)"
         PYTHONPATH="${APP_DIR}" "${PYTHON_BIN}" -m app.session_cli "$@"
         ;;
+    user|users|web-user|web-users)
+        PYTHON_BIN="$(command -v python3 2>/dev/null || echo /usr/bin/python3)"
+        PYTHONPATH="${APP_DIR}" "${PYTHON_BIN}" -m app.web_auth "$@"
+        ;;
     enable)
         if command -v rc-update >/dev/null 2>&1; then
             rc-update add alpine-recorder default
@@ -535,6 +539,8 @@ case "$cmd" in
         echo "  status           Show service status, running processes, and recent log output"
         echo "  session          Show or control the Remote Producer web session key/URL/PIN/QR"
         echo "                   (e.g. 'session [status|enable|disable|rotate|url|pin|key|qr] [--json]')"
+        echo "  user             Manage local Web UI logins (add, passwd, remove, list)"
+        echo "                   (e.g. 'user add <name>', 'user passwd <name>', 'user remove <name>', 'user list')"
         echo "  enable           Enable automatic post-boot startup via OpenRC"
         echo "  disable          Disable automatic post-boot startup (manual mode for troubleshooting)"
         echo "  logs             Show recent application and Xorg log output"

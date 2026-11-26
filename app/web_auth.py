@@ -314,3 +314,190 @@ class WebUserManager:
             if acct is None or acct.token_version != ver:
                 return None
             return acct
+
+
+# ---------------------------------------------------------------------------
+# Headless CLI: alpine-recorder user [list|add|passwd|remove]
+# ---------------------------------------------------------------------------
+
+def _notify_live_server_reload(
+    config_dir: Optional[str],
+    runtime_dir: Optional[str],
+) -> bool:
+    """Ask a running RemoteProducerServer (if any) to reload web_users.json live."""
+    try:
+        from app.session_cli import (
+            SESSION_STATE_FILENAME,
+            resolve_runtime_dir,
+            send_control_command,
+        )
+
+        rt_dir = resolve_runtime_dir(
+            etc_config_dir=config_dir,
+            runtime_dir=runtime_dir,
+        )
+        state_path = rt_dir / SESSION_STATE_FILENAME
+        if not state_path.is_file():
+            return False
+        ok, _msg, _state = send_control_command(
+            state_path=state_path,
+            action="reload_users",
+            timeout=1.5,
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _read_cli_password(args: Any, prompt_label: str = "Password") -> Tuple[bool, str]:
+    import getpass
+    import sys
+
+    if getattr(args, "password", None) is not None:
+        return (True, str(args.password))
+    if getattr(args, "password_stdin", False):
+        line = sys.stdin.readline()
+        return (True, line.rstrip("\r\n"))
+    pw1 = getpass.getpass(f"{prompt_label}: ")
+    pw2 = getpass.getpass(f"Confirm {prompt_label}: ")
+    if pw1 != pw2:
+        return (False, "Passwords do not match.")
+    return (True, pw1)
+
+
+def run_user_cli(argv: Optional[List[str]] = None) -> int:
+    """CLI entrypoint for managing defined local Web UI logins."""
+    import argparse
+    import sys
+
+    from app.config_manager import (
+        DEFAULT_ETC_CONFIG_DIR,
+        DEFAULT_STORAGE_DIR,
+        ConfigManager,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="alpine-recorder user",
+        description="Manage local Web UI login accounts with standing project & script access.",
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        default="list",
+        choices=["list", "ls", "add", "passwd", "password", "chpasswd", "remove", "rm", "delete", "del"],
+        help="Action to perform: list, add, passwd, or remove.",
+    )
+    parser.add_argument(
+        "username",
+        nargs="?",
+        default=None,
+        help="Local Web UI username (required for add, passwd, remove).",
+    )
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="Account password (if omitted, prompts interactively without echoing).",
+    )
+    parser.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="Read password from a single line of stdin.",
+    )
+    parser.add_argument(
+        "--role",
+        default="admin",
+        choices=["admin", "producer"],
+        help="Account role (default: admin).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output machine-readable JSON.",
+    )
+    parser.add_argument("--config-dir", default=None, help="Override config directory.")
+    parser.add_argument("--storage-dir", default=None, help="Override storage directory.")
+    parser.add_argument("--runtime-dir", default=None, help="Override runtime state directory.")
+
+    args = parser.parse_args(argv)
+    etc_dir = args.config_dir or os.environ.get("ALPINE_RECORDER_CONFIG_DIR") or DEFAULT_ETC_CONFIG_DIR
+    storage_dir = args.storage_dir or os.environ.get("ALPINE_RECORDER_STORAGE") or DEFAULT_STORAGE_DIR
+
+    mgr = WebUserManager(
+        etc_config_dir=etc_dir,
+        storage_dir=storage_dir,
+        on_persist_lbu=ConfigManager.trigger_lbu_commit_async,
+    )
+
+    act = args.action.lower()
+
+    if act in ("list", "ls"):
+        users = mgr.list_users()
+        if args.json:
+            print(json.dumps({"ok": True, "users": users}, indent=2, sort_keys=True))
+        elif not users:
+            print("No local Web UI accounts defined.")
+            print("Add one with: alpine-recorder user add <username>")
+        else:
+            print("Defined Local Web UI Accounts:")
+            for u in users:
+                print(f"  - {u['username']}  (role: {u.get('role', 'admin')})")
+        return 0
+
+    if not args.username:
+        msg = f"Username is required for '{act}'. Usage: alpine-recorder user {act} <username>"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            print(f"[FAIL] {msg}", file=sys.stderr)
+        return 2
+
+    if act == "add":
+        ok_pw, pw_or_err = _read_cli_password(args, "Password")
+        if not ok_pw:
+            if args.json:
+                print(json.dumps({"ok": False, "error": pw_or_err}, indent=2))
+            else:
+                print(f"[FAIL] {pw_or_err}", file=sys.stderr)
+            return 1
+        ok, msg = mgr.add_user(args.username, pw_or_err, role=args.role)
+    elif act in ("passwd", "password", "chpasswd"):
+        ok_pw, pw_or_err = _read_cli_password(args, "New Password")
+        if not ok_pw:
+            if args.json:
+                print(json.dumps({"ok": False, "error": pw_or_err}, indent=2))
+            else:
+                print(f"[FAIL] {pw_or_err}", file=sys.stderr)
+            return 1
+        ok, msg = mgr.change_password(args.username, pw_or_err)
+    else:
+        ok, msg = mgr.remove_user(args.username)
+
+    reloaded = _notify_live_server_reload(args.config_dir, args.runtime_dir) if ok else False
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ok": ok,
+                    "action": act,
+                    "username": args.username,
+                    "message": msg,
+                    "live_reloaded": reloaded,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        if ok:
+            suffix = " (live server updated)" if reloaded else ""
+            print(f"[OK] {msg}{suffix}")
+        else:
+            print(f"[FAIL] {msg}", file=sys.stderr)
+
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_user_cli())
+

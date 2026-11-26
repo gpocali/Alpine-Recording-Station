@@ -347,6 +347,74 @@ class TestLocalWebAuthAndHttpsEndpoints(unittest.TestCase):
         st, forbid = self._req("GET", "/api/projects", token=guest_token)
         self.assertEqual(st, 403)
 
+    def test_cli_user_add_passwd_remove_live_reloads_running_server(self) -> None:
+        import contextlib
+        import io
+        from app.web_auth import run_user_cli
+
+        rt_dir = str(Path(self._tmp.name) / "runtime")
+        common = [
+            "--config-dir",
+            str(self.etc_dir),
+            "--storage-dir",
+            str(self.storage_dir),
+            "--runtime-dir",
+            rt_dir,
+            "--json",
+        ]
+
+        # 1. Add user via CLI -> live server reloads immediately
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_user_cli(["add", "cliadmin", "--password", "initialPass99", *common])
+        self.assertEqual(rc, 0)
+        res_add = json.loads(buf.getvalue())
+        self.assertTrue(res_add["ok"])
+        self.assertTrue(res_add["live_reloaded"])
+
+        st, login1 = self._req(
+            "POST",
+            "/api/login",
+            {"login_mode": "local", "username": "cliadmin", "password": "initialPass99"},
+        )
+        self.assertEqual(st, 200)
+        tok1 = login1["auth_token"]
+
+        # 2. List users via CLI
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_user_cli(["list", *common])
+        self.assertEqual(rc, 0)
+        res_list = json.loads(buf.getvalue())
+        self.assertEqual([u["username"] for u in res_list["users"]], ["cliadmin"])
+
+        # 3. Change password via CLI -> old token invalidated, new password works live
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_user_cli(["passwd", "cliadmin", "--password", "updatedPass77", *common])
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(buf.getvalue())["live_reloaded"])
+
+        st, _ = self._req("GET", "/api/status", token=tok1)
+        self.assertEqual(st, 401)
+        st, login2 = self._req(
+            "POST",
+            "/api/login",
+            {"login_mode": "local", "username": "cliadmin", "password": "updatedPass77"},
+        )
+        self.assertEqual(st, 200)
+        tok2 = login2["auth_token"]
+
+        # 4. Remove user via CLI -> token revoked immediately
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_user_cli(["remove", "cliadmin", *common])
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(buf.getvalue())["live_reloaded"])
+
+        st, _ = self._req("GET", "/api/status", token=tok2)
+        self.assertEqual(st, 401)
+
 
 @unittest.skipUnless(HAS_PYQT6, "PyQt6 not installed")
 class TestPrompterDialogAndSettingsUi(unittest.TestCase):

@@ -380,7 +380,7 @@ class SessionControlServer:
                 return
 
             action = str(req.get("action") or "status").lower().strip()
-            if action not in ("status", "enable", "disable", "rotate", "unban"):
+            if action not in ("status", "enable", "disable", "rotate", "unban", "reload_users"):
                 self._send_reply(conn, {"ok": False, "error": f"Unsupported action: {action}"})
                 return
 

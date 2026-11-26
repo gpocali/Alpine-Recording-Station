@@ -1011,6 +1011,24 @@ class RemoteProducerServer:
                 self.get_session_info(),
             )
 
+        if action == "reload_users":
+            self.web_user_manager.load()
+            # Disconnect any local WebSocket clients whose user was removed
+            with self._clients_lock:
+                to_drop = [
+                    c
+                    for c in self._clients.values()
+                    if c.auth_kind == "local"
+                    and self.web_user_manager.get_user(c.username) is None
+                ]
+                for c in to_drop:
+                    self._clients.pop(c.client_id, None)
+            for client in to_drop:
+                client.close()
+            if to_drop:
+                self._recompute_remote_talkback_state()
+            return (True, "Reloaded local Web UI accounts.", self.get_session_info())
+
         return (False, f"Unsupported action: {action}", self.get_session_info())
 
     def rotate_session(self) -> ProducerSession:
